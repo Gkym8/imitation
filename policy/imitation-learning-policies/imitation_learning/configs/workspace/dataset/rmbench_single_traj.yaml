@@ -1,0 +1,128 @@
+_target_: imitation_learning.datasets.rmbench_dataset.RMBenchSingleTrajDataset
+
+# ``process_data.py`` creates <root_dir>/<name>.zarr/episode_<id>/...
+root_dir: data
+name: rmbench
+compressed_dir: ""
+normalizer_dir: ${workspace.train_dataset.root_dir}
+
+robot_num: 2
+include_episode_num: -1
+include_episode_indices: []
+used_episode_ratio: 0.98
+random_split_dataset: true
+
+history_padding_length: ${workspace.model.history_padding_length}
+# Invalid action chunks near an episode boundary are treated as padding rather
+# than being trained against repeated terminal actions.
+future_padding_length: ${workspace.model.action_length}
+starting_percentile_max: 1.0
+starting_percentile_min: 0.0
+index_pool_size_per_episode: -1
+seed: ${seed}
+
+use_relative_pose: false
+use_relative_gripper_width: false
+normalizer_sample_num: -1
+repeat_dataset_num: 1
+down_sample_steps: 1
+
+# The converter stores all three views. This list controls which view(s) are
+# consumed by the policy, for example [left_camera] or
+# [head_camera, left_camera, right_camera].
+image_keys: [head_camera]
+proprio_keys: [agent_pos]
+action_keys: [action]
+apply_image_augmentation_in_cpu: true
+
+source_data_meta:
+  head_camera:
+    include_indices: ${workspace.model.image_indices}
+    shape: [240, 320, 3]
+  left_camera:
+    include_indices: ${workspace.model.image_indices}
+    shape: [240, 320, 3]
+  right_camera:
+    include_indices: ${workspace.model.image_indices}
+    shape: [240, 320, 3]
+  agent_pos:
+    include_indices: ${workspace.model.proprio_indices}
+    shape: [14]
+  action:
+    include_indices: ${workspace.model.action_indices}
+    shape: [14]
+
+output_data_meta:
+  head_camera:
+    data_type: image
+    length: ${workspace.model.image_length}
+    normalizer: identity
+    augmentation:
+      - name: Resize
+        size:
+          - ${visual_encoder.input_size}
+          - ${visual_encoder.input_size}
+        antialias: true
+    shape:
+      - 3
+      - ${visual_encoder.input_size}
+      - ${visual_encoder.input_size}
+    source_entry_names: [head_camera]
+
+  left_camera:
+    data_type: image
+    length: ${workspace.model.image_length}
+    normalizer: identity
+    augmentation:
+      - name: Resize
+        size:
+          - ${visual_encoder.input_size}
+          - ${visual_encoder.input_size}
+        antialias: true
+    shape:
+      - 3
+      - ${visual_encoder.input_size}
+      - ${visual_encoder.input_size}
+    source_entry_names: [left_camera]
+
+  right_camera:
+    data_type: image
+    length: ${workspace.model.image_length}
+    normalizer: identity
+    augmentation:
+      - name: Resize
+        size:
+          - ${visual_encoder.input_size}
+          - ${visual_encoder.input_size}
+        antialias: true
+    shape:
+      - 3
+      - ${visual_encoder.input_size}
+      - ${visual_encoder.input_size}
+    source_entry_names: [right_camera]
+
+  agent_pos:
+    data_type: low_dim
+    length: ${workspace.model.proprio_length}
+    normalizer: range
+    augmentation: []
+    shape: [14]
+    source_entry_names: [agent_pos]
+
+  action:
+    data_type: low_dim
+    length: ${workspace.model.action_length}
+    normalizer: range
+    augmentation: []
+    shape: [14]
+    source_entry_names: [action]
+
+dataloader_cfg:
+  batch_size: 32
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 1
+
+statistics_data_path: ""

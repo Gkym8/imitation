@@ -1,0 +1,84 @@
+defaults:
+  - _self_
+
+dataset_type: rmbench
+
+# RMBench visual backend. This single block switches the current observation,
+# full-patch history bank, and compact future-prediction target together.
+# To restore the previous backend, copy the SigLIP2 block from base_config.yaml.
+visual_encoder:
+  _target_: imitation_learning.models.encoders.image_encoders.SharedDinoV2ImageEncoder
+  model_name: facebook/dinov2-with-registers-base
+  input_size: 224
+  apply_image_norm: true
+  pretrained: true
+  frozen: true
+  individual_forward: false
+
+# Generic RMBench task defaults. The training launcher will override the Zarr
+# dataset name with <task_name>-<task_config>-<expert_data_num>.
+workspace:
+  train_dataset:
+    name: rmbench
+    robot_num: 2
+    repeat_dataset_num: 1
+    starting_percentile_max: 1.0
+
+    # contiguous, random_pairs, streaming, or prefix. 
+    anchor_sampling_mode: streaming
+
+    image_keys: [head_camera]
+
+    use_cached_image_features: true
+    cached_image_feature_kind: auto
+    cached_image_feature_dim: 768
+    cached_image_feature_patch_token_num: 256
+    cached_image_feature_model_name: ${visual_encoder.model_name}
+    cached_image_feature_input_size: ${visual_encoder.input_size}
+    cached_image_feature_dtype: float32
+    dataloader_cfg:
+      batch_size: 8
+
+  model:
+    train_history_action_noise_level: none
+    eval_history_action_noise_level: none
+    # The policy defaults select compact CLS slots for exactly three views and
+    # proprioception-conditioned full-patch slots for a single view.
+    image_indices: [0]
+    image_length: 1
+    proprio_indices: [0]
+    proprio_length: 1
+    action_length: 16
+    action_indices: ${range:0,${workspace.model.action_length}}
+    history_action_num_per_chunk: 10
+    # Use prediction-error initialization/update during training and evict the
+    # lowest-weight eligible slot when the bank is full, matching inference.
+    training_slot_weight: true
+    # Enable the configured slot bias in both causal training and inference.
+    attention_bias: true
+    action_no_error_range:
+      - 0
+      - ${workspace.model.action_length}
+    denoising_network_partial:
+      hidden_dim: 512
+      max_history_len: 8
+      history_time_encoding: absolute
+      include_action_history: false
+
+      # additive & standardized
+      attention_bias_mode: standardized
+      attention_bias_lambda: 0.2
+      attention_bias_epsilon: 1.0e-6
+
+  trainer:
+    # Anchors computed by one bounded forward/backward graph.
+    streaming_chunk_length: 4
+    # Detached chunks whose parameter gradients are accumulated per update.
+    streaming_chunk_accumulate: 1
+    
+    # Match the original RMBench DP training schedule.
+    num_epochs: 401
+    checkpoint_every: 25
+    rollout_every: 0
+    sample_every: 0
+    val_every: 25

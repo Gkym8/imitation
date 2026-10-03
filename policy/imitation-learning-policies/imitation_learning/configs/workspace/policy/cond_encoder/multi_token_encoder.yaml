@@ -1,0 +1,23 @@
+_target_: imitation_learning.models.encoders.multi_token_encoder.MultiTokenEncoder
+
+image_encoder_partial:
+  _partial_: True
+  _target_: ${visual_encoder._target_}
+  model_name: ${visual_encoder.model_name}
+  apply_image_norm: ${visual_encoder.apply_image_norm}
+  resize_size: ${visual_encoder.input_size}
+  feature_aggregation: 'patches'
+  individual_forward: ${visual_encoder.individual_forward}
+  image_meta: ???
+  pretrained: ${visual_encoder.pretrained}
+  frozen: ${visual_encoder.frozen}
+
+
+projector_type: "linear"
+# Both selectable base backbones currently expose 768-dimensional features.
+feature_dim: 768
+data_meta: ${workspace.train_dataset.output_data_meta}
+
+data_entry_names: ???
+
+name: ???

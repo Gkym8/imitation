@@ -1,0 +1,17 @@
+# Basic experiment configuration
+policy_name: imitation-learning-policies
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+expert_data_num: null
+checkpoint_path: null
+device: cuda:0
+head_camera_type: D435
+
+# Relative paths are resolved from the RMBench repository root by eval.sh.
+# Supported placeholders: task_name, policy_name, task_config, ckpt_setting,
+# and current_time.
+eval_output_dir: eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}

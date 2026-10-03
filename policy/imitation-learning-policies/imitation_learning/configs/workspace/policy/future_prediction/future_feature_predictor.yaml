@@ -1,0 +1,16 @@
+_target_: imitation_learning.models.future_prediction.future_feature_predictor.FutureFeaturePredictor
+_partial_: true
+
+# hidden_dim is the input width injected from the decision-memory DiT. The
+# predictor first projects that input to predictor_hidden_dim, while the output
+# width is injected from the future-target image encoder.
+predictor_hidden_dim: 512
+
+head_num: 8
+layer_num: 2
+mlp_ratio: 4.0
+dropout: 0.0
+
+# If true, predict the next-slot visual feature from [h_t, current action chunk].
+# If false, the predictor only receives h_t.
+use_action_condition: true

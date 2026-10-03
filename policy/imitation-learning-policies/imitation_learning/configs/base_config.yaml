@@ -1,0 +1,40 @@
+defaults:
+  - workspace/base_workspace
+  - _self_
+
+seed: 0
+device: cuda
+
+# Shared visual-backbone selection. Tasks can override this one block and all
+# current-image, history-image, and future-target encoders will switch together.
+visual_encoder:
+  _target_: imitation_learning.models.encoders.image_encoders.SharedSiglipImageEncoder
+  model_name: google/siglip2-base-patch16-256
+  input_size: 256
+  apply_image_norm: true
+  pretrained: true
+  frozen: true
+  individual_forward: false
+
+# Use - instead of _ so the yaml reader will not interpret the string as a number
+date_str: ${now:%Y-%m-%d}
+time_str: ${now:%H-%M-%S}
+
+# Should be overridden by `train_policy.yaml`
+project_name: ???
+logger_project_name: ???
+run_name: ???
+# Supplied by train.sh as "_<complete run_name>" for output directories.
+run_name_suffix: ""
+task_name: ???
+policy_name: ???
+train_server_name: ???
+
+hydra:
+  run:
+    dir: ${workspace.trainer.output_dir}
+
+base_ckpt_path: null
+base_ckpt_cfg_str: ""
+
+attach_vscode_debugger: false

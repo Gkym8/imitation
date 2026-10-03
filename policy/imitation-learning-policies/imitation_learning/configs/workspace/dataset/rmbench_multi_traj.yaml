@@ -1,0 +1,53 @@
+defaults:
+  - rmbench_single_traj
+  - _self_
+
+_target_: imitation_learning.datasets.rmbench_dataset.RMBenchMultiTrajDataset
+
+# Training anchor sampling:
+#   contiguous   - the original fixed-interval window.
+#   random_pairs - traj_num/2 non-overlapping (t, t+interval) pairs sampled
+#                  across the episode. It keeps the same total anchor budget.
+#   streaming    - split every episode into fixed-interval phase streams and
+#                  cover every valid anchor once. The policy carries one causal
+#                  bank through the stream and truncates gradients by chunks.
+#   prefix       - sample a random endpoint, then walk backward by one fixed
+#                  interval to the episode's first phase anchor. Samples are
+#                  variable length and grouped into nearby-length batches.
+anchor_sampling_mode: streaming
+
+# Prefix samples are sorted by anchor count before batching. A width of two
+# keeps padding small while retaining randomness inside nearby lengths.
+prefix_bucket_size: 2
+
+# Keep this even so random_pairs can reuse the same total anchor budget.
+# streaming computes its padded stream length from the dataset and ignores this
+# value after initialization.
+traj_num: ${eval:"2*${workspace.model.denoising_network_partial.max_history_len}"}
+
+# Match training anchors to the action chunk retained by the memory policy.
+# The experiment value is defined once in the policy/task YAML.
+traj_interval_min: ${workspace.model.history_action_num_per_chunk}
+traj_interval_max: ${workspace.model.history_action_num_per_chunk}
+episode_starting_idx_max: null
+starting_percentile_max: 1.0
+# contiguous/random_pairs/prefix use this random-sample budget. streaming
+# ignores it and creates exactly one sample per valid phase (per repeat).
+index_pool_size_per_episode: 100
+repeat_dataset_num: 1
+
+dataloader_cfg:
+  batch_size: 4
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 1
+
+split_dataloader_cfg:
+  batch_size: 4
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  shuffle: false
+  prefetch_factor: 1

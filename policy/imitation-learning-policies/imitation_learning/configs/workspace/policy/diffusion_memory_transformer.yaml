@@ -1,0 +1,87 @@
+defaults:
+  - diffusion_transformer
+  - cond_encoder@history_img_feature_encoder: multi_token_encoder
+  - cond_encoder@future_img_feature_encoder: multi_token_encoder
+  - future_prediction@future_feature_predictor: future_feature_predictor
+  - override denoising_network@denoising_network_partial: memory_transformer
+  - _self_
+
+_target_: imitation_learning.policies.history_denoising_policy.HistoryDenoisingPolicy
+
+skip_memory: False
+history_mask_max_prob: 0.0
+memory_gate: null # To disable memory gate
+compact_three_view_slots: true
+# Keep single-view history slots as pure frozen-backbone patch features.  The
+# current image still combines with proprioception when it queries the bank;
+# only the representation persisted in history is left unmodulated.
+state_conditioned_single_view_slots: false
+global_cond_encoder:
+  single_token_per_view_when_three_views: true
+history_img_feature_encoder:
+  single_token_per_view_when_three_views: true
+  image_encoder_partial:
+    # Retain every observed patch in each memory slot.  Nothing predicted by
+    # the future-feature head is inserted into this bank.
+    feature_aggregation: 'patches'
+  name: history_img_feature_encoder
+  data_entry_names: ${workspace.train_dataset.image_keys}
+
+# Future prediction deliberately stays compact: one frozen backend-specific
+# global token (SigLIP MAP or DINOv2 CLS) is predicted online and held only
+# until its error can initialize the next slot.
+future_img_feature_encoder:
+  image_encoder_partial:
+    feature_aggregation: 'map'
+  name: future_img_feature_encoder
+  data_entry_names: ${workspace.train_dataset.image_keys}
+future_prediction_context_pooling: mean
+
+# h_t is computed once and shared by all diffusion steps, so memory actions must
+# not depend on the current denoising timestep.
+train_history_action_noise_level: none
+eval_history_action_noise_level: none
+history_action_num_per_chunk: 10
+
+action_no_error_range: [4, 8]
+
+prediction_error_queue:
+  enabled: true
+  capacity: 20               
+  warmup_min_samples: 5        
+  warmup_min_std: 0.003         
+  epsilon: 1.0e-6             
+  weight_min: -0.5           
+  weight_max: 0.5              
+  
+  first_slot_max_frame_distance: 10
+  
+  first_slot_weight: 0.5       # Must stay inside [weight_min, weight_max].
+  # When true, every slot whose absolute frame index is no greater than
+  # first_slot_max_frame_distance keeps first_slot_weight permanently.
+  # When false, the same prior is used only for initialization and later
+  # dynamic prediction-error updates may change it.
+  first_slot_frozen: true
+  # Standardized-mode-only query bias floor for slots covered by
+  # recent_slot_protection_num. Additive mode always uses stored weights.
+  # Dynamic updates and eviction remain unchanged in both modes.
+  recent_slot_attention_floor: 0.5
+  record_training_stats: false
+  
+  record_slot_weights: false
+
+dynamic_memory_weight_update:
+  enabled: true
+  step_size: 100
+  evict_lowest_weight_when_full: true
+  recent_slot_protection_num: 2
+
+# Training-only switch. When false, causal training uses raw attention, skips
+# prediction-error weight initialization/updates, and uniformly removes one
+# existing history slot before appending a new slot to a full memory bank.
+# Online inference still uses the prediction-error weighting configuration.
+training_slot_weight: false
+
+# Whether prediction-error slot weights are added to history-attention logits.
+# This remains an inference setting when training_slot_weight is false.
+attention_bias: true

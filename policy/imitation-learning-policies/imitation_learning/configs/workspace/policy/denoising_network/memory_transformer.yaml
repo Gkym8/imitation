@@ -1,0 +1,47 @@
+defaults:
+  - conditional_transformer
+  - _self_
+
+_target_: imitation_learning.models.denoising_networks.memory_transformer.MemoryTransformer
+
+max_history_len: 8
+freeze_non_history_modules: False
+history_attention_type: token_wise
+# How one prediction-error weight per slot modifies the raw QK attention
+# logits. "additive" uses A*=A+lambda*B; "standardized" uses
+# Z=(B-mu_B)/(sigma_B+eps), A*=A+lambda*sigma_A*Z. Both then restore
+# the original variance with A_tilde=A* sigma_A/(sigma_A*+eps), using
+# statistics over valid slots.
+attention_bias_mode: additive
+attention_bias_lambda: 0.5
+attention_bias_epsilon: 1.0e-6
+# MemoryVLA-style perception retrieval: every current image patch (after
+# proprioceptive modulation) queries every retained history patch.  The result
+# is computed once per anchor/control decision and reused by all DiT layers and
+# diffusion denoising steps.
+memory_retrieval_mode: perception_patches
+perception_retrieval_layers: 2
+# Number of observation-conditioned decision-memory tokens h_t. Must be > 1;
+# this is only used by the legacy learned_queries retrieval mode.  In
+# perception_patches mode h_t has one token per current image patch.
+decision_memory_token_num: 16
+record_data_entries: []
+  # - memory_gate_val # Required for memory gate regularization
+  # - history_cross_attention # Retrieval weights, now recorded once per h_t
+  # - history_attention_logits # Pre-softmax slot/token logits
+  # - decision_memory # The final h_t tokens
+
+# Aggregate raw frame/slot logits and attention probabilities during training.
+# Full batches are never retained; one NPZ/CSV/PNG bundle is written per epoch.
+record_history_attention_epoch_stats: False
+
+include_action_history: false
+
+memory_gate_include_first_token: True
+memory_gate_func: abs # or square
+ssmax_scaling_param: null # If null, will use softmax; 0.2 is a value used in the paper
+add_additional_self_attn: True # Does not matter much?
+skip_history_attn: False # For ablation study
+add_memory_gate_token: False
+binary_gating: True
+straight_through: ""
