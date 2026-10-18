@@ -1,0 +1,65 @@
+# Independent predictor training; does not compose or update the policy.
+seed: 42
+device: auto
+# null: create an independent timestamped directory for each new run.
+# An explicit path keeps overwrite protection; --resume uses its checkpoint directory.
+output_dir: null
+
+data:
+  # train_pre.sh discovers every *.zarr when this list is empty.
+  # --dataset PATH or an explicit sources YAML overrides automatic discovery.
+  sources: []
+  episodes_per_task: 50
+  execution_chunk_length: 10
+  camera_names: [head_camera]
+  train_ratio: 0.98
+  seed: ${seed}
+  encoder_model_name: facebook/dinov2-with-registers-base
+  encoder_input_size: 224
+  # Required for multiple sources: an identifier for the SAME robot/control,
+  # action/proprio units and joint order. Matching dimensions alone is insufficient.
+  control_interface: null
+
+model:
+  # DynaGuide uses width 384; preserve this experiment's configured width 512.
+  hidden_dim: 512
+  head_num: 8
+  layer_num: 6
+  feedforward_dim: 2048
+  activation: relu
+  norm_first: false
+  final_norm: false
+  # Used only when feedforward_dim is null.
+  mlp_ratio: 4.0
+  dropout: 0.1
+
+loader:
+  batch_size: 16
+  num_workers: 8
+  pin_memory: false
+  persistent_workers: false
+
+training:
+  epochs: 100
+  optimizer: adam
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  adam_betas: [0.9, 0.999]
+  adam_eps: 1.0e-8
+  grad_clip_norm: null
+  cpu_threads: 4
+  save_every_epochs: 5
+  max_train_batches: null
+  max_val_batches: null
+
+progress:
+  enabled: true
+  mininterval: 0.1
+
+swanlab:
+  enabled: true
+  project: rmbench_future_predictor
+  workspace: null
+  experiment_name: pre_transformer
+  mode: online
+  log_every_steps: 1

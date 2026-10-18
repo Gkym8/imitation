@@ -124,14 +124,6 @@ class BaseTrainer:
             return bool(marker.bool().all().item())
         return bool(marker)
 
-    @staticmethod
-    def _is_prefix_batch(batch: batch_type) -> bool:
-        marker = batch.get("prefix_sequence")
-        if marker is None:
-            return False
-        if isinstance(marker, torch.Tensor):
-            return bool(marker.bool().all().item())
-        return bool(marker)
 
     @staticmethod
     def _slice_streaming_batch(
@@ -167,14 +159,6 @@ class BaseTrainer:
             f"{type(self).__name__} does not implement streaming training"
         )
 
-    def backward_prefix_batch(
-        self, batch: batch_type
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Accumulate one causal prefix and update once at its end."""
-
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement prefix training"
-        )
 
     def init_trainer(
         self,
@@ -506,14 +490,8 @@ class BaseTrainer:
                         "info/lr": max(self.lr_scheduler.get_last_lr()),
                     }
 
-                    prefix_batch = self._is_prefix_batch(batch)
                     streaming_batch = self._is_streaming_batch(batch)
-                    if prefix_batch:
-                        loss, detached_loss_dict = (
-                            self.backward_prefix_batch(batch)
-                        )
-                        step_increment = 1
-                    elif streaming_batch:
+                    if streaming_batch:
                         # Streaming owns the complete optimization lifecycle:
                         # every bounded chunk is one training micro-step.
                         loss, detached_loss_dict = (

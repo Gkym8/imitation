@@ -23,7 +23,6 @@ from robot_utils.torch_utils import aggregate_batch, torch_save
 from imitation_learning.utils.data_utils import get_shakiness_score_torch
 
 
-
 class PolicyTrainer(BaseTrainer):
 
     def __init__(
@@ -31,7 +30,6 @@ class PolicyTrainer(BaseTrainer):
         rollout_every: int,
         rollout_env: BaseEnv | None,
         critical_action_loss_weights: list[float],
-        memory_gate_loss_weight: float,
         future_prediction_loss_weight: float = 1.0,
         streaming_chunk_length: int = 4,
         streaming_chunk_accumulate: int = 1,
@@ -47,7 +45,6 @@ class PolicyTrainer(BaseTrainer):
         if not isinstance(rollout_env, BaseEnv):
             rollout_env = None
         self.rollout_env: BaseEnv | None = rollout_env
-        self.memory_gate_loss_weight: float = memory_gate_loss_weight
         if future_prediction_loss_weight < 0:
             raise ValueError("future_prediction_loss_weight must be non-negative")
         self.future_prediction_loss_weight = future_prediction_loss_weight
@@ -440,22 +437,13 @@ class PolicyTrainer(BaseTrainer):
         frame_combined = self._combine_attention_layers(stats["frame_logit"])
         frame_token_num = int(frame_combined["mean"].shape[-1])
         history_token_labels: list[str] = []
-        if getattr(denoising_network, "include_action_history", False):
-            history_token_labels.extend(
-                [
-                    f"history_action_{idx}"
-                    for idx in range(
-                        int(denoising_network.history_action_num_per_chunk)
-                    )
-                ]
-            )
         history_encoder = getattr(policy, "history_img_feature_encoder", None)
         image_names = (
             list(history_encoder.data_entry_names)
             if history_encoder is not None
             else []
         )
-        remaining_token_num = frame_token_num - len(history_token_labels)
+        remaining_token_num = frame_token_num
         if remaining_token_num == len(image_names):
             history_token_labels.extend(image_names)
         else:
@@ -647,14 +635,6 @@ class PolicyTrainer(BaseTrainer):
                 loss_dict["prediction_error_slot_weight_table"]
             )
 
-        if "memory_gate_val" in loss_dict:  
-            loss += loss_dict["memory_gate_val"] * self.memory_gate_loss_weight
-            detached_loss_dict["train/memory_gate_val"] = float(
-                loss_dict["memory_gate_val"].detach().cpu()
-            )
-            detached_loss_dict["train/binary_memory_gate_val"] = float(
-                loss_dict["binary_memory_gate_val"].detach().cpu()
-            )
 
         if "future_prediction" in loss_dict:
             loss += (
@@ -680,14 +660,6 @@ class PolicyTrainer(BaseTrainer):
                 print(f"{loss_dict['critical_action']=}")
                 raise
 
-        if "critical_memory_gate_val" in loss_dict:
-            # Will not add to loss, but will log it
-            detached_loss_dict["train/critical_memory_gate_val"] = float(
-                loss_dict["critical_memory_gate_val"].detach().cpu()
-            )
-            detached_loss_dict["train/critical_binary_memory_gate_val"] = float(
-                loss_dict["critical_binary_memory_gate_val"].detach().cpu()
-            )
 
         detached_loss_dict["train/loss"] = float(loss.detach().cpu())
 
@@ -895,195 +867,15 @@ class PolicyTrainer(BaseTrainer):
             )
         return total_loss, detached_totals
 
-    def backward_prefix_batch(
-        self, batch: batch_type
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Backpropagate each anchor, then update once for the whole prefix."""
 
-        assert self.model is not None
-        assert self.accelerator is not None
-        assert self.optimizer is not None
-        assert self.lr_scheduler is not None
-        assert self.ema_model is not None
+    @contextlib.contextmanager
+    def _training_sample_memory(self, policy: BasePolicy):
+        """Keep evaluation on the restored policy's configured eviction rule."""
 
-        supervised_mask = batch.get("prefix_supervised_mask")
-        feature_valid = batch.get("prefix_feature_valid")
-        if (
-            not isinstance(supervised_mask, torch.Tensor)
-            or supervised_mask.ndim != 2
-            or not isinstance(feature_valid, torch.Tensor)
-            or feature_valid.shape != supervised_mask.shape
-        ):
-            raise ValueError(
-                "prefix batches require prefix_supervised_mask and "
-                "prefix_feature_valid with shape [batch, sequence]"
-            )
-        batch_size, local_sequence_length = supervised_mask.shape
-        valid_columns = torch.nonzero(
-            supervised_mask.bool().any(dim=0), as_tuple=False
-        ).flatten()
-        if valid_columns.numel() == 0:
-            raise ValueError("prefix batch contains no supervised anchor")
-        local_anchor_num = int(valid_columns[-1].item()) + 1
-
-        local_anchor_tensor = torch.tensor(
-            local_anchor_num,
-            dtype=torch.long,
-            device=supervised_mask.device,
-        )
-        # Accelerate 0.x silently treats unknown reductions as SUM, so do not
-        # pass ``reduction='max'`` here. Gather the one scalar per rank and
-        # compute the maximum explicitly.
-        global_anchor_num = int(
-            self.accelerator.gather(
-                local_anchor_tensor.reshape(1)
-            ).max().item()
-        )
-        required_sequence_length = global_anchor_num + 1
-
-        def pad_value(value: Any, key: str) -> Any:
-            if isinstance(value, dict):
-                return {
-                    nested_key: pad_value(nested_value, nested_key)
-                    for nested_key, nested_value in value.items()
-                }
-            if (
-                not isinstance(value, torch.Tensor)
-                or value.ndim < 2
-                or value.shape[0] != batch_size
-                or value.shape[1] != local_sequence_length
-                or local_sequence_length >= required_sequence_length
-            ):
-                return value
-            pad_length = required_sequence_length - local_sequence_length
-            pad_shape = (
-                batch_size,
-                pad_length,
-                *value.shape[2:],
-            )
-            if key == "entire_traj_is_padding":
-                padding = torch.ones(
-                    pad_shape, dtype=torch.bool, device=value.device
-                )
-            elif key == "traj_idx":
-                # Keep DDP-only padding compatible with absolute frame-time
-                # encoding.  These repeated indices are placeholders only:
-                # the corresponding supervised/feature masks remain false.
-                padding = value[:, -1:].expand(pad_shape).clone()
-            else:
-                padding = torch.zeros(
-                    pad_shape, dtype=value.dtype, device=value.device
-                )
-            return torch.cat([value, padding], dim=1)
-
-        if local_sequence_length < required_sequence_length:
-            batch = cast(
-                batch_type,
-                {
-                    key: pad_value(value, key)
-                    for key, value in batch.items()
-                },
-            )
-            supervised_mask = cast(
-                torch.Tensor, batch["prefix_supervised_mask"]
-            )
-
-        local_valid_num = supervised_mask[:, :global_anchor_num].sum()
-        global_valid_num = self.accelerator.reduce(
-            local_valid_num.to(dtype=torch.float32), reduction="sum"
-        ).clamp_min(1.0)
-
-        total_loss = torch.zeros((), device=supervised_mask.device)
-        detached_totals: dict[str, float] = {}
-
-        with self.accelerator.accumulate(self.model):
-            for anchor_idx in range(global_anchor_num):
-                anchor_batch = self._slice_streaming_batch(
-                    batch,
-                    anchor_idx,
-                    anchor_idx + 2,
-                    batch_size,
-                    required_sequence_length,
-                )
-                anchor_batch["_prefix_reset"] = anchor_idx == 0
-                anchor_batch["_prefix_final"] = (
-                    anchor_idx == global_anchor_num - 1
-                )
-
-                local_current_valid = int(
-                    supervised_mask[:, anchor_idx].sum().item()
-                )
-                # DDP averages gradients across ranks. Multiplying by world
-                # size yields a true global mean over all valid anchor rows.
-                backward_scale = (
-                    self.accelerator.num_processes
-                    * local_current_valid
-                    / float(global_valid_num.item())
-                )
-                local_log_scale = local_current_valid / max(
-                    1, int(local_valid_num.item())
-                )
-
-                is_last_anchor = anchor_idx == global_anchor_num - 1
-                sync_context = (
-                    contextlib.nullcontext()
-                    if is_last_anchor
-                    else self.accelerator.no_sync(self.model)
-                )
-                with sync_context:
-                    with self.accelerator.autocast():
-                        anchor_loss, anchor_detached = self.compute_loss(
-                            anchor_batch
-                        )
-                        scaled_loss = anchor_loss * backward_scale
-                    self.accelerator.backward(scaled_loss)
-
-                total_loss = (
-                    total_loss
-                    + anchor_loss.detach() * local_log_scale
-                )
-                for key, value in anchor_detached.items():
-                    detached_totals[key] = (
-                        detached_totals.get(key, 0.0)
-                        + value * local_log_scale
-                    )
-
-            if self.accelerator.sync_gradients and self.clip_grad_norms:
-                max_norm = (
-                    self.clip_grad_norms[-1]
-                    if self.epoch >= len(self.clip_grad_norms)
-                    else self.clip_grad_norms[self.epoch]
-                )
-                if max_norm == 0:
-                    max_norm = float("inf")
-                grad_norm = self.accelerator.clip_grad_norm_(
-                    self.model.parameters(), max_norm=max_norm
-                )
-                grad_norm_clipped = self.accelerator.clip_grad_norm_(
-                    self.model.parameters(), max_norm=max_norm
-                )
-                detached_totals["info/grad_norm"] = float(
-                    grad_norm.item()
-                )
-                detached_totals["info/clipped_grad_norm"] = float(
-                    grad_norm_clipped.item()
-                )
-
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            self.lr_scheduler.step()
-            if (
-                self.accelerator.sync_gradients
-                and self.accelerator.is_main_process
-            ):
-                self.ema_model.step(
-                    self.accelerator.unwrap_model(self.model)
-                )
-
-        if not detached_totals:
-            raise RuntimeError("prefix training produced no anchor losses")
-        detached_totals["train/loss"] = float(total_loss.cpu())
-        return total_loss, detached_totals
+        # The random/prefix training sampler and its temporary eviction mode
+        # were removed.  Streaming training and evaluation now use the same
+        # chronological memory semantics.
+        yield
 
     def eval_model_step(
         self, step_log: dict[str, Any], train_sampling_batch: batch_type
@@ -1170,22 +962,7 @@ class PolicyTrainer(BaseTrainer):
             else:
                 traj_is_critical = None
 
-            if "action_is_error" in batch and isinstance(eval_policy, HistoryDenoisingPolicy):
-                action_key_names = eval_policy.action_decoder.data_entry_names
-                action_traj_length = batch[action_key_names[0]].shape[-2]
-                traj_error_mask = torch.zeros(
-                    action_traj_length,
-                    device=batch["action_is_error"].device,
-                )
-                traj_error_mask[
-                    cast(HistoryDenoisingPolicy, eval_policy)
-                    .action_no_error_range[0] : cast(HistoryDenoisingPolicy, eval_policy)
-                    .action_no_error_range[1]
-                ] = 1
-                traj_is_error = batch["action_is_error"].squeeze(-1) * traj_error_mask
-                traj_is_error = traj_is_error.any(dim=-1) # (batch_size, traj_num) or (batch_size, )
-            else:
-                traj_is_error = None
+            traj_is_error = None
 
             if "entire_traj_is_padding" in batch:
                 entire_traj_is_padding = batch["entire_traj_is_padding"]
@@ -1212,7 +989,8 @@ class PolicyTrainer(BaseTrainer):
                 for key in action_key_names:
                     gt_action[key] = train_sampling_batch.pop(key)
                 
-                pred_action = eval_policy.predict_action(train_sampling_batch)
+                with self._training_sample_memory(eval_policy):
+                    pred_action = eval_policy.predict_action(train_sampling_batch)
 
                 log_action_mse(
                     step_log, "train_sample", pred_action, gt_action, self.accelerator, **flags
@@ -1236,50 +1014,8 @@ class PolicyTrainer(BaseTrainer):
                     for key in action_key_names:
                         gt_action[key] = val_batch.pop(key)
 
-                    pred_action = eval_policy.predict_action(val_batch)
-
-                    # Prefix batches are padded only to the longest sample in
-                    # that batch, so their trajectory dimension may differ
-                    # across validation batches.  Flatten (batch, trajectory)
-                    # into one sample dimension before collecting results.
-                    # The action/time dimensions then stay fixed and can be
-                    # concatenated without introducing any new fake anchors.
-                    reference_action = gt_action[action_key_names[0]]
-                    if reference_action.ndim >= 4:
-                        val_batch_size, val_traj_num = (
-                            reference_action.shape[:2]
-                        )
-
-                        def flatten_traj_dim(
-                            value: torch.Tensor,
-                        ) -> torch.Tensor:
-                            if (
-                                value.ndim >= 2
-                                and tuple(value.shape[:2])
-                                == (val_batch_size, val_traj_num)
-                            ):
-                                return value.reshape(
-                                    val_batch_size * val_traj_num,
-                                    *value.shape[2:],
-                                )
-                            return value
-
-                        gt_action = {
-                            key: flatten_traj_dim(value)
-                            for key, value in gt_action.items()
-                        }
-                        pred_action = {
-                            key: flatten_traj_dim(value)
-                            for key, value in pred_action.items()
-                        }
-                        traj_flags = {
-                            key: (
-                                flatten_traj_dim(value)
-                                if isinstance(value, torch.Tensor)
-                                else value
-                            )
-                            for key, value in traj_flags.items()
-                        }
+                    with self._training_sample_memory(eval_policy):
+                        pred_action = eval_policy.predict_action(val_batch)
 
                     all_traj_flags.append(traj_flags)
                     all_gt_actions.append(gt_action)

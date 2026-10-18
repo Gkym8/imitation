@@ -36,12 +36,10 @@ class BCRNNPolicy(BasePolicy):
         rnn_type: str,
         mlp_layer_dims: list[int],
         open_loop: bool,
-        action_no_error_range: tuple[int, int],
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.shared_model_manager = shared_model_manager
-        self.action_no_error_range: tuple[int, ...] = tuple(action_no_error_range)
         self.detach_rnn_state = detach_rnn_state
         self.rnn_hidden_dim = rnn_hidden_dim
         self.rnn_num_layers = rnn_num_layers
@@ -258,22 +256,6 @@ class BCRNNPolicy(BasePolicy):
         # Mask out padding trajectories
         if "entire_traj_is_padding" in normalized_batch:
             action_loss = action_loss * (~normalized_batch["entire_traj_is_padding"])
-
-        # Error trajectory is only for debugging
-        # Mask out error trajectories (matching diffusion policy)
-        if "action_is_error" in normalized_batch:
-            action_traj_length = gt_trajectory.shape[2]
-            traj_error_mask = torch.zeros(action_traj_length, device=self.device)
-            traj_error_mask[
-                self.action_no_error_range[0] : self.action_no_error_range[1]
-            ] = 1
-            traj_is_error = (
-                normalized_batch["action_is_error"] * traj_error_mask[None, None, :]
-            )  # (batch_size, traj_num, traj_length)
-            traj_is_error = einops.reduce(
-                traj_is_error, "b t ... -> b t", "any"
-            )  # (batch_size, traj_num)
-            action_loss = action_loss * (~traj_is_error)
 
         # Track critical action loss separately (matching diffusion policy)
         loss: batch_type = {}

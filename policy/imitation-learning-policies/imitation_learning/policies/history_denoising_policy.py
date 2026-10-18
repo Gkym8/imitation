@@ -18,11 +18,9 @@ from imitation_learning.models.future_prediction.future_feature_predictor import
     FutureFeaturePredictor)
 from imitation_learning.models.memory.dynamic_memory_weight import (
     DynamicMemoryWeightRecord, DynamicMemoryWeightUpdateConfig,
-    apply_dynamic_memory_weight_update, select_memory_slot_eviction_index,
-    select_random_training_slot_eviction_index)
+    apply_dynamic_memory_weight_update, select_memory_slot_eviction_index)
 from imitation_learning.models.memory.prediction_error_queue import (
-    PredictionErrorQueue, PredictionErrorQueueConfig, PredictionErrorRecord,
-    apply_recent_slot_attention_floor)
+    PredictionErrorQueue, PredictionErrorQueueConfig, PredictionErrorRecord)
 from imitation_learning.models.memory.slot_weight_table import (
     build_active_slot_weight_table)
 from imitation_learning.policies.base_denoising_policy import BaseDenoisingPolicy
@@ -58,102 +56,60 @@ class StreamingTrainingState:
 
 
 @dataclass
-class PrefixTrainingState:
-    """Raw detached slot inputs retained across per-anchor backwards."""
-
-    history_img_features: list[list[torch.Tensor]]
-    history_actions: list[list[torch.Tensor]]
-
-
-@dataclass
 class StreamingRawHistoryState:
     """Detached encoder outputs used to rebuild streaming history slots.
 
     The frozen image encoder outputs are the persistent state. Projected
     latents are rebuilt at the start of every chunk so later-chunk losses can
-    still train the shared history/action projectors without retaining an
+    still train the shared history image projector without retaining an
     autograd graph across optimizer steps.
     """
 
     history_img_features: list[list[torch.Tensor]]
-    history_actions: list[list[torch.Tensor]]
 
 
 class HistoryDenoisingPolicy(BaseDenoisingPolicy):
     def __init__(
         self,
         skip_memory: bool,
-        history_mask_max_prob: float,
         history_img_feature_encoder: MultiTokenEncoder | None,
-        action_no_error_range: tuple[int, int],
-        train_history_action_noise_level: str,
-        eval_history_action_noise_level: str,
-        history_action_num_per_chunk: int,
+        execution_chunk_length: int | None = None,
         future_img_feature_encoder: MultiTokenEncoder | None = None,
         future_prediction_context_pooling: str = "none",
+        use_cached_image_features: bool = True,
         future_feature_predictor: (
             FutureFeaturePredictor | Callable[..., FutureFeaturePredictor] | None
         ) = None,
         prediction_error_queue: Mapping[str, Any] | None = None,
         dynamic_memory_weight_update: Mapping[str, Any] | None = None,
-        attention_bias: bool = True,
-        training_slot_weight: bool = True,
-        compact_three_view_slots: bool = False,
-        state_conditioned_single_view_slots: bool = False,
+        training_bias: bool | None = None,
+        inference_bias: bool | None = None,
         # add_noise_to_history_img_features: bool,
         memory_gate: MemoryGate | None = None,
         max_training_traj_num: int = -1,
         **kwargs,
     ):
+        # Discard retired checkpoint metadata; memory slots contain images only.
+        legacy_chunk_length = kwargs.pop("history_action_num_per_chunk", None)
+        kwargs.pop("train_history_action_noise_level", None)
+        kwargs.pop("eval_history_action_noise_level", None)
+        if execution_chunk_length is None:
+            execution_chunk_length = legacy_chunk_length
 
-        global_cond_encoder = kwargs.get("global_cond_encoder")
-        history_view_num = (
-            len(history_img_feature_encoder.data_entry_names)
-            if history_img_feature_encoder is not None
-            else 0
-        )
-        compact_multiview_slot = (
-            compact_three_view_slots and history_view_num == 3
-        )
-        state_conditioned_history_slot = (
-            state_conditioned_single_view_slots and history_view_num == 1
-        )
-        if compact_multiview_slot:
-            if history_img_feature_encoder is None:
-                raise ValueError(
-                    "compact three-view slots require a history image encoder"
-                )
-            if history_img_feature_encoder.token_num != history_view_num:
-                raise ValueError(
-                    "each compact history view must produce exactly one token, "
-                    f"got {history_img_feature_encoder.token_num} tokens for "
-                    f"{history_view_num} views"
-                )
-            if not isinstance(global_cond_encoder, MultiTokenEncoder):
+        # Accept old checkpoint config keys, but explicit new keys take priority.
+        legacy_training_bias = kwargs.pop("training_slot_weight", True)
+        legacy_inference_bias = kwargs.pop("attention_bias", True)
+        if training_bias is None:
+            training_bias = legacy_training_bias
+        if inference_bias is None:
+            inference_bias = legacy_inference_bias
+        for name, value in (
+            ("training_bias", training_bias),
+            ("inference_bias", inference_bias),
+        ):
+            if not isinstance(value, bool):
                 raise TypeError(
-                    "compact three-view slots require MultiTokenEncoder global condition"
-                )
-            if (
-                len(global_cond_encoder.data_entry_names) != history_view_num
-                or global_cond_encoder.token_num != history_view_num
-            ):
-                raise ValueError(
-                    "compact current/history views must be aligned one-to-one"
-                )
-        if state_conditioned_history_slot:
-            if history_img_feature_encoder is None:
-                raise ValueError(
-                    "state-conditioned single-view slots require a history "
-                    "image encoder"
-                )
-            if not isinstance(global_cond_encoder, MultiTokenEncoder):
-                raise TypeError(
-                    "state-conditioned single-view slots require a "
-                    "MultiTokenEncoder global condition"
-                )
-            if global_cond_encoder.token_num != history_img_feature_encoder.token_num:
-                raise ValueError(
-                    "state-conditioned current/history patch counts must match"
+                    f"{name} must be a bool, got {type(value).__name__}"
                 )
 
         if history_img_feature_encoder is not None:
@@ -161,16 +117,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 kwargs["denoising_network_partial"],
                 history_img_features_dim=history_img_feature_encoder.feature_dim,
                 history_img_features_token_num=history_img_feature_encoder.token_num,
-                history_action_num_per_chunk=history_action_num_per_chunk,
-                compact_multiview_slot=compact_multiview_slot,
-                state_conditioned_history_slot=(
-                    state_conditioned_history_slot
-                ),
-                history_view_num=(history_view_num if compact_multiview_slot else 0),
-            )
-        if memory_gate is not None and isinstance(memory_gate, MemoryGate):
-            kwargs["denoising_network_partial"] = partial(
-                kwargs["denoising_network_partial"],
             )
 
         super().__init__(**kwargs)
@@ -188,13 +134,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             if isinstance(self.denoising_network, MemoryTransformer)
             else "additive"
         )
-        self.compact_multiview_slot = compact_multiview_slot
-        self.state_conditioned_history_slot = (
-            state_conditioned_history_slot
-        )
-        self.stores_state_conditioned_slots = (
-            compact_multiview_slot or state_conditioned_history_slot
-        )
 
         if future_prediction_context_pooling not in {"none", "mean"}:
             raise ValueError(
@@ -204,6 +143,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         self.future_prediction_context_pooling = (
             future_prediction_context_pooling
         )
+        self.use_cached_image_features = bool(use_cached_image_features)
         if future_img_feature_encoder is None:
             # Keep legacy checkpoints unchanged: the fallback is the already
             # registered history encoder, not a second nn.Module alias with a
@@ -232,16 +172,8 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             assert self.future_img_feature_encoder is not None
             future_feature_predictor = future_feature_predictor(
                 hidden_dim=self.denoising_network.hidden_dim,
-                output_feature_dim=(
-                    self.denoising_network.hidden_dim
-                    if self.compact_multiview_slot
-                    else self.future_img_feature_encoder.feature_dim
-                ),
-                future_token_num=(
-                    history_view_num
-                    if self.compact_multiview_slot
-                    else self.future_img_feature_encoder.token_num
-                ),
+                output_feature_dim=self.future_img_feature_encoder.feature_dim,
+                future_token_num=self.future_img_feature_encoder.token_num,
                 action_dim=self.action_decoder.latent_dim,
                 max_action_length=self.action_decoder.token_num,
             )
@@ -264,34 +196,15 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     f"{denoising_network.hidden_dim})"
                 )
             assert self.future_img_feature_encoder is not None
-            if self.compact_multiview_slot:
-                if (
-                    self.future_feature_predictor.output_feature_dim
-                    != denoising_network.hidden_dim
-                    or self.future_feature_predictor.future_token_num
-                    != history_view_num
-                ):
-                    raise ValueError(
-                        "compact future predictor must output one hidden-dim token "
-                        "per camera view"
-                    )
-            else:
-                if (
-                    self.future_feature_predictor.output_feature_dim
-                    != self.future_img_feature_encoder.feature_dim
-                ):
-                    raise ValueError(
-                        "Future predictor output_feature_dim must match the future "
-                        "target image encoder feature_dim"
-                    )
-                if (
-                    self.future_feature_predictor.future_token_num
-                    != self.future_img_feature_encoder.token_num
-                ):
-                    raise ValueError(
-                        "Future predictor future_token_num must match the number of "
-                        "future target image tokens"
-                    )
+            if (
+                self.future_feature_predictor.output_feature_dim
+                != self.future_img_feature_encoder.feature_dim
+                or self.future_feature_predictor.future_token_num
+                != self.future_img_feature_encoder.token_num
+            ):
+                raise ValueError(
+                    "Future predictor output shape must match the future image encoder"
+                )
             if (
                 self.future_feature_predictor.use_action_condition
                 and self.future_feature_predictor.action_dim
@@ -301,58 +214,48 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     "Future predictor action_dim must match action latent_dim"
                 )
 
-        if not isinstance(training_slot_weight, bool):
-            raise TypeError(
-                "training_slot_weight must be a bool, got "
-                f"{type(training_slot_weight).__name__}"
-            )
-        self.training_slot_weight = training_slot_weight
+        self.training_bias = training_bias
+        self.inference_bias = inference_bias
 
         self.prediction_error_queue_config: PredictionErrorQueueConfig | None = None
-        if prediction_error_queue is not None:
-            self.prediction_error_queue_config = (
-                PredictionErrorQueueConfig.from_mapping(prediction_error_queue)
-            )
-        if (
-            self.prediction_error_queue_config is not None
-            and self.prediction_error_queue_config.enabled
-            and self.future_feature_predictor is None
-        ):
-            raise ValueError(
-                "prediction_error_queue requires future_feature_predictor"
-            )
-        if (
-            self.prediction_error_queue_config is not None
-            and self.prediction_error_queue_config.enabled
-            and max_training_traj_num > 0
-        ):
-            raise ValueError(
-                "prediction_error_queue requires temporally ordered anchors; "
-                "max_training_traj_num must be -1 because random anchor "
-                "subsampling breaks the causal queue update"
-            )
-        if (
-            self.prediction_error_queue_config is not None
-            and self.prediction_error_queue_config.enabled
-            and skip_memory
-        ):
-            raise ValueError(
-                "prediction_error_queue cannot be enabled when skip_memory is True"
-            )
-
         self.dynamic_memory_weight_update_config: (
             DynamicMemoryWeightUpdateConfig | None
         ) = None
-        if not isinstance(attention_bias, bool):
-            raise TypeError(
-                f"attention_bias must be a bool, got {type(attention_bias).__name__}"
-            )
-        self.attention_bias = attention_bias
         if dynamic_memory_weight_update is not None:
             self.dynamic_memory_weight_update_config = (
                 DynamicMemoryWeightUpdateConfig.from_mapping(
                     dynamic_memory_weight_update
                 )
+            )
+        if prediction_error_queue is not None:
+            queue_mapping = dict(prediction_error_queue)
+            if self.dynamic_memory_weight_update_config is not None:
+                dynamic_config = self.dynamic_memory_weight_update_config
+                queue_mapping.setdefault(
+                    "first_slot_weight", dynamic_config.first_weight
+                )
+                queue_mapping.setdefault(
+                    "record_training_stats", dynamic_config.record_stats
+                )
+                queue_mapping.setdefault(
+                    "record_slot_weights", dynamic_config.record_weights
+                )
+            self.prediction_error_queue_config = (
+                PredictionErrorQueueConfig.from_mapping(queue_mapping)
+            )
+        if (
+            self.prediction_error_queue_enabled
+            and self.future_feature_predictor is None
+        ):
+            raise ValueError("prediction_error_queue requires future_feature_predictor")
+        if self.prediction_error_queue_enabled and max_training_traj_num > 0:
+            raise ValueError(
+                "prediction_error_queue requires temporally ordered anchors; "
+                "max_training_traj_num must be -1"
+            )
+        if self.prediction_error_queue_enabled and skip_memory:
+            raise ValueError(
+                "prediction_error_queue cannot be enabled when skip_memory is True"
             )
         if (
             self.dynamic_memory_weight_update_config is not None
@@ -386,37 +289,20 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         if (
             self.dynamic_memory_weight_update_config is not None
             and isinstance(self.denoising_network, MemoryTransformer)
-            and self.dynamic_memory_weight_update_config
-            .recent_slot_protection_num
+            and self.dynamic_memory_weight_update_config.keep_recent
             > self.denoising_network.max_history_len
         ):
             raise ValueError(
-                "recent_slot_protection_num cannot exceed max_history_len, "
-                f"got {self.dynamic_memory_weight_update_config.recent_slot_protection_num} "
+                "keep_recent cannot exceed max_history_len, "
+                f"got {self.dynamic_memory_weight_update_config.keep_recent} "
                 f"and {self.denoising_network.max_history_len}"
             )
-        self.action_no_error_range: tuple[int, ...] = tuple(action_no_error_range)
-        """
-        If any training action between the two values is error, will not backprop the loss
-        """
-        assert self.action_no_error_range[1] > self.action_no_error_range[0] >= 0
 
 
-        self.history_noisy_actions_dict: dict[int, list[list[torch.Tensor]]] = {}
-        """
-        episode_idx -> list [num_history] of lists [num_inference_steps] of tensors [noisy_history_action, shape: (action_length, action_dim)]
-        history_mask_max_prob: [0, 1], higher means more history latents will be masked
-        Since the action diffusion is not in latent space, we directly store the noisy action as latents
-        In the future, we can also store image features/latents in the buffer
-        """
         self.history_img_features_dict: dict[int, list[torch.Tensor]] = {}
         """
         episode_idx -> list [num_history] of tensors [history_img_features, shape: (history_img_features_length, img_length*history_img_features_token_num, history_img_features_dim)]
         """
-        assert (
-            0 <= history_mask_max_prob <= 1
-        ), f"history_mask_max_prob must be in [0, 1], but got {history_mask_max_prob}"
-        self.history_mask_max_prob: float = history_mask_max_prob
 
         if not isinstance(memory_gate, MemoryGate):
             self.memory_gate: MemoryGate | None = None
@@ -465,50 +351,34 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         self._streaming_raw_history_state: (
             StreamingRawHistoryState | None
         ) = None
-        self._prefix_training_state: PrefixTrainingState | None = None
 
         self.history_img_feature_encoder: MultiTokenEncoder | None = (
             history_img_feature_encoder
         )
         self.history_storage_token_num = (
-            history_view_num
-            if self.compact_multiview_slot
-            else (
-                history_img_feature_encoder.token_num
-                if history_img_feature_encoder is not None
-                else 0
-            )
+            history_img_feature_encoder.token_num
+            if history_img_feature_encoder is not None
+            else 0
         )
         self.history_storage_feature_dim = (
-            self.denoising_network.hidden_dim
-            if self.stores_state_conditioned_slots
-            else (
-                history_img_feature_encoder.feature_dim
-                if history_img_feature_encoder is not None
-                else 0
-            )
+            history_img_feature_encoder.feature_dim
+            if history_img_feature_encoder is not None
+            else 0
         )
 
-        if self.compact_multiview_slot:
-            # Preserve all three enhanced tokens as future-prediction context.
-            # The single-view path keeps the configured pooling unchanged.
-            self.future_prediction_context_pooling = "none"
-
-        self.history_action_num_per_chunk: int = history_action_num_per_chunk
-        """
-        Number of history actions to be stored in the buffer. Should be the number of executed actions in one chunk.
-        """
-
-        assert train_history_action_noise_level in ["last_step", "none", "random"]
-        assert eval_history_action_noise_level in ["last_step", "none", "random"]
-        self.train_history_action_noise_level: str = train_history_action_noise_level
-        self.eval_history_action_noise_level: str = eval_history_action_noise_level
-        """
-        last_step: use one-step less noisy history action as condition
-        none: use clean history action as condition
-        random: use random noise levey history action as condition
-        """
-
+        if execution_chunk_length is None:
+            execution_chunk_length = self.action_decoder.token_num
+        if (
+            isinstance(execution_chunk_length, bool)
+            or not isinstance(execution_chunk_length, int)
+            or not 1 <= execution_chunk_length <= self.action_decoder.token_num
+        ):
+            raise ValueError(
+                "execution_chunk_length must be an integer in [1, action_length], "
+                f"got {execution_chunk_length}"
+            )
+        self.execution_chunk_length = execution_chunk_length
+        """Executed actions per decision, also the interval between image slots."""
 
         self.max_training_traj_num: int = max_training_traj_num
         """
@@ -591,53 +461,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             return context_tokens.mean(dim=-2, keepdim=True)
         return context_tokens
 
-    def _set_compact_future_targets(
-        self,
-        target: batch_type,
-        projected_input: dict[str, torch.Tensor],
-        entire_traj_is_padding: torch.Tensor,
-        future_transition_valid: torch.Tensor | None = None,
-    ) -> None:
-        """Use the next real S_t slot as the three-token prediction target."""
-
-        slot_features = projected_input.get("all_current_slot_features")
-        if slot_features is None:
-            raise KeyError(
-                "compact multi-view projection is missing all_current_slot_features"
-            )
-        if slot_features.ndim != 4:
-            raise ValueError(
-                "all_current_slot_features must have shape "
-                "[batch, trajectory, view, hidden]"
-            )
-        if slot_features.shape[2:] != (
-            self.history_storage_token_num,
-            self.history_storage_feature_dim,
-        ):
-            raise ValueError(
-                "compact slot feature shape does not match configured storage: "
-                f"{tuple(slot_features.shape)}"
-            )
-
-        future_features = torch.zeros_like(slot_features)
-        future_features[:, :-1] = slot_features[:, 1:]
-        future_valid = torch.zeros(
-            slot_features.shape[:2],
-            dtype=torch.bool,
-            device=slot_features.device,
-        )
-        future_valid[:, :-1] = (
-            ~entire_traj_is_padding[:, :-1]
-            & ~entire_traj_is_padding[:, 1:]
-        )
-        future_valid = self._mask_invalid_future_transitions(
-            future_valid,
-            future_transition_valid,
-        )
-        target["future_features"] = future_features
-        target["future_feature_mask"] = future_valid[:, :, None].expand(
-            -1, -1, self.history_storage_token_num
-        )
 
     @staticmethod
     def _mask_invalid_future_transitions(
@@ -758,11 +581,10 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         else:
             memory_gate_val = None
 
-        new_history_action_dict: dict[int, list[torch.Tensor]] = {}
-        batch_size, traj_length, action_dim = data_dict["noisy_action"].shape
+        batch_size = data_dict["noisy_action"].shape[0]
         assert batch_size == len(
             normalized_batch["episode_idx"]
-        ), f"Please make sure the batch size {batch_size} in data_dict['trajectory'].shape: {data_dict['trajectory'].shape}, is the same as the number of episodes {len(normalized_batch['episode_idx'])}"
+        ), f"Please make sure the batch size {batch_size} in data_dict['noisy_action'].shape: {data_dict['noisy_action'].shape}, is the same as the number of episodes {len(normalized_batch['episode_idx'])}"
 
 
         if isinstance(self.denoising_network, OptimizedModule):
@@ -775,9 +597,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         current_frame_indices = torch.empty(
             batch_size, dtype=torch.long, device=self.device
         )
-        for idx, episode_idx_tensor in enumerate(
-            normalized_batch["episode_idx"]
-        ):
+        for idx, episode_idx_tensor in enumerate(normalized_batch["episode_idx"]):
             episode_idx = int(episode_idx_tensor)
             current_frame_indices[idx] = self.next_frame_index_dict.get(
                 episode_idx, 0
@@ -785,41 +605,28 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
         current_history_img_features: torch.Tensor | None = None
         current_future_img_features: torch.Tensor | None = None
-        if self.stores_state_conditioned_slots and max_history_len > 0:
+        if self.history_img_feature_encoder is not None and max_history_len > 0:
             current_history_img_features = (
-                self.denoising_network.project_state_conditioned_slot_features(
-                    global_cond=data_dict["global_cond"],
-                    local_cond=data_dict.get("local_cond"),
-                    global_cond_mask=data_dict.get("global_cond_mask"),
-                    local_cond_mask=data_dict.get("local_cond_mask"),
+                self._encode_current_history_image_features(
+                    normalized_batch, batch_size
                 )
             )
-            if self.compact_multiview_slot:
-                # Compact three-view prediction targets the exact future S_t.
-                current_future_img_features = current_history_img_features
-            elif self.future_img_feature_encoder is not None:
-                # Full-patch single-view slots still predict the compact DINO
-                # CLS target used by the original prediction-error objective.
-                current_future_img_features = (
-                    self._encode_current_future_image_features(
-                        normalized_batch, batch_size
-                    )
+        if self.future_img_feature_encoder is not None and max_history_len > 0:
+            current_future_img_features = (
+                self._encode_current_future_image_features(
+                    normalized_batch, batch_size
                 )
-        else:
-            if self.history_img_feature_encoder is not None and max_history_len > 0:
-                current_history_img_features = (
-                    self._encode_current_history_image_features(
-                        normalized_batch, batch_size
-                    )
-                )
-            if self.future_img_feature_encoder is not None and max_history_len > 0:
-                current_future_img_features = (
-                    self._encode_current_future_image_features(
-                        normalized_batch, batch_size
-                    )
-                )
+            )
 
         current_slot_weights: torch.Tensor | None = None
+        # With online prediction-error updates, the current observation is
+        # kept as an over-capacity pending slot until the next observation
+        # resolves its future-prediction error. This makes inference evict
+        # slots in the same order as causal training: update, then evict.
+        defer_online_eviction = (
+            self.prediction_error_queue_enabled
+            and self.dynamic_memory_weight_update_enabled
+        )
         if self.prediction_error_queue_enabled and max_history_len > 0:
             if current_future_img_features is None:
                 raise RuntimeError(
@@ -871,6 +678,12 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 current_slot_weights[idx] = self._freeze_first_slot_weight(
                     record.initial_weight,
                     int(current_frame_indices[idx].item()),
+                )
+
+        if defer_online_eviction:
+            for episode_idx_tensor in normalized_batch["episode_idx"]:
+                self._trim_online_history_buffer(
+                    int(episode_idx_tensor), max_history_len
                 )
 
         queried_history_slot_ids: list[tuple[int, ...]] = []
@@ -957,51 +770,26 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                         self.history_img_features_dict[int(episode_idx)], dim=0
                     )
 
-        history_frame_indices = torch.zeros(
-            (batch_size, max_history_len),
-            dtype=torch.long,
-            device=self.device,
-        )
-        for idx, episode_idx_tensor in enumerate(
-            normalized_batch["episode_idx"]
-        ):
+        for episode_idx_tensor in normalized_batch["episode_idx"]:
             episode_idx = int(episode_idx_tensor)
             retained_frame_indices = self.history_frame_indices_dict.get(
                 episode_idx, []
             )
-            retained_action_count = len(
-                self.history_noisy_actions_dict.get(episode_idx, [])
+            retained_image_count = len(
+                self.history_img_features_dict.get(episode_idx, [])
             )
-            if len(retained_frame_indices) != retained_action_count:
+            if len(retained_frame_indices) != retained_image_count:
                 raise RuntimeError(
-                    "online action/frame-index buffers are misaligned for "
+                    "online image/frame-index buffers are misaligned for "
                     f"episode {episode_idx}"
-                )
-            if retained_frame_indices:
-                history_frame_indices[idx, -len(retained_frame_indices):] = (
-                    torch.as_tensor(
-                        retained_frame_indices,
-                        dtype=torch.long,
-                        device=self.device,
-                    )
                 )
 
         recorded_data_dicts: list[dict[str, torch.Tensor]] = []
         cached_decision_memory: torch.Tensor | None = None
         pending_retrieval_inputs: dict[str, torch.Tensor] | None = None
 
-        for k, t in enumerate(self.noise_scheduler.get_inference_timesteps()):
+        for t in self.noise_scheduler.get_inference_timesteps():
             decision_memory_was_cached = cached_decision_memory is not None
-            history_noisy_actions = torch.zeros(
-                (
-                    batch_size,
-                    max_history_len,
-                    self.history_action_num_per_chunk,
-                    action_dim
-                ),
-                device=self.device,
-            ) # (batch_size, max_history_len, history_action_num_per_chunk, action_dim)
-
             history_mask = torch.zeros(
                 (batch_size, max_history_len),
                 device=self.device,
@@ -1017,38 +805,12 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             # never the temporarily raised attention bias.
             history_stored_weights = torch.zeros_like(history_attention_bias)
 
-            # print(f"{self.history_noisy_actions_dict.keys()=}")
-            # print(f"{normalized_batch['episode_idx']=}")
-
             for l, episode_idx in enumerate(normalized_batch["episode_idx"]):
-                if int(episode_idx) in self.history_noisy_actions_dict.keys():
-
-                    if self.eval_history_action_noise_level == "none":
-                        diffusion_step_idx = -1
-                    elif self.eval_history_action_noise_level == "random":
-                        rand_idx = int(torch.randint(0, len(self.noise_scheduler.get_inference_timesteps()), (1,)).item())
-                        diffusion_step_idx = rand_idx
-                    elif self.eval_history_action_noise_level == "last_step":
-                        diffusion_step_idx = k
-                    else:
-                        raise ValueError(f"Invalid history action noise level: {self.eval_history_action_noise_level}")
-
-                    history_len = len(self.history_noisy_actions_dict[int(episode_idx)])
-                    stacked_history_noisy_action = torch.stack(
-                        [
-                            self.history_noisy_actions_dict[int(episode_idx)][i][
-                                diffusion_step_idx
-                            ]
-                            for i in range(history_len)
-                        ],
-                        dim=0,
-                    )  # (history_len, token_num, hidden_dim)
-
-                    history_noisy_actions[l, -history_len:] = (
-                        stacked_history_noisy_action
-                    )
-
-                    history_mask[l, -history_len:] = 1
+                history_len = len(
+                    self.history_img_features_dict.get(int(episode_idx), [])
+                )
+                if history_len > 0:
+                    history_mask[l, -history_len:] = True
                     if self.prediction_error_queue_enabled:
                         episode_idx_int = int(episode_idx)
                         if episode_idx_int not in self.history_memory_weights_dict:
@@ -1061,7 +823,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                         ]
                         if len(weights) != history_len:
                             raise RuntimeError(
-                                "History feature/action/weight buffers are not "
+                                "History image/weight buffers are not "
                                 f"aligned for episode {episode_idx_int}"
                             )
                         assert self.prediction_error_queue_config is not None
@@ -1072,43 +834,15 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                         retained_frame_indices = (
                             self.history_frame_indices_dict[episode_idx_int]
                         )
-                        fixed_slot_mask = self._frozen_first_slot_mask(
-                            torch.as_tensor(
-                                retained_frame_indices,
-                                dtype=torch.long,
-                                device=stored_weights.device,
-                            )
-                        )
-                        recent_slot_protection_num = (
-                            self.dynamic_memory_weight_update_config
-                            .recent_slot_protection_num
-                            if self.dynamic_memory_weight_update_config
-                            is not None
-                            else 0
-                        )
-                        history_attention_bias[l, -history_len:] = (
-                            apply_recent_slot_attention_floor(
-                                stored_weights,
-                                attention_bias_mode=(
-                                    self.history_attention_bias_mode
-                                ),
-                                recent_slot_protection_num=(
-                                    recent_slot_protection_num
-                                ),
-                                recent_slot_attention_floor=(
-                                    self.prediction_error_queue_config
-                                    .recent_slot_attention_floor
-                                ),
-                                fixed_slot_mask=fixed_slot_mask,
-                            )
-                        )
+                        # The stored slot weight is the attention bias.  The
+                        # newest slots and the first sampled slot are protected
+                        # only during eviction, never by a query-time floor.
+                        history_attention_bias[l, -history_len:] = stored_weights
 
             # These keys need to be overridden every time before the denoising network is called
             # Since the denoising network will pop the keys after the forward pass
-            data_dict["history_noisy_actions"] = history_noisy_actions
             data_dict["history_mask"] = history_mask
-            data_dict["history_frame_indices"] = history_frame_indices
-            if self.prediction_error_queue_enabled and self.attention_bias:
+            if self.prediction_error_queue_enabled and self.inference_bias:
                 data_dict["history_attention_bias"] = history_attention_bias
             else:
                 data_dict.pop("history_attention_bias", None)
@@ -1121,7 +855,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             )
 
             if self.history_img_feature_encoder is not None and max_history_len > 0:
-                noise_ratio = t / self.noise_scheduler.train_step_num
                 data_dict["history_img_features"] = history_img_features
 
             if (
@@ -1157,7 +890,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 )
                 if (
                     self.prediction_error_queue_enabled
-                    and not self.attention_bias
+                    and not self.inference_bias
                 ):
                     # Keep a shadow copy solely for the next prediction-error
                     # gradient update. The decision memory above, and therefore
@@ -1207,77 +940,60 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 data_dict["noisy_action"],
             )
 
-            for l, episode_idx in enumerate(normalized_batch["episode_idx"]):
-                if int(episode_idx) not in new_history_action_dict.keys():
-                    new_history_action_dict[int(episode_idx)] = []
-                new_history_action_dict[int(episode_idx)].append(
-                    data_dict["noisy_action"][l, :self.history_action_num_per_chunk].detach().clone()
-                )
-
         if max_history_len == 0: # For ablation study
             output = self.action_decoder.forward(data_dict["noisy_action"])
             return output  # (batch_size, traj_length, action_dim)
 
         # ================================ Update history buffer ================================
 
-        for episode_idx, history_action in new_history_action_dict.items():
-            # History: list [num_inference_steps] of tensors [noisy_history_action, shape: (action_length, action_dim)]
-            if episode_idx not in self.history_noisy_actions_dict.keys():
-                self.history_noisy_actions_dict[episode_idx] = []
-            self.history_noisy_actions_dict[episode_idx].append(history_action)
-
-        for episode_idx_tensor, frame_index_tensor in zip(
-            normalized_batch["episode_idx"], current_frame_indices
-        ):
-            episode_idx = int(episode_idx_tensor)
-            frame_index = int(frame_index_tensor)
-            if episode_idx not in self.history_frame_indices_dict:
-                self.history_frame_indices_dict[episode_idx] = []
-            self.history_frame_indices_dict[episode_idx].append(frame_index)
-            self.next_frame_index_dict[episode_idx] = (
-                frame_index + self.history_action_num_per_chunk
-            )
-
-        
         if current_history_img_features is not None:
-            for episode_idx, history_img_features in zip(
-                normalized_batch["episode_idx"], current_history_img_features
+            # A history slot is one atomic record.  Keep its image feature,
+            # frame index, weight, and stable ID in lockstep; otherwise a
+            # branch that has no image feature can leave orphan frame indices
+            # and corrupt the online eviction buffer on the next decision.
+            for idx, (episode_idx_tensor, history_img_features) in enumerate(
+                zip(normalized_batch["episode_idx"], current_history_img_features)
             ):
-                episode_idx = int(episode_idx)
+                episode_idx = int(episode_idx_tensor)
+                frame_index = int(current_frame_indices[idx])
+                self.history_frame_indices_dict.setdefault(episode_idx, []).append(
+                    frame_index
+                )
+                self.next_frame_index_dict[episode_idx] = (
+                    frame_index + self.execution_chunk_length
+                )
                 if episode_idx not in self.history_img_features_dict.keys():
                     self.history_img_features_dict[episode_idx] = []
                 self.history_img_features_dict[episode_idx].append(
                     history_img_features.detach().clone()
                 )
+                if current_slot_weights is not None:
+                    if episode_idx not in self.history_memory_weights_dict:
+                        self.history_memory_weights_dict[episode_idx] = []
+                        self.history_memory_slot_ids_dict[episode_idx] = []
+                        self.next_memory_slot_id_dict[episode_idx] = 0
+                    self.history_memory_weights_dict[episode_idx].append(
+                        current_slot_weights[idx].detach().clone()
+                    )
+                    slot_id = self.next_memory_slot_id_dict[episode_idx]
+                    self.next_memory_slot_id_dict[episode_idx] = slot_id + 1
+                    self.history_memory_slot_ids_dict[episode_idx].append(slot_id)
 
-        if current_slot_weights is not None:
-            for episode_idx_tensor, slot_weight in zip(
-                normalized_batch["episode_idx"], current_slot_weights
-            ):
-                episode_idx = int(episode_idx_tensor)
-                if episode_idx not in self.history_memory_weights_dict:
-                    self.history_memory_weights_dict[episode_idx] = []
-                    self.history_memory_slot_ids_dict[episode_idx] = []
-                    self.next_memory_slot_id_dict[episode_idx] = 0
-                self.history_memory_weights_dict[episode_idx].append(
-                    slot_weight.detach().clone()
+        if not defer_online_eviction:
+            for episode_idx_tensor in normalized_batch["episode_idx"]:
+                self._trim_online_history_buffer(
+                    int(episode_idx_tensor), max_history_len
                 )
-                slot_id = self.next_memory_slot_id_dict[episode_idx]
-                self.next_memory_slot_id_dict[episode_idx] = slot_id + 1
-                self.history_memory_slot_ids_dict[episode_idx].append(slot_id)
-
-        for episode_idx in new_history_action_dict:
-            self._trim_online_history_buffer(episode_idx, max_history_len)
 
         if current_slot_weights is not None:
             if cached_decision_memory is None or self.future_feature_predictor is None:
                 raise RuntimeError("Cannot create the next future prediction")
             if self.future_feature_predictor.use_action_condition:
                 # The next memory slot is observed after executing exactly one
-                # history-action chunk. Do not condition the future predictor
+                # execution chunk. Do not condition the future predictor
                 # on the unexecuted tail of the longer diffusion horizon.
                 action_condition = data_dict["noisy_action"][
-                    :, : self.history_action_num_per_chunk
+                    :, : self.execution_chunk_length
                 ]
             else:
                 action_condition = None
@@ -1386,7 +1102,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         # dimension to unbind below.  It is not model input, so discard it
         # before splitting a multi-trajectory batch for validation/sampling.
         normalized_batch.pop("streaming_sequence", None)
-        normalized_batch.pop("prefix_sequence", None)
         if "variance_temperature" in normalized_batch:
             normalized_batch.pop(
                 "variance_temperature"
@@ -1439,42 +1154,26 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         return PredictionErrorQueue(self.prediction_error_queue_config)
 
     def _is_frozen_first_slot_frame(self, frame_index: int) -> bool:
-        """Whether an absolute episode frame keeps the first-slot prior."""
+        """Compatibility hook; weights are never frozen after initialization."""
 
-        config = self.prediction_error_queue_config
-        return bool(
-            config is not None
-            and config.first_slot_frozen
-            and 0 <= frame_index <= config.first_slot_max_frame_distance
-        )
+        return False
 
     def _frozen_first_slot_mask(
         self,
         frame_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Vectorized counterpart of ``_is_frozen_first_slot_frame``."""
+        """Compatibility hook; no slot receives a fixed-weight mask."""
 
-        config = self.prediction_error_queue_config
-        if config is None or not config.first_slot_frozen:
-            return torch.zeros_like(frame_indices, dtype=torch.bool)
-        return (
-            (frame_indices >= 0)
-            & (frame_indices <= config.first_slot_max_frame_distance)
-        )
+        return torch.zeros_like(frame_indices, dtype=torch.bool)
 
     def _freeze_first_slot_weight(
         self,
         weight: torch.Tensor,
         frame_index: int,
     ) -> torch.Tensor:
-        """Replace an eligible slot weight with the immutable prior."""
+        """Compatibility hook; the initial prior is applied only once."""
 
-        if not self._is_frozen_first_slot_frame(frame_index):
-            return weight
-        assert self.prediction_error_queue_config is not None
-        return weight.new_tensor(
-            self.prediction_error_queue_config.first_slot_weight
-        )
+        return weight
 
     def _get_online_prediction_error_queue(
         self, episode_idx: int
@@ -1611,46 +1310,42 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
     def _trim_online_history_buffer(
         self, episode_idx: int, max_history_len: int
     ) -> None:
-        """Evict aligned slots using minimum weight or standard FIFO."""
+        """Evict aligned image slots using minimum weight or standard FIFO."""
 
-        actions = self.history_noisy_actions_dict.get(episode_idx, [])
-        images = (
-            self.history_img_features_dict.get(episode_idx, [])
-            if self.history_img_feature_encoder is not None
-            else None
-        )
-        if images is not None and len(actions) != len(images):
-            raise RuntimeError(
-                f"online action/image buffers are misaligned for episode {episode_idx}"
-            )
-
+        images = self.history_img_features_dict.get(episode_idx, [])
         weights = self.history_memory_weights_dict.get(episode_idx)
         slot_ids = self.history_memory_slot_ids_dict.get(episode_idx)
         frame_indices = self.history_frame_indices_dict.get(episode_idx)
         if frame_indices is None:
-            raise RuntimeError(
-                f"online frame-index buffer is missing for episode {episode_idx}"
-            )
-        if len(actions) != len(frame_indices):
-            raise RuntimeError(
-                "online action/frame-index buffers are misaligned for episode "
-                f"{episode_idx}"
-            )
+            return
+        # A stale/padded evaluation transition can leave one of the parallel
+        # lists one element longer than the others.  The records are appended
+        # chronologically, so retain their common prefix and discard only the
+        # unmatched tail before applying the normal eviction rule.
+        aligned_len = min(len(images), len(frame_indices))
+        if len(images) != len(frame_indices):
+            del images[aligned_len:]
+            del frame_indices[aligned_len:]
         if self.prediction_error_queue_enabled:
             if weights is None or slot_ids is None:
                 raise RuntimeError(
                     f"online weight/ID buffer is missing for episode {episode_idx}"
                 )
-            if len(actions) != len(weights) or len(actions) != len(slot_ids):
-                raise RuntimeError(
-                    f"online history buffers are misaligned for episode {episode_idx}"
-                )
+            aligned_len = min(aligned_len, len(weights), len(slot_ids))
+            if (
+                len(images) != aligned_len
+                or len(weights) != aligned_len
+                or len(slot_ids) != aligned_len
+            ):
+                del images[aligned_len:]
+                del frame_indices[aligned_len:]
+                del weights[aligned_len:]
+                del slot_ids[aligned_len:]
 
-        while len(actions) > max_history_len:
+        while len(images) > max_history_len:
             evict_lowest = (
                 self.dynamic_memory_weight_update_config is not None
-                and self.dynamic_memory_weight_update_config
-                .evict_lowest_weight_when_full
+                and self.dynamic_memory_weight_update_config.evict_lowest_weight_when_full
             )
             if evict_lowest:
                 assert weights is not None
@@ -1658,16 +1353,14 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     weights,
                     evict_lowest_weight_when_full=True,
                     recent_slot_protection_num=(
-                        self.dynamic_memory_weight_update_config
-                        .recent_slot_protection_num
+                        self.dynamic_memory_weight_update_config.recent_slot_protection_num
                     ),
+                    keep_first=self.dynamic_memory_weight_update_config.keep_first,
                 )
             else:
                 eviction_idx = 0
-            actions.pop(eviction_idx)
+            images.pop(eviction_idx)
             frame_indices.pop(eviction_idx)
-            if images is not None:
-                images.pop(eviction_idx)
             if weights is not None:
                 weights.pop(eviction_idx)
             if slot_ids is not None:
@@ -1747,7 +1440,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         target: batch_type,
         valid_slot_mask: torch.Tensor,
         slot_frame_indices: torch.Tensor,
-        pair_start_mask: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1760,13 +1452,11 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
         Only retrieval and future prediction are sequential. The returned
         decision memories are later sent through all DiT blocks as one flattened
-        batch. When ``training_slot_weight`` is disabled, training uses raw
-        attention and uniformly evicts one existing slot whenever the bank is
-        full; prediction-error weighting remains available during inference.
+        batch. ``training_bias`` only controls the main query bias;
+        the error queue, dynamic updates and configured eviction remain active
+        independently. Without an error queue, the bank uses FIFO eviction.
         """
 
-        if self.training_slot_weight and not self.prediction_error_queue_enabled:
-            raise RuntimeError("causal memory construction requires error queue")
         if self.future_feature_predictor is None:
             raise RuntimeError("future_feature_predictor is required")
         if not isinstance(
@@ -1780,18 +1470,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 "slot_frame_indices must have shape "
                 f"{(batch_size, traj_num)}, got "
                 f"{tuple(slot_frame_indices.shape)}"
-            )
-        random_pair_training = pair_start_mask is not None
-        if pair_start_mask is not None:
-            if pair_start_mask.shape != (batch_size, traj_num):
-                raise ValueError(
-                    "pair_start_mask must have shape "
-                    f"{(batch_size, traj_num)}, got "
-                    f"{tuple(pair_start_mask.shape)}"
-                )
-            pair_start_mask = pair_start_mask.to(
-                device=projected_input["x"].device,
-                dtype=torch.bool,
             )
         flat_batch_size = batch_size * traj_num
         if projected_input["x"].shape[0] != flat_batch_size:
@@ -1812,40 +1490,26 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 dtype=torch.float32,
                 device=projected_input["x"].device,
             )
-            if self.training_slot_weight
+            if self.prediction_error_queue_enabled
             else None
         )
         queues = (
             [self._new_prediction_error_queue() for _ in range(batch_size)]
-            if self.training_slot_weight
+            if self.prediction_error_queue_enabled
             else None
         )
         retained_slot_indices: list[list[int]] = [
             [] for _ in range(batch_size)
         ]
-        if self.training_slot_weight and traj_num > 0:
+        if self.prediction_error_queue_enabled and traj_num > 0:
             assert slot_weights is not None
             assert queues is not None
-            if random_pair_training:
-                assert pair_start_mask is not None
-                pair_start_weights = queues[0].first_slot_weight(
-                    slot_weights,
-                    slot_frame_indices,
-                )
-                slot_weights = torch.where(
-                    pair_start_mask & valid_slot_mask,
-                    pair_start_weights,
-                    slot_weights,
-                )
-            else:
-                first_weight = queues[0].first_slot_weight(
-                    slot_weights[:, 0], slot_frame_indices[:, 0]
-                )
-                slot_weights[:, 0] = torch.where(
-                    valid_slot_mask[:, 0],
-                    first_weight,
-                    torch.zeros_like(first_weight),
-                )
+            first_weight = queues[0].first_slot_weight(slot_weights[:, 0])
+            slot_weights[:, 0] = torch.where(
+                valid_slot_mask[:, 0],
+                first_weight,
+                torch.zeros_like(first_weight),
+            )
 
         decision_memory_by_time: list[torch.Tensor] = []
         predicted_future_by_time: list[torch.Tensor] = []
@@ -1910,33 +1574,18 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     retained_latents = all_history_latents[
                         batch_idx, source_index_tensor
                     ]
-                    if self.denoising_network.uses_absolute_history_time:
-                        retained_time_embedding = (
-                            self.denoising_network
-                            .encode_history_frame_indices(
-                                slot_frame_indices[
-                                    batch_idx, source_index_tensor
-                                ]
-                            )
-                        )
-                    else:
-                        relative_time_embedding = (
-                            self.denoising_network.history_time_embedding
-                        )
-                        if relative_time_embedding is None:
-                            raise RuntimeError(
-                                "relative history time embedding is missing"
-                            )
-                        retained_time_embedding = relative_time_embedding[
-                            0, -retained_num:, :
+                    retained_time_embedding = (
+                        self.denoising_network.history_time_embedding[
+                            0, -retained_num:
                         ]
+                    )
                     positioned_retained_latents = (
                         self.denoising_network.add_history_key_encoding(
                             retained_latents.unsqueeze(0),
                             retained_time_embedding.unsqueeze(0),
                         ).squeeze(0)
                     )
-                    if self.training_slot_weight:
+                    if self.prediction_error_queue_enabled:
                         assert slot_weights is not None
                         assert self.prediction_error_queue_config is not None
                         retained_stored_weights = torch.stack(
@@ -1945,38 +1594,13 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                                 for source_idx in source_indices
                             ]
                         )
-                        retained_frame_indices = slot_frame_indices[
-                            batch_idx, source_index_tensor
-                        ]
-                        recent_slot_protection_num = (
-                            self.dynamic_memory_weight_update_config
-                            .recent_slot_protection_num
-                            if self.dynamic_memory_weight_update_config
-                            is not None
-                            else 0
-                        )
-                        retained_biases = apply_recent_slot_attention_floor(
-                            retained_stored_weights,
-                            attention_bias_mode=(
-                                self.history_attention_bias_mode
-                            ),
-                            recent_slot_protection_num=(
-                                recent_slot_protection_num
-                            ),
-                            recent_slot_attention_floor=(
-                                self.prediction_error_queue_config
-                                .recent_slot_attention_floor
-                            ),
-                            fixed_slot_mask=self._frozen_first_slot_mask(
-                                retained_frame_indices
-                            ),
-                        )
+                        retained_biases = retained_stored_weights
                 else:
                     retained_latents = all_history_latents.new_zeros(
                         (0, *all_history_latents.shape[2:])
                     )
                     positioned_retained_latents = retained_latents
-                    if self.training_slot_weight:
+                    if self.prediction_error_queue_enabled:
                         assert slot_weights is not None
                         retained_biases = slot_weights.new_zeros((0,))
                         retained_stored_weights = slot_weights.new_zeros((0,))
@@ -2017,7 +1641,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                         ]
                     )
                 )
-                if self.training_slot_weight:
+                if self.prediction_error_queue_enabled:
                     assert slot_weights is not None
                     history_bias_rows.append(
                         torch.cat(
@@ -2046,16 +1670,16 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             history_mask = torch.stack(history_mask_rows)
             history_attention_bias = (
                 torch.stack(history_bias_rows).detach()
-                if self.training_slot_weight
+                if self.prediction_error_queue_enabled
                 else None
             )
             history_stored_weights = (
                 torch.stack(history_stored_weight_rows).detach()
-                if self.training_slot_weight
+                if self.prediction_error_queue_enabled
                 else None
             )
             if (
-                self.training_slot_weight
+                self.prediction_error_queue_enabled
                 and self.dynamic_memory_weight_update_enabled
             ):
                 assert history_attention_bias is not None
@@ -2075,7 +1699,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 history_mask=history_mask,
                 history_attention_bias=(
                     history_attention_bias
-                    if self.training_slot_weight and self.attention_bias
+                    if self.training_bias
                     else None
                 ),
                 memory_gate_val=select("memory_gate_val"),
@@ -2096,7 +1720,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             )
             predicted_future_by_time.append(predicted_future)
 
-            if self.training_slot_weight and traj_idx + 1 < traj_num:
+            if self.prediction_error_queue_enabled and traj_idx + 1 < traj_num:
                 assert queues is not None
                 assert slot_weights is not None
                 future_token_mask = target["future_feature_mask"][:, traj_idx]
@@ -2122,7 +1746,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     ):
                         assert history_attention_bias is not None
                         dynamic_error = per_sample_errors
-                        if not self.attention_bias:
+                        if not self.training_bias:
                             # Main retrieval is intentionally unbiased. Run a
                             # shadow read only to preserve the original
                             # prediction-error gradient used for slot scoring
@@ -2181,7 +1805,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                                 * valid_future.to(dynamic_error.dtype)
                             ).sum(),
                             inputs=history_attention_bias,
-                            retain_graph=self.attention_bias,
+                            retain_graph=self.training_bias,
                             create_graph=False,
                         )[0]
                         dynamic_valid_mask = (
@@ -2286,27 +1910,22 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 source_indices = retained_slot_indices[batch_idx]
                 if history_len <= 0:
                     continue
-                if (
-                    not self.training_slot_weight
-                    and len(source_indices) >= history_len
-                ):
-                    # Evict only from the already-existing history. The current
-                    # slot is appended afterwards and is therefore guaranteed
-                    # to be visible to at least the next valid anchor.
-                    eviction_idx = select_random_training_slot_eviction_index(
-                        len(source_indices),
-                        device=all_history_latents.device,
-                    )
-                    source_indices.pop(eviction_idx)
                 source_indices.append(traj_idx)
-                if self.training_slot_weight and len(source_indices) > history_len:
+                if (
+                    not self.prediction_error_queue_enabled
+                    and len(source_indices) > history_len
+                ):
+                    source_indices.pop(0)
+                if (
+                    self.prediction_error_queue_enabled
+                    and len(source_indices) > history_len
+                ):
                     assert slot_weights is not None
                     if self.dynamic_memory_weight_update_config is None:
                         evict_lowest = False
                     else:
                         evict_lowest = (
-                            self.dynamic_memory_weight_update_config
-                            .evict_lowest_weight_when_full
+                self.dynamic_memory_weight_update_config.evict_lowest
                         )
                     eviction_idx = select_memory_slot_eviction_index(
                         [
@@ -2320,6 +1939,12 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                             if self.dynamic_memory_weight_update_config
                             is not None
                             else 0
+                        ),
+                        keep_first=(
+                            self.dynamic_memory_weight_update_config.keep_first
+                            if self.dynamic_memory_weight_update_config
+                            is not None
+                            else False
                         ),
                     )
                     source_indices.pop(eviction_idx)
@@ -2380,9 +2005,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 "global_cond": (batch_size, traj_num, token_num, global_cond_dim)
                 "local_cond": (batch_size, traj_num, token_num, local_cond_dim)
                 "noisy_action": (batch_size, traj_num, data_length, action_dim) # Noisy action latents
-                "history_noisy_actions": (batch_size, traj_num, history_action_num_per_chunk, action_dim) # History latents, the noise will be 1-inference-step less than "noisy_action", to match the inference scenarios
                 "history_img_features": (batch_size, traj_num, token_num, history_img_features_dim) # History image features
-                "history_frame_indices": (batch_size, traj_num) # Episode-absolute source-frame index
                 "history_noisy_future_img_features": (batch_size, traj_num, token_num, feature_dim)
                 "memory_gate_val": (batch_size, traj_num)
                 "step": (batch_size,)
@@ -2393,19 +2016,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         batch_size = next(iter(normalized_batch.values())).shape[0]
         traj_num = next(iter(normalized_batch.values())).shape[1]
         data_dict: dict[str, torch.Tensor] = {}
-
-        if "traj_idx" in normalized_batch:
-            traj_indices = normalized_batch["traj_idx"].reshape(
-                batch_size, traj_num, -1
-            )
-            if traj_indices.shape[2] != 1:
-                raise ValueError(
-                    "each trajectory must contain one scalar traj_idx, got "
-                    f"shape {tuple(normalized_batch['traj_idx'].shape)}"
-                )
-            data_dict["history_frame_indices"] = traj_indices[:, :, 0].to(
-                dtype=torch.long
-            )
 
         global_cond_dict = {
             k: v
@@ -2450,10 +2060,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 b=batch_size,
             )
 
-        train_timesteps: int = self.noise_scheduler.train_step_num
-        inference_timesteps = self.noise_scheduler.inference_step_num
-        step_ratio = train_timesteps // inference_timesteps
-
         data_dict["step"] = self.noise_scheduler.sample_training_timesteps(
             batch_size=batch_size,
             device=self.device,
@@ -2486,58 +2092,13 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             self.future_feature_predictor is not None
             and self.future_feature_predictor.use_action_condition
         ):
-            # Adjacent training anchors are history_action_num_per_chunk steps
+            # Adjacent training anchors are execution_chunk_length steps
             # apart, matching the number of actions actually executed online.
             # Conditioning on the full prediction horizon would expose actions
             # that occur after the future-feature target.
             target["future_action_condition"] = trajectory[
-                :, :, : self.history_action_num_per_chunk
+                :, :, : self.execution_chunk_length
             ]
-
-        history_latent_diffusion_step = self.noise_scheduler.get_less_noisy_timesteps(data_dict["step"])
-
-        if self.train_history_action_noise_level == "none":
-            data_dict["history_noisy_actions"] = trajectory
-        elif self.train_history_action_noise_level == "random":
-
-            flattened_traj = einops.rearrange(
-                trajectory,
-                "b t ... -> (b t) ...",
-            )
-            history_action_noise = torch.randn_like(
-                flattened_traj,
-            )
-            rand_timesteps = torch.randint(
-                0,
-                train_timesteps,
-                (batch_size * traj_num,),
-                device=self.device,
-                generator=self.torch_rng,
-            )
-            data_dict["history_noisy_actions"] = einops.rearrange(
-                self.noise_scheduler.get_noisy_action_and_target(
-                    flattened_traj,
-                    history_action_noise,
-                    cast(torch.IntTensor, rand_timesteps),
-                )[0],
-                "(b t) ... -> b t ...",
-                b=batch_size,
-            )
-            
-        elif self.train_history_action_noise_level == "last_step":
-            history_action_noise = torch.randn_like(
-                trajectory,
-            )
-            data_dict["history_noisy_actions"], _ = self.noise_scheduler.get_noisy_action_and_target(
-                trajectory,
-                history_action_noise,
-                cast(torch.IntTensor, history_latent_diffusion_step),
-            )
-        else:
-            raise ValueError(f"Unknown history action noise level: {self.train_history_action_noise_level}")
-
-        # Truncate the history noisy actions to the number of history actions per chunk
-        data_dict["history_noisy_actions"] = data_dict["history_noisy_actions"][:, :, :self.history_action_num_per_chunk]
 
         if self.memory_gate is not None:
             normalized_batch_without_text = {
@@ -2559,10 +2120,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             ) # (batch_size, traj_num) 
             # print(f"Memory gate val: {data_dict['memory_gate_val']}, {data_dict['memory_gate_val'].shape}, \ntraj_idx: {normalized_batch['traj_idx']}, {normalized_batch['traj_idx'].shape}")
 
-        if (
-            self.history_img_feature_encoder is not None
-            and not self.stores_state_conditioned_slots
-        ):
+        if self.history_img_feature_encoder is not None:
             img_dict = {
                 k: normalized_batch[k]
                 for k in self.history_img_feature_encoder.data_entry_names if k in normalized_batch
@@ -2577,10 +2135,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
         # Memory slots may retain all visual patches while future prediction
         # remains a single stable MAP token from the frozen image encoder.
-        if (
-            self.future_feature_predictor is not None
-            and not self.compact_multiview_slot
-        ):
+        if self.future_feature_predictor is not None:
             if self.future_img_feature_encoder is None:
                 raise RuntimeError("future_img_feature_encoder is required")
             if self.future_img_feature_encoder is self.history_img_feature_encoder:
@@ -2654,32 +2209,17 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         first_frame_indices: torch.Tensor,
         reference: torch.Tensor,
     ) -> None:
-        if (
-            self.denoising_network.include_action_history
-            and self.train_history_action_noise_level != "none"
-        ):
-            raise ValueError(
-                "streaming training supports action history only when "
-                "train_history_action_noise_level='none'. Noisy action "
-                "history needs one stored latent per diffusion timestep and "
-                "cannot be carried safely across independently noised chunks."
-            )
         history_weights: list[list[torch.Tensor]] | None = None
         next_slot_weights: list[torch.Tensor] | None = None
         queues: list[PredictionErrorQueue] | None = None
-        if self.training_slot_weight:
-            if not self.prediction_error_queue_enabled:
-                raise RuntimeError(
-                    "streaming slot weighting requires prediction_error_queue"
-                )
+        if self.prediction_error_queue_enabled:
             queues = [
                 self._new_prediction_error_queue()
                 for _ in range(batch_size)
             ]
             history_weights = [[] for _ in range(batch_size)]
             next_slot_weights = [
-                queues[idx]
-                .first_slot_weight(reference[idx], first_frame_indices[idx])
+                queues[idx].first_slot_weight(reference[idx])
                 .detach()
                 .clone()
                 for idx in range(batch_size)
@@ -2862,34 +2402,18 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 )
                 if retained_num:
                     retained_latents = torch.stack(retained_latent_list)
-                    retained_frames = torch.as_tensor(
-                        retained_frame_list,
-                        dtype=torch.long,
-                        device=all_history_latents.device,
-                    )
-                    if self.denoising_network.uses_absolute_history_time:
-                        retained_time_embedding = (
-                            self.denoising_network
-                            .encode_history_frame_indices(retained_frames)
-                        )
-                    else:
-                        relative_time_embedding = (
-                            self.denoising_network.history_time_embedding
-                        )
-                        if relative_time_embedding is None:
-                            raise RuntimeError(
-                                "relative history time embedding is missing"
-                            )
-                        retained_time_embedding = relative_time_embedding[
+                    retained_time_embedding = (
+                        self.denoising_network.history_time_embedding[
                             0, -retained_num:
                         ]
+                    )
                     positioned_retained_latents = (
                         self.denoising_network.add_history_key_encoding(
                             retained_latents.unsqueeze(0),
                             retained_time_embedding.unsqueeze(0),
                         ).squeeze(0)
                     )
-                    if self.training_slot_weight:
+                    if self.prediction_error_queue_enabled:
                         assert state.history_weights is not None
                         retained_stored_weights = torch.stack(
                             state.history_weights[batch_idx]
@@ -2898,36 +2422,13 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                             raise RuntimeError(
                                 "streaming latent/weight buffers are misaligned"
                             )
-                        assert self.prediction_error_queue_config is not None
-                        recent_slot_protection_num = (
-                            self.dynamic_memory_weight_update_config
-                            .recent_slot_protection_num
-                            if self.dynamic_memory_weight_update_config
-                            is not None
-                            else 0
-                        )
-                        retained_biases = apply_recent_slot_attention_floor(
-                            retained_stored_weights,
-                            attention_bias_mode=(
-                                self.history_attention_bias_mode
-                            ),
-                            recent_slot_protection_num=(
-                                recent_slot_protection_num
-                            ),
-                            recent_slot_attention_floor=(
-                                self.prediction_error_queue_config
-                                .recent_slot_attention_floor
-                            ),
-                            fixed_slot_mask=self._frozen_first_slot_mask(
-                                retained_frames
-                            ),
-                        )
+                        retained_biases = retained_stored_weights
                 else:
                     retained_latents = all_history_latents.new_zeros(
                         (0, *all_history_latents.shape[2:])
                     )
                     positioned_retained_latents = retained_latents
-                    if self.training_slot_weight:
+                    if self.prediction_error_queue_enabled:
                         retained_stored_weights = torch.zeros(
                             0,
                             dtype=torch.float32,
@@ -2975,7 +2476,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                         ]
                     )
                 )
-                if self.training_slot_weight:
+                if self.prediction_error_queue_enabled:
                     history_bias_rows.append(
                         torch.cat(
                             [
@@ -3011,16 +2512,16 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             history_mask = torch.stack(history_mask_rows)
             history_attention_bias = (
                 torch.stack(history_bias_rows).detach()
-                if self.training_slot_weight
+                if self.prediction_error_queue_enabled
                 else None
             )
             history_stored_weights = (
                 torch.stack(history_stored_weight_rows).detach()
-                if self.training_slot_weight
+                if self.prediction_error_queue_enabled
                 else None
             )
             if (
-                self.training_slot_weight
+                self.prediction_error_queue_enabled
                 and self.dynamic_memory_weight_update_enabled
             ):
                 assert history_attention_bias is not None
@@ -3040,7 +2541,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 history_mask=history_mask,
                 history_attention_bias=(
                     history_attention_bias
-                    if self.training_slot_weight and self.attention_bias
+                    if self.training_bias
                     else None
                 ),
                 memory_gate_val=select("memory_gate_val"),
@@ -3064,7 +2565,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
             future_token_mask = target["future_feature_mask"][:, traj_idx]
             valid_future = future_token_mask.any(dim=-1)
-            if self.training_slot_weight and valid_future.any():
+            if self.prediction_error_queue_enabled and valid_future.any():
                 assert state.queues is not None
                 assert state.next_slot_weights is not None
                 token_errors = (
@@ -3084,7 +2585,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 ):
                     assert history_attention_bias is not None
                     dynamic_error = per_sample_errors
-                    if not self.attention_bias:
+                    if not self.training_bias:
                         shadow_decision_memory = (
                             self.denoising_network.memory_retriever(
                                 global_cond=projected_input["global_cond"]
@@ -3133,7 +2634,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                             * valid_future.to(dynamic_error.dtype)
                         ).sum(),
                         inputs=history_attention_bias,
-                        retain_graph=self.attention_bias,
+                        retain_graph=self.training_bias,
                         create_graph=False,
                     )[0]
                     dynamic_valid_mask = (
@@ -3223,15 +2724,15 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     continue
                 latents = state.history_latents[batch_idx]
                 frames = state.history_frame_indices[batch_idx]
-                if not self.training_slot_weight and len(latents) >= history_len:
-                    eviction_idx = select_random_training_slot_eviction_index(
-                        len(latents), device=all_history_latents.device
-                    )
-                    latents.pop(eviction_idx)
-                    frames.pop(eviction_idx)
                 latents.append(all_history_latents[batch_idx, traj_idx])
                 frames.append(int(slot_frame_indices[batch_idx, traj_idx]))
-                if self.training_slot_weight:
+                if (
+                    not self.prediction_error_queue_enabled
+                    and len(latents) > history_len
+                ):
+                    latents.pop(0)
+                    frames.pop(0)
+                if self.prediction_error_queue_enabled:
                     assert state.history_weights is not None
                     assert current_slot_weights is not None
                     weights = state.history_weights[batch_idx]
@@ -3256,6 +2757,12 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                             evict_lowest_weight_when_full=evict_lowest,
                             recent_slot_protection_num=(
                                 recent_slot_protection_num
+                            ),
+                            keep_first=(
+                                self.dynamic_memory_weight_update_config.keep_first
+                                if self.dynamic_memory_weight_update_config
+                                is not None
+                                else False
                             ),
                         )
                         latents.pop(eviction_idx)
@@ -3282,7 +2789,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         ]
 
         slot_table: dict[str, torch.Tensor] | None = None
-        if self.training_slot_weight:
+        if self.prediction_error_queue_enabled:
             assert state.history_weights is not None
             table_weight = torch.zeros(
                 (batch_size, history_len),
@@ -3322,7 +2829,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
     def _reproject_detached_history(
         self,
-        raw_state: PrefixTrainingState | StreamingRawHistoryState,
+        raw_state: StreamingRawHistoryState,
         *,
         state_name: str,
     ) -> None:
@@ -3357,52 +2864,21 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     f"{state_name} raw image bank is not aligned with "
                     "frame indices"
                 )
-            latent_groups: list[torch.Tensor] = []
-            if network.include_action_history:
-                raw_actions = raw_state.history_actions[batch_idx]
-                if len(raw_actions) != retained_num:
-                    raise RuntimeError(
-                        f"{state_name} raw action bank is not aligned with "
-                        "frames"
-                    )
-                action_latents = network.action_projector(
-                    torch.stack(raw_actions)
-                )
-                start_idx = (
-                    network.input_pos_embedding.shape[1]
-                    - network.action_token_num
-                )
-                end_idx = (
-                    start_idx + network.history_action_num_per_chunk
-                )
-                action_latents = (
-                    action_latents
-                    + network.input_pos_embedding[
-                        :, start_idx:end_idx, :
-                    ]
-                )
-                latent_groups.append(action_latents)
-            latent_groups.append(projector(torch.stack(raw_images)))
-            projected = torch.cat(latent_groups, dim=1)
+            projected = projector(torch.stack(raw_images))
             stream_state.history_latents[batch_idx] = list(
                 projected.unbind(dim=0)
             )
 
-    def _reproject_prefix_history(self) -> None:
-        """Rebuild prefix slots from detached raw encoder outputs."""
-
-        prefix_state = self._prefix_training_state
-        if prefix_state is None:
-            raise RuntimeError("prefix training state is not initialized")
-        self._reproject_detached_history(
-            prefix_state,
-            state_name="prefix",
-        )
 
     def _streaming_history_reprojection_enabled(self) -> bool:
         """Whether streaming can safely persist raw visual features."""
 
-        if self.stores_state_conditioned_slots:
+        # Cached mode keeps the historical frozen-encoder behavior: detached
+        # encoded slots can be reprojected between chunks to train the history
+        # projector.  In online mode the encoder itself is trainable and the
+        # encoded slot is intentionally detached at the chunk boundary; do not
+        # treat that detached feature as a frozen raw-image bank.
+        if not self.use_cached_image_features:
             return False
         encoder = self.history_img_feature_encoder
         if encoder is None:
@@ -3416,288 +2892,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         network = cast(MemoryTransformer, cast(Any, self.denoising_network))
         return network.history_img_features_projector is not None
 
-    def compute_prefix_loss(
-        self,
-        normalized_batch: batch_type,
-    ) -> batch_type:
-        """Compute one anchor while keeping only detached raw slot state."""
-
-        if self.skip_memory:
-            raise ValueError("prefix training requires memory to be enabled")
-        if self.stores_state_conditioned_slots:
-            raise ValueError(
-                "prefix currently requires raw visual slots; disable compact "
-                "three-view/state-conditioned slot storage"
-            )
-        if self.history_img_feature_encoder is None:
-            raise ValueError("prefix requires a history image encoder")
-        if any(
-            parameter.requires_grad
-            for parameter in self.history_img_feature_encoder.parameters()
-        ):
-            raise ValueError(
-                "prefix raw-feature state requires a frozen image encoder"
-            )
-        reset_state = bool(normalized_batch.pop("_prefix_reset"))
-        final_anchor = bool(normalized_batch.pop("_prefix_final"))
-        normalized_batch.pop("prefix_sequence", None)
-        self.shared_model_manager.clear_cache()
-
-        supervised_mask = normalized_batch.get("prefix_supervised_mask")
-        feature_valid = normalized_batch.get("prefix_feature_valid")
-        if (
-            not isinstance(supervised_mask, torch.Tensor)
-            or supervised_mask.ndim != 2
-            or supervised_mask.shape[1] != 2
-            or not isinstance(feature_valid, torch.Tensor)
-            or feature_valid.shape != supervised_mask.shape
-        ):
-            raise ValueError(
-                "each prefix anchor call requires current plus look-ahead "
-                "masks with shape [batch, 2]"
-            )
-        current_valid = supervised_mask[:, 0].bool()
-        next_feature_valid = feature_valid[:, 1].bool()
-
-        action_key_names = self.action_decoder.data_entry_names
-        action_traj_length = normalized_batch[action_key_names[0]].shape[2]
-        data_dict, target = self._encode_input_multi_traj(normalized_batch)
-        data_dict["_streaming_training"] = True
-        if isinstance(self.denoising_network, OptimizedModule):
-            self.denoising_network = cast(
-                MemoryTransformer, cast(Any, self.denoising_network)
-            )
-        else:
-            assert isinstance(self.denoising_network, MemoryTransformer)
-        network = self.denoising_network
-        projected_input = network.prepare_parallel_forward(data_dict)
-        if "future_features" not in target:
-            raise RuntimeError("prefix requires future feature targets")
-        # The second trajectory is target-only and deliberately marked as
-        # action padding. It is nevertheless a valid visual target.
-        future_valid = current_valid & next_feature_valid
-        target["future_feature_mask"][:, 0] = future_valid[:, None].expand(
-            -1, target["future_feature_mask"].shape[-1]
-        )
-
-        batch_size = supervised_mask.shape[0]
-        input_traj_num = supervised_mask.shape[1]
-        traj_indices = normalized_batch["traj_idx"].reshape(
-            batch_size, input_traj_num, -1
-        )
-        if traj_indices.shape[2] != 1:
-            raise ValueError("each prefix anchor must have one traj_idx")
-        slot_frame_indices = traj_indices[:, :, 0].to(
-            device=projected_input["x"].device,
-            dtype=torch.long,
-        )
-        all_history_latents = projected_input.get("all_history_latents")
-        raw_image_features = data_dict.get("history_img_features")
-        if all_history_latents is None or raw_image_features is None:
-            raise RuntimeError(
-                "prefix requires projected and raw history image features"
-            )
-
-        if reset_state:
-            self._start_streaming_training_state(
-                batch_size=batch_size,
-                first_frame_indices=slot_frame_indices[:, 0],
-                reference=all_history_latents[:, 0, 0, 0].float(),
-            )
-            self._prefix_training_state = PrefixTrainingState(
-                history_img_features=[[] for _ in range(batch_size)],
-                history_actions=[[] for _ in range(batch_size)],
-            )
-        stream_state = self._streaming_training_state
-        prefix_state = self._prefix_training_state
-        if stream_state is None or prefix_state is None:
-            raise RuntimeError("prefix state is missing at a non-initial anchor")
-        if len(stream_state.history_frame_indices) != batch_size:
-            raise ValueError("prefix batch size changed within one sample")
-
-        old_frames = [
-            list(frames) for frames in stream_state.history_frame_indices
-        ]
-        old_image_maps = [
-            {
-                frame: feature
-                for frame, feature in zip(
-                    frames, prefix_state.history_img_features[batch_idx]
-                )
-            }
-            for batch_idx, frames in enumerate(old_frames)
-        ]
-        old_action_maps = [
-            {
-                frame: action
-                for frame, action in zip(
-                    frames, prefix_state.history_actions[batch_idx]
-                )
-            }
-            for batch_idx, frames in enumerate(old_frames)
-        ]
-        self._reproject_prefix_history()
-
-        (
-            decision_memory,
-            predicted_future,
-            prediction_error_records,
-            dynamic_records,
-            slot_table,
-        ) = self._build_streaming_training_memories(
-            projected_input=projected_input,
-            target=target,
-            valid_slot_mask=supervised_mask.bool(),
-            slot_frame_indices=slot_frame_indices,
-            supervised_traj_num=1,
-            reset_state=False,
-        )
-
-        current_raw_images = raw_image_features[:, 0].detach()
-        current_raw_actions = data_dict["history_noisy_actions"][:, 0].detach()
-        for batch_idx in range(batch_size):
-            image_map = old_image_maps[batch_idx]
-            action_map = old_action_maps[batch_idx]
-            if bool(current_valid[batch_idx]):
-                frame = int(slot_frame_indices[batch_idx, 0].item())
-                image_map[frame] = current_raw_images[batch_idx]
-                action_map[frame] = current_raw_actions[batch_idx]
-            retained_frames = stream_state.history_frame_indices[batch_idx]
-            prefix_state.history_img_features[batch_idx] = [
-                image_map[frame].detach() for frame in retained_frames
-            ]
-            prefix_state.history_actions[batch_idx] = [
-                action_map[frame].detach() for frame in retained_frames
-            ]
-
-        projected_input = self._slice_streaming_projected_input(
-            projected_input,
-            batch_size=batch_size,
-            input_traj_num=input_traj_num,
-            supervised_traj_num=1,
-        )
-        projected_input["decision_memory"] = einops.rearrange(
-            decision_memory, "b t n d -> (b t) n d"
-        )
-        model_output = network.finish_parallel_forward(
-            projected_input,
-            batch_size=batch_size,
-            traj_num=1,
-        )
-
-        loss: dict[str, Any] = {}
-        loss["future_prediction"] = (
-            self.future_feature_predictor.cosine_prediction_loss(
-                predicted_features=predicted_future,
-                target_features=target["future_features"][:, :1],
-                target_mask=target["future_feature_mask"][:, :1],
-                detach_target=True,
-            )
-        )
-        valid_anchor_mask = current_valid[:, None]
-        memory_gate_val = data_dict.get("memory_gate_val")
-        if memory_gate_val is not None:
-            memory_gate_val = memory_gate_val[:, :1] * valid_anchor_mask
-        action_loss = F.mse_loss(
-            model_output["action"],
-            target["action"][:, :1],
-            reduction="none",
-        )
-        action_loss = einops.reduce(
-            action_loss, "b t ... -> b t", "mean"
-        )
-        action_loss = action_loss * valid_anchor_mask
-
-        if "action_is_error" in normalized_batch:
-            traj_error_mask = torch.zeros(
-                action_traj_length, device=self.device
-            )
-            traj_error_mask[
-                self.action_no_error_range[0] : self.action_no_error_range[1]
-            ] = 1
-            traj_is_error = einops.reduce(
-                normalized_batch["action_is_error"][:, :1]
-                * traj_error_mask[None, None, :],
-                "b t ... -> b t",
-                "any",
-            )
-            action_loss = action_loss * (~traj_is_error)
-            if memory_gate_val is not None:
-                memory_gate_val = memory_gate_val * (~traj_is_error)
-
-        if "action_is_critical" in normalized_batch:
-            traj_is_critical = torch.any(
-                normalized_batch["action_is_critical"][:, :1], dim=2
-            ).squeeze(-1)
-            critical_action_loss = action_loss * traj_is_critical
-            if (critical_action_loss != 0).any():
-                loss["critical_action"] = critical_action_loss.sum() / (
-                    critical_action_loss != 0
-                ).sum()
-            else:
-                loss["critical_action"] = critical_action_loss.sum()
-            if memory_gate_val is not None:
-                critical_memory_gate_val = (
-                    memory_gate_val * traj_is_critical
-                )
-                critical_valid_mask = traj_is_critical & (action_loss != 0)
-                if critical_valid_mask.any():
-                    loss["critical_memory_gate_val"] = (
-                        critical_memory_gate_val.sum()
-                        / critical_valid_mask.sum()
-                    )
-                    loss["critical_binary_memory_gate_val"] = (
-                        (critical_memory_gate_val > 0.5).sum()
-                        / critical_valid_mask.sum()
-                    )
-                else:
-                    loss["critical_memory_gate_val"] = (
-                        critical_memory_gate_val.sum()
-                    )
-                    loss["critical_binary_memory_gate_val"] = (
-                        (critical_memory_gate_val > 0.5).sum()
-                    )
-
-        if (action_loss != 0).any():
-            loss["action"] = action_loss.sum() / (action_loss != 0).sum()
-        else:
-            loss["action"] = action_loss.sum() / action_loss.numel()
-        if memory_gate_val is not None:
-            memory_gate_valid_num = (action_loss != 0).sum()
-            if memory_gate_valid_num == 0:
-                memory_gate_valid_num = memory_gate_val.numel()
-            loss["memory_gate_val"] = (
-                memory_gate_val.sum() / memory_gate_valid_num
-            )
-            loss["binary_memory_gate_val"] = (
-                (memory_gate_val > 0.5).sum() / memory_gate_valid_num
-            )
-
-        if (
-            self.prediction_error_queue_config is not None
-            and self.prediction_error_queue_config.record_training_stats
-            and slot_table is not None
-            and slot_table["valid_mask"].any()
-        ):
-            loss["prediction_error_queue_stats"] = (
-                self._summarize_prediction_error_records(
-                    records=prediction_error_records,
-                    dynamic_records=dynamic_records,
-                    slot_weights=slot_table["weight"],
-                    valid_slot_mask=slot_table["valid_mask"],
-                )
-            )
-        if (
-            self.prediction_error_queue_config is not None
-            and self.prediction_error_queue_config.record_slot_weights
-            and slot_table is not None
-        ):
-            loss["prediction_error_slot_weight_table"] = slot_table
-
-        if final_anchor:
-            self._streaming_training_state = None
-            self._prefix_training_state = None
-        return loss
 
     def compute_streaming_loss(
         self,
@@ -3741,12 +2935,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         projected_input = self.denoising_network.prepare_parallel_forward(
             data_dict
         )
-        if self.compact_multiview_slot:
-            self._set_compact_future_targets(
-                target,
-                projected_input,
-                normalized_batch["entire_traj_is_padding"],
-            )
         if "future_features" not in target:
             raise RuntimeError(
                 "streaming training requires future feature targets"
@@ -3765,7 +2953,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         raw_history_state: StreamingRawHistoryState | None = None
         old_frames: list[list[int]] = []
         old_image_maps: list[dict[int, torch.Tensor]] = []
-        old_action_maps: list[dict[int, torch.Tensor]] = []
         raw_image_features = data_dict.get("history_img_features")
         if reproject_history:
             if raw_image_features is None:
@@ -3776,7 +2963,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             if reset_state:
                 raw_history_state = StreamingRawHistoryState(
                     history_img_features=[[] for _ in range(batch_size)],
-                    history_actions=[[] for _ in range(batch_size)],
                 )
                 self._streaming_raw_history_state = raw_history_state
             else:
@@ -3810,16 +2996,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     }
                     for batch_idx, frames in enumerate(old_frames)
                 ]
-                old_action_maps = [
-                    {
-                        frame: action
-                        for frame, action in zip(
-                            frames,
-                            raw_history_state.history_actions[batch_idx],
-                        )
-                    }
-                    for batch_idx, frames in enumerate(old_frames)
-                ]
                 self._reproject_detached_history(
                     raw_history_state,
                     state_name="streaming",
@@ -3849,23 +3025,14 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             if reset_state:
                 old_frames = [[] for _ in range(batch_size)]
                 old_image_maps = [{} for _ in range(batch_size)]
-                old_action_maps = [{} for _ in range(batch_size)]
             current_raw_images = raw_image_features[
                 :, :supervised_traj_num
             ].detach()
-            current_raw_actions = (
-                data_dict["history_noisy_actions"][
-                    :, :supervised_traj_num
-                ].detach()
-                if self.denoising_network.include_action_history
-                else None
-            )
             valid_slot_mask = ~normalized_batch[
                 "entire_traj_is_padding"
             ][:, :supervised_traj_num]
             for batch_idx in range(batch_size):
                 image_map = old_image_maps[batch_idx]
-                action_map = old_action_maps[batch_idx]
                 for traj_idx in range(supervised_traj_num):
                     if not bool(valid_slot_mask[batch_idx, traj_idx]):
                         continue
@@ -3875,21 +3042,12 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     image_map[frame] = current_raw_images[
                         batch_idx, traj_idx
                     ]
-                    if current_raw_actions is not None:
-                        action_map[frame] = current_raw_actions[
-                            batch_idx, traj_idx
-                        ]
                 retained_frames = stream_state.history_frame_indices[
                     batch_idx
                 ]
                 raw_history_state.history_img_features[batch_idx] = [
                     image_map[frame].detach() for frame in retained_frames
                 ]
-                if self.denoising_network.include_action_history:
-                    raw_history_state.history_actions[batch_idx] = [
-                        action_map[frame].detach()
-                        for frame in retained_frames
-                    ]
         projected_input = self._slice_streaming_projected_input(
             projected_input,
             batch_size=batch_size,
@@ -3939,26 +3097,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         action_loss = action_loss * valid_anchor_mask
 
         traj_is_error: torch.Tensor | None = None
-        if "action_is_error" in normalized_batch:
-            traj_error_mask = torch.zeros(
-                action_traj_length, device=self.device
-            )
-            traj_error_mask[
-                self.action_no_error_range[0] : self.action_no_error_range[1]
-            ] = 1
-            traj_is_error = einops.reduce(
-                normalized_batch["action_is_error"][
-                    :, :supervised_traj_num
-                ]
-                * traj_error_mask[None, None, :],
-                "b t ... -> b t",
-                "any",
-            )
-            action_loss = action_loss * (~traj_is_error)
-            if memory_gate_val is not None:
-                memory_gate_val = memory_gate_val * (~traj_is_error)
-
-        traj_is_critical: torch.Tensor | None = None
         if "action_is_critical" in normalized_batch:
             traj_is_critical = torch.any(
                 normalized_batch["action_is_critical"][
@@ -4056,7 +3194,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 "action0_10d": (batch_size, traj_length, 8)
                 "future_0_wrist_camera": (batch_size, traj_length, 3, image_size, image_size)
                 "third_person_camera": (batch_size, traj_length, 3, image_size, image_size) # For table-bin scenario
-                "action_is_error": (batch_size, traj_length)
                 "action_is_critical": (batch_size, traj_length)
 
         If not self.skip_memory:
@@ -4068,11 +3205,8 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 "future_0_wrist_camera": (batch_size, traj_num, traj_length, 3, image_size, image_size)
                 "third_person_camera": (batch_size, traj_num, traj_length, 3, image_size, image_size) # For table-bin scenario
                 "entire_traj_is_padding": (batch_size, traj_num)
-                "action_is_error": (batch_size, traj_num, traj_length)
                 "action_is_critical": (batch_size, traj_num, traj_length) # Optional
         """
-        if "_prefix_reset" in normalized_batch:
-            return self.compute_prefix_loss(normalized_batch)
         if "_streaming_supervised_length" in normalized_batch:
             return self.compute_streaming_loss(normalized_batch)
 
@@ -4141,18 +3275,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         retained_source_slot_indices: torch.Tensor | None = None
         slot_frame_indices: torch.Tensor | None = None
         projected_input: dict[str, torch.Tensor] | None = None
-        if self.compact_multiview_slot:
-            projected_input = self.denoising_network.prepare_parallel_forward(
-                data_dict
-            )
-            self._set_compact_future_targets(
-                target,
-                projected_input,
-                normalized_batch["entire_traj_is_padding"],
-                normalized_batch.get("future_transition_valid"),
-            )
-
-        if self.prediction_error_queue_enabled or not self.training_slot_weight:
+        if self.prediction_error_queue_enabled:
             if projected_input is None:
                 projected_input = self.denoising_network.prepare_parallel_forward(
                     data_dict
@@ -4181,7 +3304,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 device=projected_input["x"].device,
                 dtype=torch.long,
             )
-            pair_start_mask = normalized_batch.get("pair_start_mask")
             (
                 decision_memory,
                 predicted_future,
@@ -4194,7 +3316,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 target=target,
                 valid_slot_mask=valid_slot_mask,
                 slot_frame_indices=slot_frame_indices,
-                pair_start_mask=pair_start_mask,
             )
             projected_input["decision_memory"] = einops.rearrange(
                 decision_memory, "b t n d -> (b t) n d"
@@ -4319,27 +3440,9 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
         # img_feature_loss = None
 
-        if "action_is_error" in normalized_batch and self.max_training_traj_num <= 0:
-            traj_error_mask = torch.zeros(action_traj_length, device=self.device)
-            traj_error_mask[
-                self.action_no_error_range[0] : self.action_no_error_range[1]
-            ] = 1
-            traj_is_error = (
-                normalized_batch["action_is_error"] * traj_error_mask[None, None, :]
-            )  # (batch_size, traj_num, traj_length)
-            traj_is_error = einops.reduce(
-                traj_is_error, "b t ... -> b t", "any"
-            )  # (batch_size, traj_num)
-            action_loss = action_loss * (~traj_is_error)
-
-            # if img_feature_loss is not None:
-            #     img_feature_loss = img_feature_loss * (~traj_is_error)
-            if memory_gate_val is not None:
-                memory_gate_val = memory_gate_val * (~traj_is_error)
-
         critical_action_loss = None
         if "action_is_critical" in normalized_batch and self.max_training_traj_num <= 0:
-            # Is based on the previous filtered loss (action_is_error and entire_traj_is_padding)
+            # Critical-action diagnostics are computed from the ordinary loss.
             single_action_is_critical = normalized_batch["action_is_critical"]
             # (batch_size, traj_num, traj_length)
             traj_action_is_critical = torch.any(
@@ -4385,7 +3488,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
     def reset(self):
         super().reset()
-        self.history_noisy_actions_dict = {}
         self.history_img_features_dict = {}
         self.history_memory_weights_dict = {}
         self.history_memory_slot_ids_dict = {}
@@ -4399,4 +3501,3 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         self.recorded_data_dicts = {}
         self._streaming_training_state = None
         self._streaming_raw_history_state = None
-        self._prefix_training_state = None

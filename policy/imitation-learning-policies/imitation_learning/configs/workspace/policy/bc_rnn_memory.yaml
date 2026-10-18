@@ -45,6 +45,5 @@ action_length: 8
 action_indices: ${range:0,${workspace.model.action_length}}
 
 history_padding_length: 0
-action_no_error_range: [0, 0]
 denoising_network_partial:
   max_history_len: 16 # For compatibility with other memory policies. Not actually used

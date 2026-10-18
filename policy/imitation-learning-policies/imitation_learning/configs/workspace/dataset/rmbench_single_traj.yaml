@@ -27,9 +27,7 @@ normalizer_sample_num: -1
 repeat_dataset_num: 1
 down_sample_steps: 1
 
-# The converter stores all three views. This list controls which view(s) are
-# consumed by the policy, for example [left_camera] or
-# [head_camera, left_camera, right_camera].
+# Select the camera inputs consumed by the policy.
 image_keys: [head_camera]
 proprio_keys: [agent_pos]
 action_keys: [action]
@@ -58,11 +56,24 @@ output_data_meta:
     length: ${workspace.model.image_length}
     normalizer: identity
     augmentation:
+      # Match the original gate-memory-policy image augmentation schedule:
+      # occasional crop followed by resize and color jitter.  These
+      # augmentations are applied only in raw-image mode; cached features are
+      # represented as low-dimensional entries and bypass this list.
+      - name: RandomCrop
+        size: [196, 196]
+        p: 0.3
       - name: Resize
         size:
           - ${visual_encoder.input_size}
           - ${visual_encoder.input_size}
         antialias: true
+      - name: ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+        p: 0.3
     shape:
       - 3
       - ${visual_encoder.input_size}
@@ -74,11 +85,20 @@ output_data_meta:
     length: ${workspace.model.image_length}
     normalizer: identity
     augmentation:
+      - name: RandomCrop
+        size: [196, 196]
+        p: 0.3
       - name: Resize
         size:
           - ${visual_encoder.input_size}
           - ${visual_encoder.input_size}
         antialias: true
+      - name: ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+        p: 0.3
     shape:
       - 3
       - ${visual_encoder.input_size}
@@ -90,11 +110,20 @@ output_data_meta:
     length: ${workspace.model.image_length}
     normalizer: identity
     augmentation:
+      - name: RandomCrop
+        size: [196, 196]
+        p: 0.3
       - name: Resize
         size:
           - ${visual_encoder.input_size}
           - ${visual_encoder.input_size}
         antialias: true
+      - name: ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+        p: 0.3
     shape:
       - 3
       - ${visual_encoder.input_size}

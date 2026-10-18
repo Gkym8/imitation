@@ -97,12 +97,6 @@ class RMBenchMemoryPolicy:
             if prediction_error_config is not None
             else None
         )
-        self.recent_slot_attention_floor = (
-            float(prediction_error_config.recent_slot_attention_floor)
-            if prediction_error_config is not None
-            and prediction_error_config.recent_slot_attention_floor is not None
-            else None
-        )
         self._memory_attention_record_key = (
             "history_cross_attention_slot_weights"
         )
@@ -157,14 +151,14 @@ class RMBenchMemoryPolicy:
         )
 
         configured_chunk_length = getattr(
-            self.policy, "history_action_num_per_chunk", None
+            self.policy, "execution_chunk_length", None
         )
         if configured_chunk_length is None:
             configured_chunk_length = self.prediction_horizon
         self.execution_chunk_length = int(configured_chunk_length)
         if not 1 <= self.execution_chunk_length <= self.prediction_horizon:
             raise ValueError(
-                "history_action_num_per_chunk must be in [1, action_length], "
+                "execution_chunk_length must be in [1, action_length], "
                 f"got {self.execution_chunk_length} and "
                 f"{self.prediction_horizon}"
             )
@@ -188,11 +182,9 @@ class RMBenchMemoryPolicy:
             f"prediction_horizon={self.prediction_horizon}, "
             f"execution_chunk_length={self.execution_chunk_length}, "
             f"recent_slot_protection_num={self.recent_slot_protection_num}, "
-            f"attention_bias={self.attention_bias}, "
+            f"inference_bias={getattr(self.policy, 'inference_bias', True)}, "
             f"weight_range=({self.weight_min}, {self.weight_max}), "
             f"first_slot_weight={self.first_slot_weight}, "
-            f"recent_slot_attention_floor="
-            f"{self.recent_slot_attention_floor}, "
             "config_source=checkpoint, "
             f"image_keys={self.image_keys}, "
             f"input_keys={list(self.input_lengths)}"
