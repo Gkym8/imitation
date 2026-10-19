@@ -136,24 +136,85 @@ _CUSTOM_IMAGE_TRANSFORMS = {
     "ResizeWithPadding": ResizeWithPadding,
 }
 
+# These transforms are useful while training, but make evaluation
+# nondeterministic.  Deterministic transforms such as Resize remain enabled in
+# evaluation so the encoder still receives its configured input resolution.
+_STOCHASTIC_IMAGE_AUGMENTATIONS = {
+    "RandomCrop",
+    "RandomResizedCrop",
+    "ColorJitter",
+    "RandomHorizontalFlip",
+    "RandomVerticalFlip",
+    "RandomAffine",
+    "RandomPerspective",
+    "RandomRotation",
+    "RandomGaussianBlur",
+    "RandomMotionBlur",
+    "RandomErasing",
+    "RandomGrayscale",
+    "RandomPosterize",
+    "RandomSolarize",
+    "RandomSharpness",
+    "RandomInvert",
+    "RandomChannelShuffle",
+    "RandomPlanckianJitter",
+    "RandomPlasmaShadow",
+    "RandomRain",
+    "RandomSnow",
+    "RandomFog",
+    "MirrorMask",
+    "GripperMask",
+}
+
+
+def _is_stochastic_image_augmentation(
+    aug_name: str, aug_cfg: dict[str, Any]
+) -> bool:
+    """Identify image transforms that should be train-only.
+
+    Kornia transforms commonly expose their probability as ``p`` or
+    ``p_batch``.  Checking those fields also covers future random transforms
+    without requiring another name to be added to the allowlist.
+    """
+
+    return aug_name in _STOCHASTIC_IMAGE_AUGMENTATIONS or any(
+        key in aug_cfg for key in ("p", "p_batch")
+    )
+
 
 class BaseTransforms:
     def __init__(
-        self, data_meta: dict[str, DataMeta], apply_image_augmentation_in_cpu: bool, seed: int
+        self,
+        data_meta: dict[str, DataMeta],
+        apply_image_augmentation_in_cpu: bool,
+        seed: int,
+        apply_stochastic_image_augmentation: bool = True,
     ):
         self.transforms: dict[str, Union[K.VideoSequential, nn.Sequential]] = {}
         self.pre_transforms: dict[str, nn.Sequential] = {}
         self.data_meta: dict[str, DataMeta] = data_meta
         self.apply_image_augmentation_in_cpu: bool = apply_image_augmentation_in_cpu
+        self.apply_stochastic_image_augmentation = (
+            apply_stochastic_image_augmentation
+        )
         self.seed: int = seed
         torch.manual_seed(self.seed)
         for entry_meta in data_meta.values():
             kornia_list = []
             custom_list = []
-            for aug_cfg in entry_meta.augmentation:
+            for raw_aug_cfg in entry_meta.augmentation:
+                # Do not mutate the resolved checkpoint configuration while
+                # constructing transforms; it may be reused by training and
+                # evaluation code in the same process.
+                aug_cfg = dict(raw_aug_cfg)
                 aug_name = aug_cfg["name"]
                 aug_cfg.pop("name")
                 if entry_meta.data_type == "image":
+                    if (
+                        not self.apply_stochastic_image_augmentation
+                        and _is_stochastic_image_augmentation(aug_name, aug_cfg)
+                    ):
+                        continue
                     if aug_name in _CUSTOM_IMAGE_TRANSFORMS:
                         custom_list.append(
                             _CUSTOM_IMAGE_TRANSFORMS[aug_name](**aug_cfg)

@@ -129,6 +129,9 @@ class RMBenchMemoryPolicy:
         self.transforms = BaseTransforms(
             data_meta=data_meta,
             apply_image_augmentation_in_cpu=True,
+            # Keep deterministic preprocessing such as Resize, but never use
+            # stochastic training augmentation during evaluation.
+            apply_stochastic_image_augmentation=False,
             seed=int(self.cfg.seed),
         )
         self.transforms.to(self.device)

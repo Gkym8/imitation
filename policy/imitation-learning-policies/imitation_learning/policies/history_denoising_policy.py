@@ -2871,15 +2871,14 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
 
     def _streaming_history_reprojection_enabled(self) -> bool:
-        """Whether streaming can safely persist raw visual features."""
+        """Whether streaming can persist detached encoder features.
 
-        # Cached mode keeps the historical frozen-encoder behavior: detached
-        # encoded slots can be reprojected between chunks to train the history
-        # projector.  In online mode the encoder itself is trainable and the
-        # encoded slot is intentionally detached at the chunk boundary; do not
-        # treat that detached feature as a frozen raw-image bank.
-        if not self.use_cached_image_features:
-            return False
+        Offline mode reads these features from the dataset cache.  Online mode
+        encodes each newly arriving anchor from its raw image.  Once encoded,
+        both modes use the same detached historical feature bank; no prior
+        image is re-encoded at the next streaming chunk.
+        """
+
         encoder = self.history_img_feature_encoder
         if encoder is None:
             return False
