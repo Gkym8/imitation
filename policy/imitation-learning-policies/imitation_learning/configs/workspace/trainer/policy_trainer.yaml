@@ -18,6 +18,7 @@ skip_saving_keywords: []
 keep_saving_keywords: [] 
 rollout_every: 0 
 future_prediction_loss_weight: 0.05
+gate_selectivity_loss_weight: 0.01
 critical_action_loss_weights: [0.0] 
 streaming_chunk_length: 4
 streaming_chunk_accumulate: 1

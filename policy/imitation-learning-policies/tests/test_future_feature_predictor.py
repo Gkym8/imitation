@@ -24,6 +24,62 @@ def make_predictor(use_action_condition: bool = True) -> FutureFeaturePredictor:
 
 
 class FutureFeaturePredictorTest(unittest.TestCase):
+    def test_mse_loss_preserves_magnitude_and_can_backpropagate_to_target(self):
+        predicted = torch.tensor([[[2.0, 4.0]]], requires_grad=True)
+        target = torch.tensor([[[1.0, 2.0]]], requires_grad=True)
+        loss = FutureFeaturePredictor.mse_prediction_loss(predicted, target, detach_target=False)
+        torch.testing.assert_close(loss, torch.tensor(2.5))
+        cosine = FutureFeaturePredictor.cosine_prediction_loss(predicted, target)
+        torch.testing.assert_close(cosine, torch.tensor(0.0), atol=1e-6, rtol=0)
+        loss.backward()
+        torch.testing.assert_close(predicted.grad, torch.tensor([[[1.0, 2.0]]]))
+        torch.testing.assert_close(target.grad, -predicted.grad)
+
+    def test_mse_loss_masks_before_error_and_detaches_targets_by_default(self):
+        predicted = torch.tensor([
+            [[1.0, 3.0], [float("nan"), 1e6]], [[2.0, 4.0], [3.0, 5.0]],
+        ], requires_grad=True)
+        target = torch.zeros_like(predicted, requires_grad=True)
+        with torch.no_grad():
+            target[0, 1] = float("nan")
+        mask = torch.tensor([[True, False], [True, True]])
+        loss = FutureFeaturePredictor.mse_prediction_loss(predicted, target, mask)
+        torch.testing.assert_close(loss, torch.tensor(64.0 / 6.0))
+        loss.backward()
+        self.assertIsNone(target.grad)
+        self.assertTrue(torch.isfinite(predicted.grad).all())
+        torch.testing.assert_close(predicted.grad[0, 1], torch.zeros(2))
+        torch.testing.assert_close(predicted.grad[mask], predicted.detach()[mask] / 3)
+
+    def test_mse_loss_without_valid_targets_is_finite_differentiable_zero(self):
+        predicted = torch.full((2, 3, 4), float("nan"), requires_grad=True)
+        target = torch.full_like(predicted, float("nan"), requires_grad=True)
+        loss = FutureFeaturePredictor.mse_prediction_loss(
+            predicted, target, torch.zeros(2, 3, dtype=torch.bool),
+        )
+        self.assertEqual(float(loss), 0)
+        loss.backward()
+        torch.testing.assert_close(predicted.grad, torch.zeros_like(predicted))
+        self.assertIsNone(target.grad)
+
+    def test_mse_loss_accumulates_low_precision_features_in_float32(self):
+        predicted = torch.tensor([[[256.0, 512.0]]], dtype=torch.bfloat16, requires_grad=True)
+        loss = FutureFeaturePredictor.mse_prediction_loss(predicted, torch.zeros_like(predicted))
+        self.assertEqual(loss.dtype, torch.float32)
+        torch.testing.assert_close(loss, torch.tensor(163840.0))
+        loss.backward()
+        self.assertTrue(torch.isfinite(predicted.grad).all())
+        torch.testing.assert_close(predicted.grad, predicted.detach())
+
+    def test_mse_loss_rejects_mismatched_features_and_masks(self):
+        predicted = torch.randn(1, 2, 3)
+        with self.assertRaisesRegex(ValueError, "same shape"):
+            FutureFeaturePredictor.mse_prediction_loss(predicted, torch.randn(1, 2, 4))
+        with self.assertRaisesRegex(ValueError, "target_mask"):
+            FutureFeaturePredictor.mse_prediction_loss(predicted, predicted, torch.ones(1, 2, 1))
+        with self.assertRaisesRegex(ValueError, "batch and feature"):
+            FutureFeaturePredictor.mse_prediction_loss(torch.ones(3), torch.ones(3))
+
     def test_internal_transformer_can_be_wider_than_context(self) -> None:
         predictor = FutureFeaturePredictor(
             hidden_dim=16,

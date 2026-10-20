@@ -1,234 +1,334 @@
-# 基于预测误差加权的长时程机器人记忆策略框架
+# 基于多头门控与延迟淘汰的长时程机器人记忆策略框架
 
 ## 1. 总体设计
 
-本文设计一种面向长时程机器人策略学习的记忆建模框架。核心思想是：记忆不仅用于存储历史信息，还应根据历史状态对未来行为的重要程度动态调整其读取权重。
+本文设计一种面向长时程机器人策略学习的视觉记忆建模框架。核心思想是：历史记忆不仅需要根据当前状态进行检索，还应该根据其对未来策略学习的作用，学习每条历史记忆的重要性，并在记忆容量有限的情况下决定保留哪些历史信息。
 
-整体框架由四部分组成：
+与直接为每个历史 slot 维护一个独立的记忆权重不同，本文使用一个共享参数的 MLP Gate，为每条历史记忆在不同 Attention Head 上生成对应的重要性评分。Gate 一方面用于调整历史信息的 Attention 读取程度，另一方面用于 Memory Bank 满时的记忆淘汰。
 
-- **顺序记忆 Buffer**：以固定时间间隔将历史轨迹划分为若干 slot，每个 slot 保存一段动作轨迹以及代表性历史图像特征；
-- **记忆检索与决策表征构建**：当前视觉观测与本体感受作为 query，从历史 Buffer 中检索相关信息，得到当前决策记忆 $h_t$；
-- **未来预测与动态权重更新**：利用 $h_t$ 预测下一阶段未来视觉表征，通过预测误差衡量未来状态相对于当前记忆的“不可预期程度”，进而更新对应历史 slot 的记忆权重；
-- **Diffusion 动作专家**：以 $h_t$ 作为条件生成未来动作序列
+同时，考虑到一条记忆在当前不重要，并不意味着它在未来一段时间内仍然不重要，本文引入延迟淘汰机制。被选中淘汰的记忆不立即删除，而是暂时保留为 Shadow Memory，以很小的权重继续参与未来 H 个 anchor 的记忆检索，使其能够继续从未来的 Policy Loss 和 Future Prediction Loss 中获得监督。
 
-整体数据流可以概括为： $$ \text{History} \rightarrow \text{Memory Buffer} \rightarrow \text{Memory Retrieval} \rightarrow h_t $$
+整体框架由五部分组成：
 
-随后 $h_t$ 分别进入未来预测模块与 Diffusion 动作专家： $$ h_t \rightarrow \begin{cases} \text{Future Prediction} \rightarrow \text{Prediction Error} \rightarrow \text{Memory Weight Update}\\[4pt] \text{Diffusion Policy} \rightarrow A_{t:t+H-1} \end{cases} $$
+- **顺序记忆 Buffer**：按照固定时间间隔构建历史 memory slot，每个 slot 保存对应的历史视觉特征及必要的时间、状态信息；
+- **Multi-Head Memory Gate**：使用共享参数的 MLP 为每条历史记忆生成多个 Gate，分别控制不同 Attention Head 对该记忆的读取程度；
+- **Memory Retrieval**：将当前视觉与本体感受融合后作为 query，从历史 Memory Bank 中检索信息，构建当前决策记忆 h_t；
+- **Shadow Memory 与延迟淘汰**：根据多个 Head 的 Gate 汇总分数选择淘汰对象，将其保留为低权重的 Shadow Memory，并在未来 H 个 anchor 后正式删除；
+- **Future Prediction 与 Diffusion Policy**：使用当前决策记忆分别预测下一阶段的视觉特征和生成未来动作序列，通过两个任务的监督共同学习记忆检索与 Gate。 
 
+整体数据流可以概括为：
+
+$$  
+\text{History}\rightarrow\text{Memory Bank} \xrightarrow{\text{Multi-Head Gate + Attention}}h_t  
+$$
+
+随后 $h_t$ 分别进入未来预测模块与 Diffusion 动作专家：
+
+$$  
+h_t\rightarrow \begin{cases} \text{Future Prediction}\rightarrow\mathcal L_{\text{pred}}\\[4pt] \text{Diffusion Policy}\rightarrow\mathcal L_{\text{diff}} \end{cases}  
+$$
+
+两个损失都通过 Attention 路径更新 Gate MLP，使其学习不同历史记忆对当前策略学习与未来状态预测的作用。
 
 ## 2. 顺序记忆 Buffer
 
 ### 2.1 Slot 构建
 
-历史轨迹按照固定长度 $L$ 顺序划分为 $M$ 个 memory slot： $\mathcal M_t = { S_1,S_2,\dots,S_M }.$
-
-第 $i$ 个 slot 定义为： $$ S_i = { A_i,, v_i,, w_i }, $$ 其中：
-
-- $A_i$：该时间段内连续的历史动作轨迹；
-- $v_i$：该时间段对应的代表性时刻视觉特征；
-- $w_i$：该 slot 图像当前的记忆重要性权重。
-
-例如： $$ \begin{aligned} S_1&: {a_0,\dots,a_{L-1},v_1},\ ; S_2: {a_L,\dots,a_{2L-1},v_2}. \end{aligned} $$
-
-视觉帧可以统一开始时刻
-
-该设计不根据预测误差决定是否写入记忆， 即预测误差只改变历史信息未来被读取时的重要程度，而不改变历史数据本身的时间结构。
-
-## 3. 当前记忆检索与决策表征
-
-当前时刻得到视觉观测 $o_t$ 与本体感受 $p_t$。首先通过视觉编码器得到： $x_t=E_{\text{vis}}(o_t).$ 然后融合视觉和本体信息： $q_t = F_{\text{obs}}(x_t,p_t).$
-
-将 $q_t$ 作为当前 query，对 Memory Buffer 中的历史 slot 进行检索。
-
-基础 attention 为： $$ s_i = \frac{ (Qq_t)^\top(Km_i) }{ \sqrt d }. $$
-
-为了引入预测误差所得到的历史重要性，使用 memory weight $w_i$ 对 attention score 进行调制： $\tilde s_i = s_i + w_i.$
-
-最终： $$ \begin{aligned} \alpha_i &= \operatorname{Softmax}(\tilde s_i),\ h_t= \sum_i \alpha_i Vm_i. \end{aligned} $$
-
-因此，模型中实际上存在两种不同的历史选择机制：
-
-**当前相关性** 由 attention 决定： $q_t \leftrightarrow m_i.$ 表示当前状态需要查询哪些历史信息？
-
-**历史重要性** 由预测误差产生： $w_i.$ 表示这段历史在过去是否对应重要、不可预期的状态变化？
-
-## 4. 未来预测模块
-
-### 4.1 Future Prediction
-
-未来预测模块的目标不是显式建模完整未来轨迹，而是从当前决策记忆 $h_t$ 中提取能够表征下一阶段状态变化的预测信息。
-
-首先定义一个可学习的 Future Token：$p^F \in \mathbb{R}^{d}.$
-
-该 token 不直接表示未来图像特征，而是作为一个未来预测占位符，与当前决策记忆 $h_t$ 拼接：$X_t = [h_t;,p^F].$
-
-随后，将拼接后的 token 序列输入一个轻量级 Future Prediction Transformer：$T_{\text{pred}}(X_t).$
-
-取 Transformer 输出中 Future Token 对应的位置：$\tilde X_t[-1].$
-
-其中，$u_t^F$ 表示在当前决策记忆 $h_t$ 条件下得到的未来预测隐表示。
-
-### 4.2 未来视觉特征监督
-
-对于下一个 memory slot 中选取的真实代表帧 $o_{t+1}$，使用视觉编码器 $E_{\text{vis}}$ 提取其真实视觉特征：$E_{\text{vis}}(o_{t+1}).$
-
-训练过程中，使用真实未来视觉特征监督预测结果。本文采用余弦距离作为未来预测误差：
-
-$$1-  
-\frac{  
-\hat z_{t+1}^{\top}  
-(z_{t+1})  
-}{  
-|\hat z_{t+1}|_2  
-|  
-(z_{t+1})  
-|_2  
-}.  
-$$
-定义当前预测误差为：$\mathcal L_{\text{pred}}.$
-
-该误差除了用于训练 Future Prediction Module 外，还将在后续作为记忆动态调节的反馈信号，通过计算预测误差关于 memory attention bias $w_i$ 的梯度：
-$$\frac{\partial e_t}{\partial w_{i,t}},$$
-
-衡量第 $i$ 个历史 memory slot 对当前未来预测的贡献，并进一步动态调整其检索权重。
-
-因此，未来预测模块的目标并不是构建能够生成完整未来场景的世界模型，而是通过未来视觉特征监督，迫使当前决策记忆 $h_t$ 保留：
-
-> 对下一阶段状态变化具有预测能力、并真正有助于未来决策的历史信息。
-
-整个过程可以概括为：
+历史轨迹按照固定时间间隔 L 构建时间有序的 anchor，每个 anchor 对应一个 memory slot：
 
 $$  
-h_t  
-\rightarrow  
-[h_t;p^F]  
-\rightarrow  
-T_{\text{pred}}  
-\rightarrow  
-u_t^F  
-\rightarrow  
-\hat z_{t+1}  
-\rightarrow  
-e_t.  
+\mathcal M_t=\{S_1,S_2,\dots,S_M\}.  
 $$
 
-其中，$e_t$ 一方面作为未来预测监督信号，另一方面作为后续预测误差驱动记忆权重更新的基础。
+第 i 个 slot 定义为：
 
-## 5. 基于预测误差的记忆权重更新
-
-未来预测不仅作为辅助训练任务，同时用于判断某个历史状态的重要程度。假设当前通过 slot $S_i$ 及之前的信息，预测下一阶段对应视觉特征： $\hat z_{i+1}.$
-
-当真实的下一 slot $S_{i+1}$ 到来后，得到真实视觉特征： $z_{i+1}.$
-
-计算预测误差： $e_{i+1} = D \left( \hat z_{i+1}, z_{i+1} \right).$
-
-需要注意，$e_{i+1}$ 描述的是：
-
-> 在看到 $S_{i+1}$ 之前，根据过去历史对它进行预测时产生了多大的 surprise。
-
-因此该误差应赋给： ${S_{i+1}}$ 而不是 $S_i$。
-
-## 6. Error Queue 与初始记忆权重
-
-直接使用绝对预测误差（prediction error）衡量记忆重要性存在一个问题：随着未来预测模块逐渐收敛，预测误差的整体尺度可能不断减小。因此，不能简单地令： $$ w_t=e_t $$ 本文维护一个长度为 $N_e$ 的滑动误差队列（Error Queue）： $$ \mathcal E_t = {e_{t-N_e},\dots,e_{t-1}} $$ 其中存储近期未来预测产生的预测误差。
-
-对于当前预测误差 $e_t$，首先计算误差队列中误差的均值与标准差： $$ \mu_Q = \frac{1}{N_e} \sum_{e_j\in\mathcal E_t} e_j,\qquad \sigma_Q = \sqrt{ \frac{1}{N_e} \sum_{e_j\in\mathcal E_t} (e_j-\mu_Q)^2 } $$
-
-随后使用 Z‑分数衡量当前预测误差相对于近期预测误差分布的位置： $$ z_t = \frac{ e_t-\mu_Q }{ \sigma_Q+\epsilon } $$
+$$  
+S_i=\{m_i,t_i,r_i\},  
+$$
 
 其中：
 
-- $z_t>0$ 表示当前状态比近期平均状态更难预测；
-- $z_t<0$ 表示当前状态比近期平均状态更容易预测；
-- $z_t\approx0$ 表示当前预测误差接近近期平均水平。
+- $m_i$：历史视觉特征；
+- $t_i$：该 slot 对应的时间位置；
+- $r_i$：该 slot 当前的状态，包括 Active 或 Shadow，以及 Shadow 剩余的保留时间。
 
-由于 Z‑分数描述的是预测误差的相对位置，因此即使随着训练进行所有预测误差的绝对值逐渐减小，只要不同状态之间仍然存在相对预测难度差异，该指标仍然可以稳定地区分其相对重要性。
+原有的动作轨迹、时间位置及必要的保护状态仍可以按照现有方式维护。记忆按时间顺序写入，不根据 Gate 的大小决定是否创建新的 slot。
 
-随后，将标准化后的预测误差映射为对应记忆槽（memory slot）的初始注意力偏置： $$ w_t^{(0)} = w_{\min} + (w_{\max}-w_{\min}) \cdot \sigma \left( z_t\right) $$ 其中 $\sigma(\cdot)$ 表示 Sigmoid 函数
+### 2.2 Active Memory 与 Shadow Memory
 
-由于 $w_t$ 将直接作为加性偏置（additive bias）加入注意力对数（attention logits），因此建议使权重范围以 $0$ 为中心，即： $$ w_{\min}=-\lambda, \qquad w_{\max}=+\lambda $$ 此时可以进一步写为： $$ w_t^{(0)} = \lambda \left[ 2\sigma \left(z_t \right)-1 \right] $$
+本文将 Memory Bank 区分为两种状态：
 
-因此：
+- **Active Memory**：正常参与 Attention 检索，并作为下一次淘汰决策的候选；
+- **Shadow Memory**：已经被选中淘汰，但尚未物理删除的历史记忆。其 Attention 读取权重被大幅降低，并继续保留未来 H 个 anchor。
 
-- $z_t=0 \Rightarrow w_t^{(0)}=0$，表示预测难度处于近期平均水平时，不对原始注意力得分施加额外偏置；
-- $z_t>0 \Rightarrow w_t^{(0)}>0$，表示相对难预测的状态获得更高的初始记忆优先级；
-- $z_t<0 \Rightarrow w_t^{(0)}<0$，表示相对容易预测的状态受到一定程度的抑制。
+假设 Active Memory 的容量为 B=8。当有新的 slot 需要进入已经满载的 Active Bank 时，选择一个 Active Slot 转为 Shadow，新 slot 则进入 Active Bank。因此，Active Memory 始终最多保留 8 条，而 Shadow Memory 在后续 H 个 anchor 内暂时占用额外的物理空间。
 
-因此，误差队列提供的是一种基于历史预测惊喜度（prediction surprise）的**记忆重要性先验（Memory Importance Prior）**。
+如果每个 anchor 最多新建一条记忆，并且每次最多产生一条 Shadow，那么：
 
-## 7. Prediction‑Error‑Guided Memory Weight Update
-
-误差队列仅7决定记忆槽被建立时的初始权重$w_i^{(0)}$，然而，一个历史状态在产生时具有较大的预测误差，并不意味着它在之后所有决策时刻都同样重要。因此，在记忆检索（Memory Retrieval）过程中，本文进一步利用当前未来预测误差对已有记忆权重进行动态修正。
-
-对于当前查询 $q_t$ 与第 $i$ 个记忆槽，其原始注意力相似度为： $$ s_{i,t} = \frac{ q_t^\top k_i }{ \sqrt d } $$
-
-将动态记忆权重 $w_{i,t}$ 直接作为加性注意力偏置： $$ \tilde s_{i,t} = s_{i,t}+w_{i,t} $$
-
-随后计算注意力： $$ \alpha_{i,t} = \operatorname{softmax} ( \tilde s_{i,t} ) $$
-
-并得到当前决策记忆： $$ h_t = \sum_i \alpha_{i,t}v_i $$
-
-未来预测模块根据 $h_t$ 预测下一记忆槽的代表帧视觉特征，并得到当前预测误差： $$ e_t = \mathcal L_{\text{pred}} $$
-
-由于记忆权重 $w_{i,t}$ 参与了当前预测误差的完整前向计算过程： $$ w_{i,t} \rightarrow \alpha_{i,t} \rightarrow h_t \rightarrow \hat z_{t+1} \rightarrow e_t $$ 因此可以计算预测误差关于每个记忆权重的梯度： $$ g_{i,t} = \frac{ \partial e_t }{ \partial w_{i,t} } $$
+$$  
+B_{\text{active}}=8,\qquad B_{\text{shadow}}\leq H,  
+$$
+$$  
+\boxed{B_{\text{physical}}\leq8+H.}  
+$$
 
 
-该梯度反映：如果进一步提高第 $i$ 个记忆槽的检索权重，当前未来预测误差将如何变化。
+这里的 H 表示延迟淘汰的 anchor 数量，而不是 Diffusion Policy 的动作预测长度。
 
-- 当 $g_{i,t}<0$，意味着增加 $w_{i,t}$ 可以降低预测误差，因此该记忆槽对当前未来预测具有正向贡献，应提高其检索权重。
-- 反之，当 $g_{i,t}>0$，意味着增加该记忆槽的权重会进一步增大预测误差，因此应降低其检索权重。
+## 3. Multi-Head Memory Gate 与当前记忆检索
 
-因此采用梯度下降形式进行动态更新： $$ w_{i,t}^{\text{new}} = w_{i,t} - \eta_w \operatorname{sg} \left( g_{i,t} \right) $$ 其中 $\eta_w$ 为记忆权重更新步长，$\operatorname{sg}(\cdot)$ 表示**停止梯度（Stop Gradient）**。
+### 3.1 Multi-Head Gate
 
-需要强调，$w_i$ 不是模型中的可学习参数，也不由网络优化器更新，而是维护在模型参数之外的动态记忆状态。每次进行未来预测时，仅临时令其参与计算图，从而获得 $\frac{\partial e_t}{\partial w_i}$，随后立即断开梯度（detach），并通过上述显式更新规则修改 $w_i$。
+原本每条历史记忆只对应一个 Gate，用于统一调控所有 Attention Head 的读取程度。但不同 Head 可能关注历史信息中的不同内容，因此本文将单个 Gate 扩展为 Multi-Head Gate。
 
-为了避免单次预测误差产生过大的权重变化，可以进一步对更新结果进行截断： $$ w_{i,t}^{\text{new}} = \operatorname{clip} \left( w_{i,t} - \eta_w \operatorname{sg}(g_{i,t}), w_{\min}, w_{\max} \right) $$
+假设历史视觉特征维度为 256，Memory Attention 有 8 个 Head，则每个 Head 的特征维度为：
 
-因此，本文中的记忆权重实际包含两个连续阶段： $$ \boxed{ \text{Historical Prediction Error} \rightarrow \text{Initial Memory Weight} } $$ 以及： $$ \boxed{ \text{Current Prediction Error Gradient} \rightarrow \text{Dynamic Weight Correction} } $$
+$$  
+d_h=256/8=32.  
+$$
 
-其中，误差队列回答的是：**该状态在被记录时，相对于近期历史而言有多难预测？** 而预测误差梯度回答的是：**该历史记忆在当前决策状态下，对正确预测未来究竟有多大帮助？**
+对于第 i 条历史记忆，使用一个共享参数的 MLP 生成 8 个 Gate：
 
-最终记忆检索为： $$ \boxed{ \alpha_{i,t} = \operatorname{softmax} \left( \frac{ q_t^\top k_i }{ \sqrt d } + w_{i,t} \right) } $$
+$$  
+\mathbf g_i =\sigma\!\left(\mathrm{MLP}_{\text{gate}}(m_i) + b\right) =[g_{i,1},g_{i,2},\dots,g_{i,8}],  
+$$
 
-从而形成完整闭环： $$ \boxed{ \text{Predict} \rightarrow \text{Error} \rightarrow \text{Initialize / Correct Weight} \rightarrow \text{Memory Retrieval} \rightarrow \text{Predict} } $$
+其中 $g_{i,h}\in(0,1)$，表示第 h 个 Attention Head 对历史记忆 $S_i$ 的重要性评分，b 是可学习的 偏置项。
 
-该机制使记忆权重不再是固定的历史重要性评分，而是能够随着后续预测结果不断动态调整的外部记忆状态。
+这里不是为每个 Head 单独训练一个 MLP，而是所有历史 slot 共享同一个 MLP，由其一次输出 8 个 Gate。每个 Gate 对应控制一个 Head 的记忆读取，即该 Head 所处理的 32 维特征；但生成 Gate 时仍然可以利用完整的 256 维记忆特征。
+
+### 3.2 当前记忆检索
+
+当前时刻得到视觉观测 o_t 与本体感受 p_t，首先通过视觉编码器得到：
+
+$$  
+x_t=E_{\text{vis}}(o_t).  
+$$
+
+随后融合视觉与本体感受信息：
+$$  
+q_t=F_{\text{obs}}(x_t,p_t).  
+$$
+
+  
+将 q_t 作为当前 query，对 Memory Bank 中的历史 slot 进行多头 Attention 检索。
+
+第 h 个 Attention Head 对第 i 条历史记忆的基础相似度为：
+
+$$  
+s_{t,i}^{(h)} =\frac{(Q^{(h)}q_t)^\top(K^{(h)}m_i)}{\sqrt{d_k}}.  
+$$
+
+为了引入 Multi-Head Gate，本文不直接将 Gate 数值与基础相似度相加，而是在 Softmax 归一化之前，使用 Gate 调节每条历史记忆对应的指数权重。令 $\tilde g_{i,h}$ 表示第 i 条历史记忆在第 h 个 Head 上的有效 Gate：Active Memory 使用原始 $g_{i,h}$，Shadow Memory 则使用缩小后的 Gate，具体在第 5 节说明。
+
+最终得到每个 Head 的 Attention 权重：
+
+$$  
+\boxed{ \alpha_{t,i}^{(h)} =\frac{ \tilde g_{i,h}\exp\!\left(s_{t,i}^{(h)}\right) }{ \sum_{j\in\mathcal M_t}\tilde g_{j,h}\exp\!\left(s_{t,j}^{(h)}\right) } }.  
+$$
+将基础相似度展开后，也就是：
+
+$$  
+\alpha_{t,i}^{(h)} =\frac{ \tilde g_{i,h}\exp\!\left(\frac{(Q^{(h)}q_t)^\top(K^{(h)}m_i)}{\sqrt{d_k}}\right) }{ \sum_{j\in\mathcal M_t}\tilde g_{j,h}\exp\!\left(\frac{(Q^{(h)}q_t)^\top(K^{(h)}m_j)}{\sqrt{d_k}}\right) }.  
+$$
+
+由于 $\tilde g_{i,h}>0$，上述乘性 Gate 形式在数学上等价于在 Softmax 前的 Attention Logit 上加入 $\log\tilde g_{i,h}$：
+
+$$  
+\alpha_{t,i}^{(h)} =\operatorname{Softmax}_i\!\left( s_{t,i}^{(h)}+\log\tilde g_{i,h} \right).  
+$$
+
+因此，Gate 在形式上直接调节 Softmax 归一化之前的指数权重，等价地发挥 Attention Bias 的作用。这里对应的加性 Bias 是 $\log\tilde g_{i,h}$，而不是直接将 $\tilde g_{i,h}$ 加到相似度上。实际实现时可对极小的 Gate 做数值截断以避免计算对数时的不稳定。
+
+$$  
+h_t^{(h)}=\sum_i\alpha_{t,i}^{(h)}V^{(h)}m_i.  
+$$
+
+将各个 Head 的结果拼接并映射后，得到当前决策记忆：
+
+$$  
+h_t=W_O\operatorname{Concat}\left(h_t^{(1)},\dots,h_t^{(8)}\right).  
+$$
+
+因此，模型中存在两种不同的历史选择机制：
+
+**当前相关性**由 Query-Key Attention 决定，表示当前状态需要读取哪些历史信息；
+
+**历史重要性**由 Multi-Head Gate 学习得到，表示该段历史信息对不同 Head 的读取和后续策略学习具有多大作用。
+
+Gate 不再由预测误差显式赋值或手动更新，而是作为可学习网络，通过 Policy Loss 和 Future Prediction Loss 进行端到端优化。
+
+## 4. 未来预测模块与 Diffusion Policy
+
+### 4.1 Future Prediction
+
+未来预测模块的目标不是显式建模完整未来轨迹，而是从当前决策记忆 h_t 中提取能够表征下一阶段状态变化的预测信息。
+
+首先定义可学习的 Future Token：$p^F\in\mathbb R^d.$与当前决策记忆 h_t 和相应动作序列拼接：
+
+$$  
+X_t=[h_t;\,a_{t:t+k};\,p^F].  
+$$
+随后，将拼接后的 token 序列输入轻量级 Future Prediction Transformer：
+
+$$  
+\tilde X_t=T_{\text{pred}}(X_t).  
+$$
+取 Transformer 输出中 Future Token 对应的位置，并映射为预测的下一阶段视觉特征：
+
+$$  
+u_t^F=\tilde X_t[-1],\qquad \hat z_{t+1}=P_F(u_t^F).  
+$$
+
+对于下一个 anchor 中选取的真实代表帧 o_{t+1}，通过视觉编码器得到目标特征：$z_{t+1}=E_{\text{vis}}(o_{t+1}).$
+使用余弦距离或者MSE损失
+
+该损失用于训练 Future Prediction Module，同时经由决策记忆 h_t 和 Memory Attention，更新 Multi-Head Gate。
+因此，未来预测模块的目标是通过真实未来视觉特征监督，迫使当前决策记忆保留：
+
+> 对下一阶段状态变化具有预测能力、并有助于未来决策的历史信息。
+
+### 4.2 Diffusion Policy
+
+经过加权检索后得到 h_t，并将其作为 Diffusion Action Expert 的条件，生成未来动作序列：
+
+$$  
+\pi_\theta(A_{t:t+T_a-1}\mid h_t),  
+$$
+
+其中 T_a 表示动作预测长度，区别于 Shadow Memory 的保留窗口 H。
+
+Diffusion Policy 通过动作监督损失 $\mathcal L_{\text{diff}}$ 更新策略网络，同时也通过 Memory Attention 更新共享的 Gate MLP。
+
+## 5. 基于 Gate 评分的记忆淘汰与 Shadow Memory
+
+### 5.1 记忆淘汰评分
+
+当 Active Memory Bank 达到容量上限 B=8，并需要写入新的历史 slot 时，使用当前 Gate MLP 对每条 Active Memory 的重要性进行评价。
+
+对于第 i 条历史记忆，汇总其 H 个 Head 的 Gate：
+
+$$  
+\boxed{ I_i=\frac{1}{H}\sum_{h=1}^{H}g_{i,h} }.  
+$$
+随后选择汇总评分最低的 slot：
+
+$$  
+i^*=\arg\min_{i\in\mathcal M_t^{\text{active}}}I_i.  
+$$
+如果存在当前不允许淘汰的受保护 slot，则只在可淘汰的 Active Slots 中进行选择。
+
+该设计使同一个 Gate 同时承担两项功能：
+
+- **Soft Memory Retrieval**：控制某条历史记忆在不同 Attention Head 中被读取的程度；
+- **Hard Eviction Decision**：汇总多个 Head 的重要性评分，决定哪条历史记忆优先退出 Active Bank。
+
+### 5.2 Shadow Memory 与低权重读取
+
+传统的 Hard Eviction 在选中某条历史记忆后立即删除，使这条记忆无法再参与之后的 Policy Learning 和 Future Prediction。
+
+但一条记忆当前评分较低，并不意味着它在未来一段时间内一定没有作用。因此，本文不立即删除被选中淘汰的 slot，而是将其状态由 Active 转为 Shadow，并继续保留未来 H 个 anchor。
+
+本文根据 slot 当前的状态设置有效 Gate：
+$$  
+\boxed{ \tilde g_{i,h}= \begin{cases} g_{i,h},&S_i\text{ 为 Active},\\ \varepsilon\,g_{i,h},&S_i\text{ 为 Shadow}. \end{cases} }  
+$$
+其中 $\varepsilon$ 是一个很小的系数，例如 0.001 或 0.01。
+
+因此，在第 3 节的乘性 Gate Attention 中，Shadow Memory 对应的未归一化权重由 $g_{i,h}\exp(s_{t,i}^{(h)})$ 变为 $\varepsilon g_{i,h}\exp(s_{t,i}^{(h)})$，相当于在该条记忆的 Attention Logit 上额外加入 $\log\varepsilon$ 的负向偏置。
+
+这样，Shadow Memory 在 Softmax 归一化之前的指数权重被缩小为原来的 $\varepsilon$ 倍，使其通常只以很小的 Attention 权重继续参与记忆检索。由于 Softmax 还包含其他历史记忆的归一化，Shadow 最终的 Attention 权重不一定严格小于 $\varepsilon$。
+
+需要注意，这里不是把 Gate 直接替换为固定常数 0.001，而是保留 MLP 原本预测的 $g_{i,h}$，再乘以 $\varepsilon$。因此 Shadow 的有效 Gate 仍然是一个可微函数，未来任务损失依然能够通过 Attention 回传到共享 Gate MLP。
+
+### 5.3 延迟物理删除
+
+假设第 i 条历史记忆在 anchor t_e 被选中淘汰，则它进入 Shadow 状态，在之后的 H 个 anchor 中保持低权重参与 Attention：
+
+$$  
+t\in\{t_e+1,\dots,t_e+H\}.  
+$$
+在完成第 t_e+H 个 anchor 的训练或检索后，正式从 Memory Bank 中删除该 slot。
+
+整个过程为：
+
+$$  
+\text{Active Memory} \xrightarrow{\text{最低 Gate 评分}} \text{Shadow Memory} \xrightarrow{\text{保留 }H\text{ 个 anchor}} \text{Physical Removal}.  
+$$
+
+Shadow Memory 不再参与之后的淘汰候选选择，也不会占用 8 个 Active Slots 的名额。每次新增记忆时，仍然只从 Active Bank 中选择下一条需要淘汰的记忆。
+
+## 6. Gate Selectivity Regularization
+
+Multi-Head Gate 由可学习的 MLP 产生，如果只使用任务损失进行训练，存在所有 Gate 输出趋于相同数值的可能，例如全部接近 1。此时 Gate 对不同历史记忆没有区分能力，无法真正发挥记忆选择的作用。
+
+但本文不直接要求同一条记忆的 8 个 Head 必须产生不同的 Gate。因为某条历史记忆也可能同时对多个 Attention Head 都很重要。
+
+真正希望约束的是：**对于同一个 Attention Head，不同历史记忆应当具有一定的 Gate 评分差异。**
+
+假设当前 Active Bank 中有 B 条历史记忆，所有 Gate 构成矩阵：
+$$  
+G\in(0,1)^{B\times8}.  
+$$
+对于第 h 个 Attention Head，计算它在不同 Active Slots 上的 Gate 标准差：
+$$  
+\sigma_h=\operatorname{Std}_{i\in\mathcal M_t^{\text{active}}}(g_{i,h}).  
+$$
+
+当所有 slot 的 Gate 全部相同时，$\sigma_h=0$。因此，本文加入一个简单的选择性约束损失：
+$$  
+\boxed{ \mathcal L_{\text{gate}} =\frac{1}{H}\sum_{h=1}^{H} \left[\max(0,\tau-\sigma_h)\right]^2 }.  
+$$
 
 
-## 8. 最终 Diffusion 策略学习
+其中 $\tau$ 是预设的最低差异阈值，例如 0.1。
 
-经过加权检索后得到：$h_t$。
+- 当某个 Head 对所有历史记忆的 Gate 都接近 1、接近 0，或者接近同一个常数时，标准差较小，会受到惩罚；
+- 当某个 Head 已经能够对不同历史记忆产生一定的区分时，不再额外增大 Gate 差异；
+- 不要求不同 Head 的 Gate 必须互不相同，而是允许多个 Head 同时关注同一条重要历史记忆。
 
-$h_t$ 一方面进入 Future Prediction Module，另一方面直接作为 Diffusion Action Expert 的条件。
+该损失只对 Active Memory 的原始 Gate 计算，不将已经乘以 $\varepsilon$ 的 Shadow Gate 纳入统计。为了避免有效 slot 数太少导致统计不稳定，可以在 Active Bank 满时再启用此项约束。
+需要注意，该约束只用于防止 Gate 退化为常数输出，并不直接规定哪条历史记忆更重要。具体的重要性仍然通过任务损失进行学习。
 
-最终策略为： $$ \pi_\theta( A_{t:t+H-1} \mid h_t ). $$
+## 8. 训练过程
 
-其中 $h_t$ 已经通过历史 attention 同时融合： $\text{Current Observation Relevance}$ 以及 $\text{Historical Predictive Importance}$.
+现有训练仍然将演示轨迹组织为时间有序的 anchor 流，并按长度为 4 的小 chunk 进行训练。每个 chunk 额外读取一个 lookahead anchor，作为下一阶段视觉特征预测的监督目标。
 
-因此最终动作生成并不是依赖均匀的历史信息，而是重点利用：
+首个 chunk 初始化 Memory Bank，后续 chunk 继续携带历史 slot、时间位置、保护状态和 Shadow 的剩余保留时间，而不是在每个 chunk 开始时重置 Memory Bank
 
-> 当前任务相关，同时在过去发生时具有较高预测 surprise 的历史片段。
+跨 chunk 时，不需要保留完整的历史计算图。可以保存必要的历史特征和状态，在后续 chunk 中重新通过当前 Gate MLP 计算 Gate，使 Shadow Memory 继续参与新 chunk 的前向计算与反向传播。
+
+这里的未来窗口 H 按 anchor 数量计数，而不是按 chunk 数量计数。例如每个 chunk 为 4 个 anchor，当 H=8 时，被淘汰的 Shadow 可以跨越后续两个 chunk 接受任务损失监督。
+
+与原本显式使用预测误差梯度更新记忆权重的方法不同，本方案不再通过独立的手动更新规则修改每条 slot 的 w_i，也不再需要由 Error Queue 为 Gate 直接赋予初始注意力偏置。Gate 由共享 MLP 输出，并通过现有的任务损失和选择性约束直 接学习。
 
 ## 9. 总体训练目标
 
-整体训练损失保持为三个主要组成部分： $$ \boxed{ \mathcal L = \mathcal L_{\text{diff}} + \lambda_p\mathcal L_{\text{pred}}  } $$
+整体训练目标由三部分组成：
 
-- 动作生成损失 $\mathcal L_{\text{diff}}$ 负责学习最终机器人策略。
-- 未来预测损失 $\mathcal L_{\text{pred}}$ 迫使决策记忆保存能够解释未来状态的信息。
+$$  
+\boxed{ \mathcal L =\mathcal L_{\text{diff}} +\lambda_p\mathcal L_{\text{pred}} +\lambda_g\mathcal L_{\text{gate}} }.  
+$$
+
+其中：
+- $\mathcal L_{\text{diff}}$：动作生成损失，负责学习最终机器人策略，同时监督记忆检索；
+- $\mathcal L_{\text{pred}}$：未来视觉特征预测损失，迫使决策记忆保留能够解释下一阶段状态变化的信息；
+- $\mathcal L_{\text{gate}}$：Gate 选择性约束，鼓励同一 Head 对不同历史记忆产生具有区分性的评分，避免 Gate 退化为常数输出。
+
+Active Memory 与 Shadow Memory 使用相同的任务损失和同一个 Gate MLP。不同之处仅在于 Shadow Memory 的有效 Gate 被乘以很小的系数 $\varepsilon$，并在未来 H 个 anchor 后被物理删除。
+
+因此，不需要单独设计针对 Shadow 的未来监督损失，而是通过延迟删除保留已有的任务监督路径。
 
 ## 10. 推理阶段
 
-历史 slot 按照与训练阶段相同的固定时间顺序持续构建。
+推理阶段沿用与训练阶段相同的顺序记忆构建、Multi-Head Gate、Attention 检索。
+当前时刻：
 
-当前时刻： $$ (o_t,p_t) \rightarrow q_t \rightarrow \mathcal M_t \rightarrow h_t. $$
-
-然后： $$ h_t\rightarrow \text{Diffusion Policy}\rightarrow A_{t:t+H-1}. $$
-
-未来预测模块仍可以在线预测下一阶段表示： $$ h_t\rightarrow \hat z_{t+k}. $$
-
-当未来真实观测真正到达后，再计算 prediction error，并更新该新历史 slot 的权重。
-
-因此整个推理过程是严格因果的： $$ \boxed{ \text{Prediction} \rightarrow \text{Future Observation Arrives} \rightarrow \text{Error} \rightarrow \text{Memory Weight Update} } $$ 不会在动作决策时使用尚未发生的真实未来信息。
-
- 
-
+$$  
+(o_t,p_t)\rightarrow q_t \rightarrow\mathcal M_t \xrightarrow{\text{Multi-Head Gate + Attention}}h_t.  
+$$
+随后：
+$$  
+h_t\rightarrow\text{Diffusion Policy} \rightarrow A_{t:t+T_a-1}.  
+$$
+当 Active Bank 已满时，根据各 slot 的 Gate 汇总分数选择淘汰对象淘汰。

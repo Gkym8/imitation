@@ -5,13 +5,17 @@ defaults:
 _target_: imitation_learning.models.denoising_networks.memory_transformer.MemoryTransformer
 
 max_history_len: 8
+# Shadows share storage/attention with Active slots but do not count toward
+# max_history_len. Zero restores immediate hard eviction.
+shadow_horizon: 4
+shadow_gate_scale: 0.01
 freeze_non_history_modules: false
 history_attention_type: token_wise
-attention_bias_mode: additive
-attention_bias_lambda: 0.5
-attention_bias_epsilon: 1.0e-6
 memory_retrieval_mode: perception_patches
 perception_retrieval_layers: 2
+use_conditioned_slot_gate: true
+slot_gate_hidden_dim: 128
+slot_gate_bias_init: 0.0
 decision_memory_token_num: 16
 record_data_entries: []
 record_history_attention_epoch_stats: false

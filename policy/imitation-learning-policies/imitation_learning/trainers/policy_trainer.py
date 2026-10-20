@@ -14,12 +14,10 @@ from accelerate import Accelerator
 
 from imitation_learning.common.datatypes import batch_type
 from imitation_learning.envs.base_env import BaseEnv
-from imitation_learning.models.memory.slot_weight_table import (
-    write_active_slot_weight_csv)
 from imitation_learning.policies.base_policy import BasePolicy
 from imitation_learning.policies.history_denoising_policy import HistoryDenoisingPolicy
 from imitation_learning.trainers.base_trainer import BaseTrainer
-from robot_utils.torch_utils import aggregate_batch, torch_save
+from robot_utils.torch_utils import aggregate_batch
 from imitation_learning.utils.data_utils import get_shakiness_score_torch
 
 
@@ -31,6 +29,7 @@ class PolicyTrainer(BaseTrainer):
         rollout_env: BaseEnv | None,
         critical_action_loss_weights: list[float],
         future_prediction_loss_weight: float = 1.0,
+        gate_selectivity_loss_weight: float = 0.01,
         streaming_chunk_length: int = 4,
         streaming_chunk_accumulate: int = 1,
         **kwargs,
@@ -48,6 +47,9 @@ class PolicyTrainer(BaseTrainer):
         if future_prediction_loss_weight < 0:
             raise ValueError("future_prediction_loss_weight must be non-negative")
         self.future_prediction_loss_weight = future_prediction_loss_weight
+        if not np.isfinite(gate_selectivity_loss_weight) or gate_selectivity_loss_weight < 0:
+            raise ValueError("gate_selectivity_loss_weight must be finite and non-negative")
+        self.gate_selectivity_loss_weight = float(gate_selectivity_loss_weight)
         if (
             isinstance(streaming_chunk_length, bool)
             or not isinstance(streaming_chunk_length, int)
@@ -70,216 +72,6 @@ class PolicyTrainer(BaseTrainer):
         assert (
             len(self.critical_action_loss_weights) > 0
         ), "critical_action_loss_weights must be non-empty"
-        self._prediction_error_queue_epoch_records: list[
-            dict[str, Any]
-        ] = []
-        self._slot_weight_epoch_records: list[dict[str, Any]] = []
-
-    @torch.no_grad()
-    def _record_prediction_error_queue_stats(
-        self, queue_stats: dict[str, torch.Tensor]
-    ) -> None:
-        """Collect queue diagnostics for local epoch files, never trackers."""
-
-        if not queue_stats:
-            return
-        stat_names = sorted(queue_stats)
-        scalar_stats = []
-        for name in stat_names:
-            value = queue_stats[name]
-            if not isinstance(value, torch.Tensor) or value.numel() != 1:
-                raise ValueError(
-                    "prediction-error queue statistics must be scalar tensors; "
-                    f"{name} has value {value!r}"
-                )
-            scalar_stats.append(value.detach().float().reshape(()))
-        local_stats = torch.stack(scalar_stats).unsqueeze(0)
-
-        if self.accelerator is not None:
-            gathered_stats = self.accelerator.gather(local_stats)
-            is_main_process = self.accelerator.is_main_process
-        else:
-            gathered_stats = local_stats
-            is_main_process = True
-
-        if is_main_process:
-            self._prediction_error_queue_epoch_records.append(
-                {
-                    "global_step": self.global_step,
-                    "stats": {
-                        name: gathered_stats[:, idx].detach().cpu()
-                        for idx, name in enumerate(stat_names)
-                    },
-                }
-            )
-
-    @torch.no_grad()
-    def _record_slot_weight_table(
-        self, slot_table: dict[str, torch.Tensor]
-    ) -> None:
-        """Collect active memory-slot weights locally for an epoch CSV."""
-
-        required_keys = {
-            "weight",
-            "valid_mask",
-            "source_slot_index",
-            "anchor_frame_index",
-        }
-        missing_keys = required_keys.difference(slot_table)
-        if missing_keys:
-            raise ValueError(
-                "slot weight table is missing fields: "
-                f"{sorted(missing_keys)}"
-            )
-        unexpected_keys = set(slot_table).difference(required_keys)
-        if unexpected_keys:
-            raise ValueError(
-                "slot weight table has unexpected fields: "
-                f"{sorted(unexpected_keys)}"
-            )
-
-        weight = slot_table["weight"].detach().to(dtype=torch.float32)
-        if weight.ndim != 2:
-            raise ValueError(
-                "slot weights must have shape (batch, history_len), got "
-                f"{tuple(weight.shape)}"
-            )
-        local_batch_size = weight.shape[0]
-        tensors = {
-            "weight": weight,
-            "valid_mask": slot_table["valid_mask"].detach().to(
-                device=weight.device, dtype=torch.uint8
-            ),
-            "source_slot_index": slot_table["source_slot_index"].detach().to(
-                device=weight.device, dtype=torch.long
-            ),
-            "anchor_frame_index": slot_table["anchor_frame_index"].detach().to(
-                device=weight.device, dtype=torch.long
-            ),
-        }
-        for name, tensor in tensors.items():
-            if tensor.shape != weight.shape:
-                raise ValueError(
-                    f"{name} must have shape {tuple(weight.shape)}, got "
-                    f"{tuple(tensor.shape)}"
-                )
-
-        process_index = (
-            0 if self.accelerator is None else self.accelerator.process_index
-        )
-        tensors["rank"] = torch.full(
-            (local_batch_size,),
-            process_index,
-            dtype=torch.long,
-            device=weight.device,
-        )
-        tensors["sample_index"] = torch.arange(
-            local_batch_size, dtype=torch.long, device=weight.device
-        )
-
-        if self.accelerator is not None:
-            gathered = {
-                name: self.accelerator.gather(tensor.contiguous())
-                for name, tensor in tensors.items()
-            }
-            is_main_process = self.accelerator.is_main_process
-        else:
-            gathered = tensors
-            is_main_process = True
-
-        if is_main_process:
-            self._slot_weight_epoch_records.append(
-                {
-                    "global_step": self.global_step,
-                    **{
-                        name: tensor.detach().cpu()
-                        for name, tensor in gathered.items()
-                    },
-                }
-            )
-
-    def save_epoch_offline_records(self) -> None:
-        """Write queue diagnostics and active-slot tables only to disk."""
-
-        if self.accelerator is not None and not self.accelerator.is_main_process:
-            self._prediction_error_queue_epoch_records.clear()
-            self._slot_weight_epoch_records.clear()
-            return
-
-        if self._prediction_error_queue_epoch_records:
-            records = self._prediction_error_queue_epoch_records
-            stat_names = sorted(
-                {
-                    name
-                    for record in records
-                    for name in record["stats"]
-                }
-            )
-            stat_templates = {
-                name: next(
-                    record["stats"][name]
-                    for record in records
-                    if name in record["stats"]
-                )
-                for name in stat_names
-            }
-            payload = {
-                "format_version": 1,
-                "epoch": self.epoch,
-                "global_steps": torch.tensor(
-                    [record["global_step"] for record in records],
-                    dtype=torch.long,
-                ),
-                # Each tensor is [optimizer_steps, distributed_processes].
-                "stats": {
-                    name: torch.stack(
-                        [
-                            record["stats"].get(
-                                name,
-                                torch.full_like(
-                                    stat_templates[name], float("nan")
-                                ),
-                            )
-                            for record in records
-                        ],
-                        dim=0,
-                    )
-                    for name in stat_names
-                },
-            }
-            record_dir = os.path.join(
-                self.output_dir,
-                "offline_training_records",
-                "prediction_error_queue",
-            )
-            os.makedirs(record_dir, exist_ok=True)
-            record_path = os.path.join(
-                record_dir, f"epoch_{self.epoch:04d}.pt"
-            )
-            torch_save(payload, record_path)
-            self._prediction_error_queue_epoch_records.clear()
-            print(
-                "Saved offline prediction-error queue records to "
-                f"{record_path}"
-            )
-
-        if self._slot_weight_epoch_records:
-            record_dir = os.path.join(
-                self.output_dir,
-                "offline_training_records",
-                "slot_weights",
-            )
-            os.makedirs(record_dir, exist_ok=True)
-            record_path = os.path.join(
-                record_dir, f"epoch_{self.epoch:04d}.csv"
-            )
-            write_active_slot_weight_csv(
-                record_path,
-                epoch=self.epoch,
-                records=self._slot_weight_epoch_records,
-            )
-            self._slot_weight_epoch_records.clear()
-            print(f"Saved offline active slot-weight table to {record_path}")
 
     @staticmethod
     def _combine_attention_layers(
@@ -607,63 +399,25 @@ class PolicyTrainer(BaseTrainer):
 
         print(f"History attention statistics saved to {epoch_dir}")
 
+
     def compute_loss(self, batch: batch_type) -> tuple[torch.Tensor, dict[str, float]]:
         assert self.model is not None
-
-        # import cv2
-        # import numpy as np
-        # img = batch["third_person_camera"][0, 0].detach().cpu().numpy()
-        # img = img.transpose(1, 2, 0)
-        # img = img * 255.0
-        # img = img.astype(np.uint8)
-        # cv2.imwrite("debug_img.png", img)
-        # exit()
-
-        # print(f"{batch['traj_idx']=}")
-
         loss_dict = self.model(batch)
-        detached_loss_dict: dict[str, float] = {}
-        detached_loss_dict["train/action_loss"] = float(loss_dict["action"].detach().cpu())
-        loss = loss_dict["action"]  # Will be replaced by other weighted sum
-
-        if "prediction_error_queue_stats" in loss_dict:
-            queue_stats = loss_dict["prediction_error_queue_stats"]
-            self._record_prediction_error_queue_stats(queue_stats)
-
-        if "prediction_error_slot_weight_table" in loss_dict:
-            self._record_slot_weight_table(
-                loss_dict["prediction_error_slot_weight_table"]
-            )
-
-
-        if "future_prediction" in loss_dict:
-            loss += (
-                loss_dict["future_prediction"]
-                * self.future_prediction_loss_weight
-            )
-            detached_loss_dict["train/future_prediction_loss"] = float(
-                loss_dict["future_prediction"].detach().cpu()
-            )
-
+        loss = loss_dict["action"]
+        logs = {"train/action_loss": float(loss.detach().cpu())}
+        for name, weight in (
+            ("future_prediction", self.future_prediction_loss_weight),
+            ("gate_selectivity", self.gate_selectivity_loss_weight),
+        ):
+            if name in loss_dict:
+                loss = loss + weight * loss_dict[name]
+                logs[f"train/{name}_loss"] = float(loss_dict[name].detach().cpu())
         if "critical_action" in loss_dict:
-            idx = min(self.epoch, len(self.critical_action_loss_weights) - 1)
-            try:
-                loss += (
-                    loss_dict["critical_action"]
-                    * self.critical_action_loss_weights[idx]
-                )
-                detached_loss_dict["train/critical_action_loss"] = float(
-                    loss_dict["critical_action"].detach().cpu()
-                )
-            except:
-                print(f"{loss=}")
-                print(f"{loss_dict['critical_action']=}")
-                raise
-
-
-        detached_loss_dict["train/loss"] = float(loss.detach().cpu())
-
-        return loss, detached_loss_dict
+            index = min(self.epoch, len(self.critical_action_loss_weights) - 1)
+            loss = loss + self.critical_action_loss_weights[index] * loss_dict["critical_action"]
+            logs["train/critical_action_loss"] = float(loss_dict["critical_action"].detach().cpu())
+        logs["train/loss"] = float(loss.detach().cpu())
+        return loss, logs
 
     def backward_streaming_batch(
         self, batch: batch_type

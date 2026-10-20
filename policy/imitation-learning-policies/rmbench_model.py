@@ -78,25 +78,7 @@ class RMBenchMemoryPolicy:
         policy.to(self.device)
         policy.eval()
         self.policy = policy
-        self.attention_bias = bool(getattr(self.policy, "attention_bias", True))
-        prediction_error_config = getattr(
-            self.policy, "prediction_error_queue_config", None
-        )
-        self.weight_min = (
-            float(prediction_error_config.weight_min)
-            if prediction_error_config is not None
-            else None
-        )
-        self.weight_max = (
-            float(prediction_error_config.weight_max)
-            if prediction_error_config is not None
-            else None
-        )
-        self.first_slot_weight = (
-            float(prediction_error_config.first_slot_weight)
-            if prediction_error_config is not None
-            else None
-        )
+        self._gate_head_num = int(self.policy.denoising_network.head_num)
         self._memory_attention_record_key = (
             "history_cross_attention_slot_weights"
         )
@@ -105,15 +87,6 @@ class RMBenchMemoryPolicy:
             if self._memory_attention_record_key not in record_entries:
                 record_entries.append(self._memory_attention_record_key)
             self.policy.denoising_network.record_data_entries = record_entries
-        dynamic_memory_config = getattr(
-            self.policy, "dynamic_memory_weight_update_config", None
-        )
-        self.recent_slot_protection_num = (
-            int(dynamic_memory_config.recent_slot_protection_num)
-            if dynamic_memory_config is not None
-            else 0
-        )
-
         self.image_keys = list(self.cfg.workspace.train_dataset.image_keys)
         selected_output_meta = _select_camera_meta(
             self.cfg.workspace.train_dataset.output_data_meta,
@@ -171,65 +144,54 @@ class RMBenchMemoryPolicy:
             if eval_output_dir is not None
             else None
         )
-        self.slot_weight_record_path = (
-            self.eval_output_dir / "memory_slot_weights.csv"
+        self.slot_gate_record_path = (
+            self.eval_output_dir / "memory_slot_gates.csv"
             if self.eval_output_dir is not None
             else None
         )
         self._eval_episode_index = -1
-        self._eval_decision_index = 0
-        self._initialize_slot_weight_recording()
+        self._initialize_slot_gate_recording()
 
         print(
             f"Loaded checkpoint {self.checkpoint_path}: "
             f"prediction_horizon={self.prediction_horizon}, "
             f"execution_chunk_length={self.execution_chunk_length}, "
-            f"recent_slot_protection_num={self.recent_slot_protection_num}, "
-            f"inference_bias={getattr(self.policy, 'inference_bias', True)}, "
-            f"weight_range=({self.weight_min}, {self.weight_max}), "
-            f"first_slot_weight={self.first_slot_weight}, "
+            f"keep_first={self.policy.keep_first_memory}, "
+            f"keep_recent={self.policy.keep_recent_memory}, "
+            f"shadow_horizon={self.policy.denoising_network.shadow_horizon}, "
+            f"shadow_gate_scale={self.policy.denoising_network.memory_retriever.shadow_gate_scale}, "
             "config_source=checkpoint, "
             f"image_keys={self.image_keys}, "
             f"input_keys={list(self.input_lengths)}"
         )
         self._reset_runtime_state()
 
-    def _initialize_slot_weight_recording(self) -> None:
-        if self.slot_weight_record_path is None:
+    def _initialize_slot_gate_recording(self) -> None:
+        if self.slot_gate_record_path is None:
             return
-        self.slot_weight_record_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.slot_weight_record_path.open(
+        self._slot_gate_record_fieldnames = [
+            "episode_index", "query_anchor_index", "slot_id", "slot_state",
+            "gate_mean",
+            *[f"gate_head_{i}" for i in range(self._gate_head_num)],
+            "attention_mean",
+        ]
+        self.slot_gate_record_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.slot_gate_record_path.open(
             "w", newline="", encoding="utf-8"
         ) as file:
-            writer = csv.writer(file)
-            writer.writerow(
-                [
-                    "episode_index",
-                    "decision_index",
-                    "query_frame_index",
-                    "active_slot_count",
-                    "buffer_position",
-                    "slot_id",
-                    "slot_frame_index",
-                    "slot_age_frames",
-                    "slot_weight",
-                    "attention_mean",
-                    "attention_std",
-                    "attention_max",
-                ]
-            )
+            csv.DictWriter(file, fieldnames=self._slot_gate_record_fieldnames).writeheader()
         print(
-            "Memory slot weights and attention will be recorded to "
-            f"{self.slot_weight_record_path}"
+            "Memory slot gates and attention will be recorded to "
+            f"{self.slot_gate_record_path}"
         )
 
-    def _latest_slot_attention_stats(
-        self, active_slot_count: int
-    ) -> tuple[list[float], list[float], list[float]]:
-        """Summarize the actual post-softmax attention for retained slots."""
+    def _latest_slot_attention(
+        self, retained_slot_count: int
+    ) -> list[float]:
+        """Average actual post-softmax attention for each retained slot."""
 
-        if active_slot_count == 0:
-            return [], [], []
+        if retained_slot_count == 0:
+            return []
         episode_records = getattr(self.policy, "recorded_data_dicts", {}).get(0)
         if not episode_records:
             raise RuntimeError("Missing recorded history attention for episode 0")
@@ -239,112 +201,63 @@ class RMBenchMemoryPolicy:
                 "The latest memory query did not record post-softmax slot attention"
             )
         attention = attention.float()
-        if attention.ndim < 2 or attention.shape[-1] < active_slot_count:
+        if attention.ndim < 2 or attention.shape[-1] < retained_slot_count:
             raise RuntimeError(
                 "Recorded slot attention has incompatible shape "
-                f"{tuple(attention.shape)} for {active_slot_count} active slots"
+                f"{tuple(attention.shape)} for {retained_slot_count} retained slots"
             )
 
         # Online history is right-aligned in the fixed-length history tensor.
         # Flatten retrieval/diffusion/head/query axes while keeping the slot
         # axis, then retain exactly the slots described by the CSV metadata.
         attention = attention.reshape(-1, attention.shape[-1])
-        attention = attention[:, -active_slot_count:]
+        attention = attention[:, -retained_slot_count:]
         if not torch.isfinite(attention).all():
             raise RuntimeError("Recorded slot attention contains non-finite values")
-        return (
-            attention.mean(dim=0).tolist(),
-            attention.std(dim=0, unbiased=False).tolist(),
-            attention.amax(dim=0).tolist(),
-        )
+        return attention.mean(dim=0).tolist()
 
     def _record_memory_query(self) -> None:
-        if self.slot_weight_record_path is None:
+        if self.slot_gate_record_path is None:
             return
-        snapshots = getattr(
-            self.policy, "latest_online_memory_query_dict", None
-        )
-        if snapshots is None:
-            raise RuntimeError(
-                "The loaded policy does not expose online memory query records"
-            )
-        snapshot = snapshots.get(0)
+        snapshot = self.policy.latest_online_memory_query_dict.get(0)
         if snapshot is None:
             raise RuntimeError("Missing online memory query record for episode 0")
-
-        query_frame_index = int(snapshot["query_frame_index"])
-        slot_ids = tuple(snapshot["slot_ids"])
-        slot_frame_indices = tuple(snapshot["slot_frame_indices"])
-        slot_weights = tuple(snapshot["slot_weights"])
-        if not (
-            len(slot_ids) == len(slot_frame_indices) == len(slot_weights)
-        ):
+        ids = tuple(snapshot["slot_ids"])
+        gates = tuple(snapshot["slot_gates"])
+        states = tuple(snapshot["slot_states"])
+        anchor = int(snapshot["query_anchor_index"])
+        if not (len(ids) == len(gates) == len(states)):
             raise RuntimeError("Recorded slot metadata is not aligned")
-
+        if any(len(heads) != self._gate_head_num for heads in gates):
+            raise RuntimeError("Recorded gate head count does not match checkpoint")
+        if gates and not np.isfinite(np.asarray(gates)).all():
+            raise RuntimeError("Recorded gates contain non-finite values")
+        if any(state not in {"active", "shadow"} for state in states):
+            raise RuntimeError("Recorded slot state is invalid")
         if self._eval_episode_index < 0:
-            # Keep standalone adapter use sensible even if its caller omits an
-            # explicit reset before the first action.
             self._eval_episode_index = 0
-        active_slot_count = len(slot_ids)
-        attention_means, attention_stds, attention_maxes = (
-            self._latest_slot_attention_stats(active_slot_count)
-        )
-        if active_slot_count == 0:
-            rows = [
-                [
-                    self._eval_episode_index,
-                    self._eval_decision_index,
-                    query_frame_index,
-                    0,
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                ]
-            ]
-        else:
-            rows = []
-            for buffer_position, (
-                slot_id,
-                slot_frame_index,
-                slot_weight,
-                attention_mean,
-                attention_std,
-                attention_max,
-            ) in enumerate(
-                zip(
-                    slot_ids,
-                    slot_frame_indices,
-                    slot_weights,
-                    attention_means,
-                    attention_stds,
-                    attention_maxes,
-                )
-            ):
-                rows.append(
-                    [
-                        self._eval_episode_index,
-                        self._eval_decision_index,
-                        query_frame_index,
-                        active_slot_count,
-                        buffer_position,
-                        int(slot_id),
-                        int(slot_frame_index),
-                        query_frame_index - int(slot_frame_index),
-                        "" if slot_weight is None else format(slot_weight, ".9g"),
-                        format(attention_mean, ".9g"),
-                        format(attention_std, ".9g"),
-                        format(attention_max, ".9g"),
-                    ]
-                )
-        with self.slot_weight_record_path.open(
-            "a", newline="", encoding="utf-8"
-        ) as file:
-            csv.writer(file).writerows(rows)
+        attention = self._latest_slot_attention(len(ids))
+        prefix = {
+            "episode_index": self._eval_episode_index,
+            "query_anchor_index": anchor,
+        }
+        rows = []
+        if not ids:
+            rows.append(prefix)
+        for position, (slot_id, heads, state) in enumerate(
+            zip(ids, gates, states)
+        ):
+            row = dict(prefix)
+            row.update({
+                "slot_id": int(slot_id),
+                "slot_state": state,
+                "gate_mean": format(sum(heads) / len(heads), ".9g"),
+                "attention_mean": format(attention[position], ".9g"),
+            })
+            row.update({f"gate_head_{i}": format(value, ".9g") for i, value in enumerate(heads)})
+            rows.append(row)
+        with self.slot_gate_record_path.open("a", newline="", encoding="utf-8") as file:
+            csv.DictWriter(file, fieldnames=self._slot_gate_record_fieldnames).writerows(rows)
 
     def _collect_input_lengths(self) -> dict[str, int]:
         encoders = [self.policy.global_cond_encoder]
@@ -418,12 +331,9 @@ class RMBenchMemoryPolicy:
 
     def get_action(self, obs: dict[str, Any]) -> np.ndarray:
         batch = self._make_batch(obs)
-        # Do not use torch.inference_mode(): prediction-error memory performs
-        # an explicit local gradient update inside predict_action().
-        with torch.no_grad():
+        with torch.inference_mode():
             normalized_action = self.policy.predict_action(batch)
         self._record_memory_query()
-        self._eval_decision_index += 1
         action = self.normalizer.unnormalize(normalized_action)[self.action_name]
         if (
             action.ndim != 3
@@ -446,5 +356,4 @@ class RMBenchMemoryPolicy:
 
     def reset_model(self) -> None:
         self._eval_episode_index += 1
-        self._eval_decision_index = 0
         self._reset_runtime_state()

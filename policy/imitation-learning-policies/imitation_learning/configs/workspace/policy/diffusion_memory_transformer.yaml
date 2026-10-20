@@ -8,8 +8,6 @@ defaults:
 
 _target_: imitation_learning.policies.history_denoising_policy.HistoryDenoisingPolicy
 
-# Keep the old cached-feature path available while allowing raw-image online
-# training when the task config sets use_cached_image_features=false.
 use_cached_image_features: ${workspace.train_dataset.use_cached_image_features}
 
 skip_memory: false
@@ -27,36 +25,19 @@ history_img_feature_encoder:
 
 future_img_feature_encoder:
   image_encoder_partial:
-    # Future prediction keeps the original one-token CLS/MAP target.
-    feature_aggregation: map
+    feature_aggregation: ${eval:"dict(pooled='map', tokens='patches')['${workspace.model.future_prediction_mode}']"}
     spatial_merge_size: ${visual_encoder.spatial_merge_size}
-    # The future target is always produced by an independent frozen encoder.
     frozen: true
     shared_model_key: ${cond:${workspace.train_dataset.use_cached_image_features},${visual_encoder.model_name},future_target_dinov2}
   name: future_img_feature_encoder
   data_entry_names: ${workspace.train_dataset.image_keys}
 
-future_prediction_context_pooling: mean
+future_prediction_mode: pooled
+future_prediction_context_pooling: ${eval:"dict(pooled='mean', tokens='none')['${workspace.model.future_prediction_mode}']"}
 execution_chunk_length: 10
 
-prediction_error_queue:
-  enabled: true
-  capacity: 20
-  warmup_min_samples: 5
-  warmup_min_std: 0.003
-  epsilon: 1.0e-6
-  weight_min: -0.5
-  weight_max: 0.5
-
-dynamic_memory_weight_update:
-  enabled: true
-  step_size: 100.0
-  evict_lowest: true
-  first_weight: 0.5
+memory_eviction:
   keep_first: true
   keep_recent: 2
-  record_stats: false
-  record_weights: false
 
-training_bias: true
-inference_bias: true
+gate_selectivity_min_std: 0.1

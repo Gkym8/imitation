@@ -98,6 +98,139 @@ For regular training, the config overriding order is (from lowest to highest):
 
 ### Simulation
 
+For RMBench, select future prediction in
+`imitation_learning/configs/task/rmbench.yaml`:
+
+```yaml
+workspace:
+  model:
+    future_prediction_mode: pooled  # pooled (default) or tokens
+```
+
+`pooled` mean-pools the retrieved decision memory `h` to one vector and
+predicts the next anchor's CLS token (DINOv2) or MAP token (SigLIP), one per
+camera. `tokens` passes the complete `h` token sequence to the predictor and
+predicts the next anchor's spatial patch features, without pooling `h`.
+The target encoder and predictor output token count switch together. `tokens`
+uses MSE on raw predicted/target features, without L2 normalization, averaged
+over valid target tokens and feature dimensions. `pooled` and legacy configs
+without a mode retain cosine-distance loss. Both modes use the same action
+conditioning and memory update path. Invalid next-anchor transitions and
+padding are excluded; no valid target returns a differentiable zero.
+
+Patch targets follow `visual_encoder.spatial_merge_size`: with DINOv2 at
+224 pixels, the current value `4` gives 16 target tokens per camera; `1`
+keeps all 256 spatial patches. Cached training uses the existing CLS+patch
+cache for either mode; raw-image training and online inference use the same
+encoder settings. The mode is saved in checkpoints. Existing checkpoints
+without this setting retain their original pooling and target shapes.
+
+RMBench also enables an observation-conditioned, multi-head slot gate in
+`workspace.model.denoising_network_partial`:
+
+```yaml
+use_conditioned_slot_gate: true
+slot_gate_hidden_dim: 128
+slot_gate_bias_init: 0.0
+```
+
+The gate pools each projected historical slot and the current visual/state
+tokens separately, normalizes both summaries, and feeds their concatenation
+through a shared `Linear -> GELU -> Linear` MLP. For width 512 and 8 attention
+heads this is `1024 -> 128 -> 8`. The attention logits receive `logsigmoid`
+of the MLP outputs, broadcast over each slot's patches. The complete visual
+tokens remain available to attention and to `future_prediction_mode: tokens`.
+One gate evaluation is reused across retrieval layers and Diffusion steps;
+each new observation recomputes scores against the retained slots.
+
+For `perception_patches`, the final `TokenGateFusion` blends current visual/state
+tokens `C` with the history-aware output `R` of the last retrieval block:
+`g = sigmoid(Linear(concat(C, R)))`, `h = g*C + (1-g)*R`.
+The gate has one value per token and feature dimension: with width 512,
+the linear layer maps 1024 features to 512. Its weights and bias use the
+original normal initialization with standard deviation 1e-3. Query residuals
+remain inside the retrieval blocks; with no valid history, `R=C`, so the
+blend reduces to the current tokens. This fusion gate is distinct from the
+per-slot, per-head gate inside history attention, and both receive gradients
+from the action and future-prediction losses.
+
+Fusion parameters are saved and loaded as `perception_gate.proj.weight` and
+`perception_gate.proj.bias` under the memory retriever. Checkpoint loading is
+strict: checkpoints trained with the fusion layer removed do not contain these
+parameters and cannot be directly evaluated with the restored architecture.
+Train a matching model to evaluate the restored fusion gate.
+
+Training and inference share one chronological memory bank with `active` and
+`shadow` slot states. After reading history, a full Active bank demotes the
+eligible Active slot with the lowest mean raw gate over heads, then inserts
+the current observation as Active. Ties demote the oldest eligible slot.
+The original first slot and the newest two Active slots after insertion are
+protected by default. `keep_recent` includes the incoming slot, so before
+insertion only the newest `max(keep_recent - 1, 0)` existing Active slots are
+protected. For a full bank containing slots 0 through 7 and an incoming slot 8,
+`keep_recent: 2` protects 7 and 8; slot 6 is an eviction candidate. The incoming
+slot is written only after the current read, in both training and inference.
+Protection must leave at least one existing eviction candidate.
+
+```yaml
+workspace:
+  model:
+    denoising_network_partial:
+      max_history_len: 8       # Active capacity
+      shadow_horizon: 8        # Future valid anchors; 0 deletes immediately
+      shadow_gate_scale: 0.01  # Multiply each Shadow's raw per-head gate
+    memory_eviction:
+      keep_first: true
+      keep_recent: 2
+    gate_selectivity_min_std: 0.1
+  trainer:
+    gate_selectivity_loss_weight: 0.01
+```
+
+Shadow slots share the same MLP and Attention normalization with Active slots.
+Their effective log-gates are `logsigmoid(MLP) + log(shadow_gate_scale)`;
+raw gates are recomputed at every read. A slot demoted after anchor `t` is
+read as Shadow at `t+1` through `t+shadow_horizon`, then physically deleted
+after the final read. It never re-enters the eviction candidates or consumes
+an Active place. Total feature storage and history position embeddings are
+bounded by `max_history_len + shadow_horizon` (16 slots by default).
+Counters advance only on valid supervised/online anchors, excluding padding
+and lookahead. State and expiry survive chunk boundaries along with features.
+
+The selectivity loss computes population standard deviation over valid Active
+slots' raw gates for each head, then averages `relu(0.1 - std)**2` over heads.
+Shadow gates are excluded. Only full Active banks
+receive this penalty; unfilled banks contribute zero to the average over valid
+training anchors. The default total loss is
+`action + 0.05 * future_prediction + 0.01 * gate_selectivity`.
+Both task losses and this regularizer train the gate. Chunk boundaries detach
+stored features; the next chunk reprojects them using current parameters.
+Future lookahead anchors provide targets without entering the memory bank.
+Online inference only reads gates and predicts actions, without running the
+future predictor or future target encoder. The obsolete prediction-error queue,
+manually updated slot weights, and scalar attention-bias settings are removed.
+
+For inspection, `policy.denoising_network.memory_retriever.latest_slot_gates`
+contains detached raw `[batch, Active_capacity + shadow_horizon, head]` scores
+for the latest read, with zero for padded slots. `latest_effective_slot_gates`
+also includes the Shadow scaling. Adding `history_slot_gates` and/or
+`history_effective_slot_gates` to `record_data_entries` records these values.
+RMBench evaluation writes one row per historical slot read to
+`memory_slot_gates.csv`, with only `episode_index`, `query_anchor_index`,
+`slot_id`, `slot_state`, `gate_mean`, `gate_head_0` through `gate_head_{H-1}`,
+and `attention_mean`. Gates are raw MLP sigmoid outputs; `gate_mean` averages
+the heads, matching the eviction score. Attention is the actual post-softmax
+slot probability (summed over its patches), averaged over heads and current
+query tokens in the final retrieval layer. Active and Shadow slots both appear;
+padding does not. An empty bank produces one row with blank slot values.
+Episodes append to the same file without repeating its header.
+
+Checkpoints save the Shadow configuration and matching positional embedding
+shape. Configs without `shadow_horizon` retain immediate eviction and their
+original shape. Enabling a nonzero horizon changes that shape and requires
+training a matching model. Old checkpoint configs containing removed memory
+settings must be updated before loading this policy version.
+
 Please go through all comments in `shell_scripts/train_sim.sh` for detailed instructions.
 
 By default it runs on all GPUs. To use a different single GPU or multiple GPUs, pass the GPU IDs as a comma-separated argument:

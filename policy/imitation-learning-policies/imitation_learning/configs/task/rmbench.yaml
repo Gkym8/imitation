@@ -9,14 +9,11 @@ visual_encoder:
   input_size: 224
   apply_image_norm: true
   pretrained: true
-  # Both offline cached and online raw-image modes use a frozen DINO.  The
-  # mode flag only selects whether inputs come from the cache or are encoded
-  # once when a new anchor enters the stream.
   frozen: true
   individual_forward: false
   # Spatially average each merge_size x merge_size patch block. 1 keeps all
   # 256 DINO patches; 2/4/8 produce 64/16/4 history patch tokens.
-  spatial_merge_size: 4
+  spatial_merge_size: 8
 
 workspace:
   train_dataset:
@@ -36,7 +33,7 @@ workspace:
     cached_image_feature_input_size: ${visual_encoder.input_size}
     cached_image_feature_dtype: float32
     dataloader_cfg:
-      batch_size: 4
+      batch_size: 8
 
   model:
     image_indices: [0]
@@ -46,14 +43,13 @@ workspace:
     action_length: 16
     action_indices: ${range:0,${workspace.model.action_length}}
     execution_chunk_length: 10
-    training_bias: true
-    inference_bias: true
+    # pooled: mean(h) -> future CLS; tokens: h -> future patch tokens.
+    # Patch targets use visual_encoder.spatial_merge_size, like memory slots.
+    future_prediction_mode: tokens
     denoising_network_partial:
+      use_conditioned_slot_gate: true
       hidden_dim: 512
       max_history_len: 8
-      attention_bias_mode: standardized
-      attention_bias_lambda: 0.2
-      attention_bias_epsilon: 1.0e-6
 
   trainer:
     streaming_chunk_length: 4
