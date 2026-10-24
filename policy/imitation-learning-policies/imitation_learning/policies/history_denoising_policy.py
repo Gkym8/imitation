@@ -658,15 +658,18 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             self.denoising_network.max_history_len,
             keep_first=self.keep_first_memory,
             keep_recent=self.keep_recent_memory,
-            shadow_horizon=self.denoising_network.shadow_horizon,
+            shadow_horizon=self.denoising_network.effective_shadow_horizon,
         )
 
     def _pack_history(
         self, banks: list[GateMemoryBank], reference: torch.Tensor
     ) -> dict[str, torch.Tensor]:
         network = self.denoising_network
-        capacity = network.max_history_storage_len
-        rows, masks, active_masks, shadow_masks = [], [], [], []
+        # Training and online use the same configured capacity. With Shadow
+        # disabled, use only the Active suffix of the checkpoint position table.
+        capacity = max(bank.storage_capacity for bank in banks)
+        rows, masks, active_masks, shadow_masks, shadow_ages = [], [], [], [], []
+        frame_indices = []
         for bank in banks:
             padding = capacity - len(bank)
             empty = reference.new_zeros((padding, *reference.shape[1:]))
@@ -682,12 +685,24 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             )
             active_masks.append(active)
             shadow_masks.append(masks[-1] & ~active)
+            shadow_ages.append(torch.tensor(
+                [0] * padding + [bank.shadow_age(slot) for slot in bank.slots],
+                device=reference.device, dtype=torch.long,
+            ))
+            frame_indices.append(torch.tensor(
+                [0] * padding + [slot.frame_index for slot in bank.slots],
+                device=reference.device, dtype=torch.long,
+            ))
         history = torch.stack(rows)
-        positioned = network.add_history_key_encoding(history, network.history_time_embedding)
+        positioned = network.add_history_key_encoding(
+            history, network.history_time_embedding[:, -capacity:],
+            history_frame_indices=torch.stack(frame_indices),
+        )
         result = {
             "history_mask": torch.stack(masks),
             "history_active_mask": torch.stack(active_masks),
             "history_shadow_mask": torch.stack(shadow_masks),
+            "history_shadow_age": torch.stack(shadow_ages),
         }
         if network.memory_retrieval_mode == "perception_patches":
             result["history_latents"] = history
@@ -812,7 +827,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         all_latents = projected["all_history_latents"]
         batch_size, input_length = all_latents.shape[:2]
         offsets = torch.arange(batch_size, device=all_latents.device) * input_length
-        memories, penalties, eligible_rows = [], [], []
+        memories, penalties, eligible_rows, history_rows = [], [], [], []
         records = self._retrieval_records(training=True)
         current_keys = ("global_cond", "global_cond_mask", "local_cond", "local_cond_mask", "memory_gate_val")
         can_reproject = not (network.compact_multiview_slot or network.state_conditioned_history_slot)
@@ -826,6 +841,9 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 for name in current_keys if name in projected
             }
             inputs.update(self._pack_history(banks, all_latents[:, anchor]))
+            # Inspect the bank before inserting this observation. This also
+            # handles nonzero stream starts, padding, and carried chunk state.
+            history_rows.append(inputs["history_mask"].any(dim=-1))
             memory = network.retrieve_decision_memory(inputs, record_data_dict=records)
             memories.append(memory)
             log_gates = records["slot_gate_training_log_gates"].pop()
@@ -863,7 +881,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         )
         for bank in banks:
             bank.detach()
-        return memories, gate_loss
+        return memories, gate_loss, torch.stack(history_rows, dim=1)
 
     def compute_streaming_loss(self, normalized_batch: batch_type) -> batch_type:
         if "_streaming_supervised_length" not in normalized_batch:
@@ -901,8 +919,9 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             if banks is None or len(banks) != batch_size:
                 raise RuntimeError("missing or misaligned streaming memory banks")
         data_dict["_streaming_training"] = True
+        data_dict["history_frame_indices"] = frames[:, :, 0]
         projected = self.denoising_network.prepare_parallel_forward(data_dict)
-        decision_memory, gate_loss = self._build_gate_training_memories(
+        decision_memory, gate_loss, history_available = self._build_gate_training_memories(
             projected, data_dict["history_img_features"], valid,
             frames[:, :, 0], supervised, banks,
         )
@@ -925,33 +944,39 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             "gate_selectivity": gate_loss,
         }
         if self.future_feature_predictor is not None:
-            actions = None
-            if self.future_feature_predictor.use_action_condition:
-                actions = einops.rearrange(
-                    target["future_action_condition"][:, :supervised],
-                    "b t n d -> (b t) n d",
+            future_mask = target["future_feature_mask"][:, :supervised]
+            predict_rows = (
+                history_available & anchor_valid & future_mask.any(dim=-1)
+            )
+            if bool(predict_rows.any()):
+                flat_rows = predict_rows.flatten()
+                actions = None
+                if self.future_feature_predictor.use_action_condition:
+                    actions = target["future_action_condition"][:, :supervised][predict_rows]
+                # Do not call the predictor for observations without past
+                # memory, rather than merely masking their loss afterwards.
+                prediction = self.future_feature_predictor(
+                    current_observation_tokens=self._pool_future_prediction_context(
+                        projected["decision_memory"][flat_rows]
+                    ),
+                    action_chunk=actions,
                 )
-            prediction = self.future_feature_predictor(
-                current_observation_tokens=self._pool_future_prediction_context(
-                    projected["decision_memory"]
-                ),
-                action_chunk=actions,
-            )
-            prediction = einops.rearrange(
-                prediction, "(b t) n d -> b t n d", b=batch_size, t=supervised,
-            )
-            # Patch-token regression preserves feature magnitudes. Pooled CLS
-            # prediction and legacy configs retain their cosine objective.
-            prediction_loss = (
-                self.future_feature_predictor.mse_prediction_loss
-                if self.future_prediction_mode == "tokens"
-                else self.future_feature_predictor.cosine_prediction_loss
-            )
-            loss["future_prediction"] = prediction_loss(
-                prediction, target["future_features"][:, :supervised],
-                target_mask=target["future_feature_mask"][:, :supervised],
-                detach_target=True,
-            )
+                # Preserve each mode's objective, averaging only eligible
+                # future targets (not the action-only first observation).
+                prediction_loss = (
+                    self.future_feature_predictor.mse_prediction_loss
+                    if self.future_prediction_mode == "tokens"
+                    else self.future_feature_predictor.cosine_prediction_loss
+                )
+                loss["future_prediction"] = prediction_loss(
+                    prediction, target["future_features"][:, :supervised][predict_rows],
+                    target_mask=future_mask[predict_rows],
+                    detach_target=True,
+                )
+            else:
+                # Action-only chunks still support ordinary backward/DDP.
+                # The existing trainer permits unused predictor parameters.
+                loss["future_prediction"] = projected["decision_memory"].sum() * 0.0
         if "action_is_critical" in batch:
             critical = batch["action_is_critical"][:, :supervised].any(dim=2).squeeze(-1)
             critical = critical & anchor_valid

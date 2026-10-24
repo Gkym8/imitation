@@ -6,7 +6,7 @@ if [[ $# -lt 6 || $# -gt 7 ]]; then
     echo "Usage: bash train.sh TASK_NAME TASK_CONFIG EXPERT_DATA_NUM SEED ACTION_DIM GPU_IDS [RUN_TAG]" >&2
     echo "GPU_IDS accepts one GPU (for example 0) or a comma-separated list (for example 0,1)." >&2
     echo "RUN_TAG is optional and is appended to the complete task run name." >&2
-    echo "Select camera views with workspace.train_dataset.image_keys in imitation_learning/configs/task/rmbench.yaml." >&2
+    echo "Task settings use imitation_learning/configs/task/TASK_NAME.yaml when present, otherwise task/rmbench.yaml." >&2
     echo "Converted datasets are stored under RMBench/data/imitation_learning_policies by default." >&2
     exit 2
 fi
@@ -41,6 +41,10 @@ done
 num_processes=${#gpu_id_list[@]}
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+task_yaml_name=rmbench
+if [[ -f "${script_dir}/imitation_learning/configs/task/${task_name}.yaml" ]]; then
+    task_yaml_name=${task_name}
+fi
 project_root="$(cd -- "${script_dir}/../.." && pwd)"
 processed_data_dir=${RMBENCH_PROCESSED_DATA_DIR:-${project_root}/data/imitation_learning_policies}
 dataset_name="${task_name}-${task_config}-${expert_data_num}"
@@ -96,7 +100,7 @@ cd "${script_dir}"
 train_args=(
     scripts/train_policy.py
     +task_name="${task_name}"
-    +task_yaml_name=rmbench
+    +task_yaml_name="${task_yaml_name}"
     +policy_name=diffusion_memory_transformer
     +project_name=rmbench
     +logger_project_name=rmbench

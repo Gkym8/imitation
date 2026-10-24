@@ -36,7 +36,9 @@ class DummyDinoV2(nn.Module):
         positions = torch.arange(261, dtype=pixel_values.dtype)[None, :, None]
         channels = torch.arange(8, dtype=pixel_values.dtype)[None, None, :]
         content = pixel_values.mean(dim=(1, 2, 3)).reshape(batch_size, 1, 1)
-        return SimpleNamespace(last_hidden_state=content + (positions + channels).sin())
+        return SimpleNamespace(
+            last_hidden_state=content + (positions + channels).sin() + self.anchor * channels
+        )
 
 
 class FuturePredictionModeTest(unittest.TestCase):
@@ -48,9 +50,9 @@ class FuturePredictionModeTest(unittest.TestCase):
     def tearDown(self):
         SharedModelManager.reset()
 
-    def make_config(self, mode="pooled", cached=True, merge_size=4):
+    def make_config(self, mode="pooled", cached=True, merge_size=4, task="rmbench"):
         with hydra.initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
-            cfg = compose_hydra_config("rmbench", "diffusion_memory_transformer")
+            cfg = compose_hydra_config(task, "diffusion_memory_transformer")
         cfg.device = "cpu"
         cfg.visual_encoder.spatial_merge_size = merge_size
         cfg.workspace.train_dataset.use_cached_image_features = cached
@@ -81,13 +83,137 @@ class FuturePredictionModeTest(unittest.TestCase):
         gc.collect()
         SharedModelManager.reset()
         manager = SharedModelManager(cache_size=10)
-        manager.register_vit_model(MODEL_NAME, frozen=True, model=DummyDinoV2())
-        if not cfg.workspace.train_dataset.use_cached_image_features:
+        manager.register_vit_model(
+            MODEL_NAME, frozen=bool(cfg.visual_encoder.frozen), model=DummyDinoV2()
+        )
+        target_key = cfg.workspace.model.future_img_feature_encoder.image_encoder_partial.get(
+            "shared_model_key", MODEL_NAME
+        )
+        if target_key != MODEL_NAME:
             manager.register_vit_model(
                 MODEL_NAME, frozen=True, model=DummyDinoV2(),
-                registry_name="future_target_dinov2",
+                registry_name=target_key,
             )
         return hydra.utils.instantiate(cfg.workspace.model)
+
+    def test_frozen_backbone_is_shared_for_both_datasets_and_camera_layouts(self):
+        layouts = (
+            ("rmbench", ["head_camera"]),
+            ("rmbench", ["head_camera", "left_camera", "right_camera"]),
+            ("mikasa_remember_color_3", ["third_person_camera"]),
+            ("mikasa_remember_color_3", ["third_person_camera", "robot0_wrist_camera"]),
+        )
+        for task, cameras in layouts:
+            for cached in (True, False):
+                with self.subTest(task=task, cameras=cameras, cached=cached):
+                    cfg = self.make_config(cached=cached, task=task)
+                    cfg.workspace.train_dataset.image_keys = cameras
+                    policy = self.instantiate_policy(cfg)
+                    manager = policy.shared_model_manager
+                    self.assertEqual(list(manager.vit_models), [MODEL_NAME])
+                    backbone = manager.vit_models[MODEL_NAME]
+                    self.assertTrue(all(not p.requires_grad for p in backbone.parameters()))
+                    for encoder in (
+                        policy.global_cond_encoder,
+                        policy.history_img_feature_encoder,
+                        policy.future_img_feature_encoder,
+                    ):
+                        for camera in cameras:
+                            image_encoder = encoder.encoder_dict[camera]
+                            self.assertEqual(image_encoder.shared_model_key, MODEL_NAME)
+                            self.assertIs(
+                                image_encoder.manager[0].vit_models[image_encoder.shared_model_key],
+                                backbone,
+                            )
+                    self.assertFalse(any(
+                        "future_target_dinov2" in key for key in policy.state_dict()
+                    ))
+                    del policy
+
+    def test_trainable_backbone_retains_a_separate_frozen_target(self):
+        cfg = self.make_config(cached=False)
+        cfg.visual_encoder.frozen = False
+        policy = self.instantiate_policy(cfg)
+        manager = policy.shared_model_manager
+        self.assertEqual(set(manager.vit_models), {MODEL_NAME, "future_target_dinov2"})
+        online = manager.vit_models[MODEL_NAME]
+        target = manager.vit_models["future_target_dinov2"]
+        self.assertIsNot(online, target)
+        self.assertTrue(all(p.requires_grad for p in online.parameters()))
+        self.assertTrue(all(not p.requires_grad for p in target.parameters()))
+        losses = policy.compute_loss(self.make_batch(cached=False))
+        (losses["action"] + 0.05 * losses["future_prediction"]).backward()
+        self.assertIsNotNone(online.anchor.grad)
+        self.assertTrue(torch.isfinite(online.anchor.grad))
+        self.assertGreater(float(online.anchor.grad.abs()), 0)
+        self.assertIsNone(target.anchor.grad)
+
+    def test_old_two_backbone_config_loads_strictly_and_shared_outputs_match(self):
+        cfg = self.make_config(cached=False)
+        legacy_cfg = OmegaConf.create(OmegaConf.to_yaml(cfg, resolve=False))
+        legacy_cfg.workspace.model.future_img_feature_encoder.image_encoder_partial.shared_model_key = (
+            "${cond:${workspace.train_dataset.use_cached_image_features},"
+            "${visual_encoder.model_name},future_target_dinov2}"
+        )
+        saved_config = OmegaConf.to_yaml(legacy_cfg, resolve=False)
+        batch = self.make_batch(cached=False)
+
+        def collect(policy):
+            policy.train()
+            policy.reset_rng()
+            torch.manual_seed(11)
+            calls = []
+            handles = [
+                backbone.register_forward_hook(
+                    lambda module, args, output: calls.append(module)
+                )
+                for backbone in policy.shared_model_manager.vit_models.values()
+            ]
+            losses = {
+                name: value.detach().clone()
+                for name, value in policy.compute_loss(batch).items()
+            }
+            for handle in handles:
+                handle.remove()
+            policy.eval()
+            policy.reset()
+            policy.reset_rng()
+            actions = []
+            for anchor in range(2):
+                observation = {
+                    "head_camera": batch["head_camera"][:, anchor],
+                    "agent_pos": batch["agent_pos"][:, anchor],
+                    "episode_idx": torch.tensor([0]),
+                }
+                with torch.inference_mode():
+                    actions.append(policy.predict_action(observation)["action"].clone())
+            return losses, actions, len(calls)
+
+        legacy_policy = self.instantiate_policy(legacy_cfg)
+        saved_state = {key: value.detach().clone() for key, value in legacy_policy.state_dict().items()}
+        expected_losses, expected_actions, legacy_calls = collect(legacy_policy)
+        self.assertEqual(legacy_calls, 2)
+        del legacy_policy
+
+        restored = self.instantiate_policy(OmegaConf.create(saved_config))
+        restored.load_state_dict(saved_state, strict=True)
+        self.assertEqual(len(restored.shared_model_manager.vit_models), 2)
+        _, restored_actions, _ = collect(restored)
+        for actual, expected in zip(restored_actions, expected_actions):
+            torch.testing.assert_close(actual, expected)
+        del restored
+
+        shared_policy = self.instantiate_policy(cfg)
+        shared_policy.load_state_dict({
+            key: value for key, value in saved_state.items()
+            if not key.startswith("shared_model_manager.vit_models.future_target_dinov2.")
+        }, strict=True)
+        actual_losses, actual_actions, shared_calls = collect(shared_policy)
+        self.assertEqual(shared_calls, 1)
+        for name, expected in expected_losses.items():
+            torch.testing.assert_close(actual_losses[name], expected)
+        for actual, expected in zip(actual_actions, expected_actions):
+            torch.testing.assert_close(actual, expected)
 
     def make_batch(self, cached=True, anchors=3):
         torch.manual_seed(2)
@@ -141,13 +267,19 @@ class FuturePredictionModeTest(unittest.TestCase):
                     prediction_handle.remove()
                     self.assertTrue(contexts)
                     self.assertEqual(set(contexts), {expected_context})
-                    prediction = predictions[-1].reshape_as(target["future_features"])
-                    mask = target["future_feature_mask"]
+                    # Only the middle anchor has both a past observation
+                    # and a valid future target; the first is action-only.
+                    eligible = target["future_feature_mask"].any(dim=-1)
+                    eligible[:, 0] = False
+                    prediction = predictions[-1]
+                    self.assertEqual(prediction.shape[0], int(eligible.sum()))
+                    expected_target = target["future_features"][eligible]
+                    mask = target["future_feature_mask"][eligible]
                     expected_prediction_loss = (
-                        (prediction[mask].float() - target["future_features"][mask].float()).square().mean()
+                        (prediction[mask].float() - expected_target[mask].float()).square().mean()
                         if mode == "tokens"
                         else (1.0 - torch.nn.functional.cosine_similarity(
-                            prediction[mask], target["future_features"][mask], dim=-1,
+                            prediction[mask], expected_target[mask], dim=-1,
                         )).mean()
                     )
                     torch.testing.assert_close(losses["future_prediction"].detach(), expected_prediction_loss)

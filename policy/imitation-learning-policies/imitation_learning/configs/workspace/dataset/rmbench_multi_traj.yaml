@@ -9,6 +9,10 @@ _target_: imitation_learning.datasets.rmbench_dataset.RMBenchMultiTrajDataset
 #   streaming  - cover each valid anchor in fixed-interval phase streams;
 #                carry causal memory and truncate gradients between chunks.
 anchor_sampling_mode: streaming
+# Inclusive [first, last] episode-frame range for stream starts.
+# null keeps the original phases; [30, 40] selects 11 starts without an earlier prefix.
+# This limits starts only; each stream still continues to the valid episode end.
+sample_range: null
 
 # Streaming computes its padded stream length from the dataset and ignores
 # this window length after initialization.

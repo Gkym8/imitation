@@ -1,0 +1,23 @@
+defaults:
+  - rmbench
+  - _self_
+
+workspace:
+  train_dataset:
+    image_keys: [head_camera]
+    use_cached_image_features: false
+    dataloader_cfg:
+      batch_size: 8
+  model:
+    denoising_network_partial:
+      max_history_len: 8
+      shadow_horizon: 3
+      shadow_window: true
+      use_learned_history_query: true
+      query_tokens: null
+      # history_time_encoding: absolute
+    action_length: 10
+  trainer:
+    num_epochs: 301
+    checkpoint_every: 50
+    future_prediction_loss_weight: 0.01

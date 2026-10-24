@@ -28,7 +28,9 @@ future_img_feature_encoder:
     feature_aggregation: ${eval:"dict(pooled='map', tokens='patches')['${workspace.model.future_prediction_mode}']"}
     spatial_merge_size: ${visual_encoder.spatial_merge_size}
     frozen: true
-    shared_model_key: ${cond:${workspace.train_dataset.use_cached_image_features},${visual_encoder.model_name},future_target_dinov2}
+    # A frozen backbone can serve current/history inputs and future targets.
+    # Keep targets separate only when the online backbone is trainable.
+    shared_model_key: ${cond:${visual_encoder.frozen},${visual_encoder.model_name},future_target_dinov2}
   name: future_img_feature_encoder
   data_entry_names: ${workspace.train_dataset.image_keys}
 

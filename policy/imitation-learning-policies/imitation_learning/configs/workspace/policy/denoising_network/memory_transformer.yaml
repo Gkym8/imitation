@@ -5,10 +5,21 @@ defaults:
 _target_: imitation_learning.models.denoising_networks.memory_transformer.MemoryTransformer
 
 max_history_len: 8
-# Shadows share storage/attention with Active slots but do not count toward
-# max_history_len. Zero restores immediate hard eviction.
-shadow_horizon: 4
-shadow_gate_scale: 0.01
+# relative: retain the existing Bank-rank position table.
+# absolute: sinusoidal encoding of each slot's episode frame index.
+history_time_encoding: relative
+# Both training and inference: false hard-deletes the minimum eligible gate slot.
+shadow_window: true
+# At age k, a Shadow's raw gate is scaled by shadow_gate_scale / 10**k.
+shadow_horizon: 3
+shadow_gate_scale: 0.1
+
+fusion_gate: true
+# Q_init + CrossAttn(Q_init, concat(image, state)).
+# false keeps current visual/state tokens as the history-attention query.
+use_learned_history_query: false
+# null follows the image token count; a positive integer sets Q_init's length.
+query_tokens: null
 freeze_non_history_modules: false
 history_attention_type: token_wise
 memory_retrieval_mode: perception_patches

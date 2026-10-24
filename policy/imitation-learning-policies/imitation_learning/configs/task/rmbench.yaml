@@ -11,8 +11,6 @@ visual_encoder:
   pretrained: true
   frozen: true
   individual_forward: false
-  # Spatially average each merge_size x merge_size patch block. 1 keeps all
-  # 256 DINO patches; 2/4/8 produce 64/16/4 history patch tokens.
   spatial_merge_size: 8
 
 workspace:
@@ -23,6 +21,7 @@ workspace:
     starting_percentile_max: 1.0
     anchor_sampling_mode: streaming
     image_keys: [head_camera]
+    
     # true: preserve the existing offline cached-feature training path.
     # false: load raw images and backpropagate through the current/history DINO.
     use_cached_image_features: true
@@ -43,9 +42,9 @@ workspace:
     action_length: 16
     action_indices: ${range:0,${workspace.model.action_length}}
     execution_chunk_length: 10
+
     # pooled: mean(h) -> future CLS; tokens: h -> future patch tokens.
-    # Patch targets use visual_encoder.spatial_merge_size, like memory slots.
-    future_prediction_mode: tokens
+    future_prediction_mode: pooled
     denoising_network_partial:
       use_conditioned_slot_gate: true
       hidden_dim: 512

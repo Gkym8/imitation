@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from functools import partial
 from typing import Any
 
@@ -25,6 +26,7 @@ class MultiTrajDataset(BaseDataset):
         anchor_sampling_mode: str = "contiguous",
         split_dataloader_cfg: dict[str, Any] | None = None,
         episode_starting_idx_max: int | None = None,
+        sample_range: Sequence[int] | None = None,
         **kwargs,
     ):
         if anchor_sampling_mode not in {"contiguous", "streaming"}:
@@ -32,6 +34,27 @@ class MultiTrajDataset(BaseDataset):
                 "anchor_sampling_mode must be 'contiguous' or 'streaming', "
                 f"got {anchor_sampling_mode!r}"
             )
+        # Older saved training configs used an inclusive upper bound only.
+        legacy_sample_nums = kwargs.pop("sample_nums", None)
+        if legacy_sample_nums is not None:
+            if isinstance(legacy_sample_nums, bool) or not isinstance(legacy_sample_nums, int) or legacy_sample_nums < 0:
+                raise ValueError("legacy sample_nums must be a non-negative integer or None")
+            if sample_range is not None:
+                raise ValueError("Set sample_range only; sample_nums is a legacy setting")
+            sample_range = (0, legacy_sample_nums)
+        if sample_range is not None:
+            if (
+                not isinstance(sample_range, Sequence)
+                or isinstance(sample_range, (str, bytes))
+                or len(sample_range) != 2
+                or any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                       for value in sample_range)
+                or sample_range[0] > sample_range[1]
+            ):
+                raise ValueError("sample_range must be [start, end] with non-negative integers and start <= end, or None")
+            if anchor_sampling_mode != "streaming":
+                raise ValueError("sample_range is only supported for streaming sampling")
+            sample_range = tuple(sample_range)
         traj_interval_min *= kwargs["down_sample_steps"]
         traj_interval_max *= kwargs["down_sample_steps"]
         super().__init__(**kwargs) # Should call the __init__ method from EpisodicDataset or AggregatedDataset. Please manage the MRO sequence properly.
@@ -47,6 +70,7 @@ class MultiTrajDataset(BaseDataset):
         self.traj_interval_min: int = traj_interval_min
         self.traj_interval_max: int = traj_interval_max
         self.anchor_sampling_mode = anchor_sampling_mode
+        self.sample_range = sample_range
 
         self.split_dataloader_cfg: dict[str, Any] | None = split_dataloader_cfg
 
@@ -93,10 +117,16 @@ class MultiTrajDataset(BaseDataset):
                     stream_stop = min(
                         stream_stop, self.episode_starting_idx_max
                     )
+                phase_begin = valid_min
                 phase_stop = min(
                     valid_min + self.traj_interval_min, stream_stop
                 )
-                phase_starts = list(range(valid_min, phase_stop))
+                if self.sample_range is not None:
+                    # Intersect the inclusive start range with valid frames.
+                    # Keep stream_stop unchanged; no earlier prefix is loaded.
+                    phase_begin = max(valid_min, self.sample_range[0])
+                    phase_stop = min(stream_stop, self.sample_range[1] + 1)
+                phase_starts = list(range(phase_begin, phase_stop))
                 self.overall_index_pool[episode_idx] = phase_starts
                 for phase_start in phase_starts:
                     stream_length = (
@@ -128,6 +158,7 @@ class MultiTrajDataset(BaseDataset):
             if streaming_traj_num <= 0:
                 raise ValueError(
                     "streaming sampling found no valid anchors in the dataset"
+                    f" for sample_range={self.sample_range}"
                 )
             # Default collation needs a fixed trajectory dimension. Shorter
             # phase streams are tail-padded and ignored by the loss mask.

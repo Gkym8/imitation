@@ -1,0 +1,22 @@
+defaults:
+  - rmbench
+  - _self_
+
+dataset_type: mikasa
+
+workspace:
+  train_dataset:
+    name: ???
+    robot_num: 1
+    image_keys: [third_person_camera, robot0_wrist_camera]
+    proprio_keys: [robot0_8d]
+    action_keys: [action0_8d]
+    use_cached_image_features: false
+
+  model:
+    action_length: 10
+
+  trainer:
+    num_epochs: 301
+    checkpoint_every: 25
+    val_every: 2
