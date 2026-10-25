@@ -56,6 +56,7 @@ def _prepare_kwargs(
     cached_image_feature_kind: str = "auto",
     cached_image_feature_patch_token_num: int = 256,
     camera_names: tuple[str, ...] = CAMERA_NAMES,
+    extra_image_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     image_keys = list(image_keys)
     if not image_keys:
@@ -70,13 +71,19 @@ def _prepare_kwargs(
             f"Choose from {list(camera_names)}"
         )
 
+    # Resolve auto from the configured memory views before adding DiT-only views.
+    resolved_feature_kind = _resolve_cached_feature_kind(
+        cached_image_feature_kind, image_keys
+    ) if use_cached_image_features else cached_image_feature_kind
+    extra_image_keys = list(extra_image_keys or [])
+    if set(extra_image_keys).difference(camera_names):
+        raise ValueError(f"Unsupported extra camera(s): {extra_image_keys}")
+    image_keys = list(dict.fromkeys([*image_keys, *extra_image_keys]))
+
     selected_source_meta = _select_camera_meta(source_data_meta, image_keys, camera_names)
     selected_output_meta = _select_camera_meta(output_data_meta, image_keys, camera_names)
 
     if use_cached_image_features:
-        resolved_feature_kind = _resolve_cached_feature_kind(
-            cached_image_feature_kind, image_keys
-        )
         if cached_image_feature_dim <= 0:
             raise ValueError("cached_image_feature_dim must be positive")
         if cached_image_feature_patch_token_num <= 0:
@@ -288,6 +295,7 @@ class CachedDinoFeatureMixin:
         cached_image_feature_dtype: str = "float32",
         cached_image_feature_kind: str = "auto",
         cached_image_feature_patch_token_num: int = 256,
+        extra_image_keys: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
         self.use_cached_image_features = use_cached_image_features
@@ -296,22 +304,26 @@ class CachedDinoFeatureMixin:
         self.cached_image_feature_model_name = cached_image_feature_model_name
         self.cached_image_feature_input_size = cached_image_feature_input_size
         self.cached_image_feature_dtype = cached_image_feature_dtype
-        self.cached_image_feature_kind = cached_image_feature_kind
+        self.cached_image_feature_kind = (
+            _resolve_cached_feature_kind(cached_image_feature_kind, self.image_keys)
+            if use_cached_image_features else cached_image_feature_kind
+        )
         self.cached_image_feature_patch_token_num = (
             cached_image_feature_patch_token_num
         )
-        super().__init__(
-            **_prepare_kwargs(
-                image_keys,
-                source_data_meta,
-                output_data_meta,
-                kwargs,
-                camera_names=self.camera_names,
-                use_cached_image_features=use_cached_image_features,
-                cached_image_feature_dim=cached_image_feature_dim,
-                cached_image_feature_kind=cached_image_feature_kind,
-                cached_image_feature_patch_token_num=(
-                    cached_image_feature_patch_token_num
-                ),
-            )
+        prepared_kwargs = _prepare_kwargs(
+            image_keys,
+            source_data_meta,
+            output_data_meta,
+            kwargs,
+            camera_names=self.camera_names,
+            use_cached_image_features=use_cached_image_features,
+            cached_image_feature_dim=cached_image_feature_dim,
+            cached_image_feature_kind=self.cached_image_feature_kind,
+            extra_image_keys=extra_image_keys,
+            cached_image_feature_patch_token_num=(
+                cached_image_feature_patch_token_num
+            ),
         )
+        self.image_keys = prepared_kwargs["image_keys"]
+        super().__init__(**prepared_kwargs)

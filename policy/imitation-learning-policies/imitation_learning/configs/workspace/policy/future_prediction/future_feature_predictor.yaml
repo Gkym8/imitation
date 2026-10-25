@@ -9,3 +9,6 @@ mlp_ratio: 4.0
 dropout: 0.0
 
 use_action_condition: true
+# Ordered action chunk -> one condition token. Old checkpoints default to tokens.
+action_condition_mode: chunk
+action_chunk_length: ${workspace.model.execution_chunk_length}

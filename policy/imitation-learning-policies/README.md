@@ -124,6 +124,18 @@ transitions and padding are excluded; no eligible target skips the predictor
 and returns a differentiable zero. Action supervision still uses every valid
 anchor, and the first observation is stored for subsequent memory queries.
 
+New training compresses the future predictor's action condition into one token
+with `workspace.model.future_feature_predictor.action_condition_mode: chunk`.
+Following DynaGuide, a 1x1 Conv1d projects each action, then the ordered chunk is
+flattened and linearly projected to the predictor width. At width 512 and chunk
+length 10: `[B,10,A] -> [B,51,10] -> [B,1,510] -> [B,1,512]`.
+The chunk length follows `execution_chunk_length`, so the condition still uses
+only actions before the next visual target. Masked/padded steps contribute zero;
+shorter inputs are padded in their original temporal positions. Feature targets
+and cosine/MSE losses retain their existing definitions. `tokens` selects the
+original per-action projection and position embeddings. Checkpoints without the
+new settings retain that original parameter layout and inference behavior.
+
 Patch targets follow `visual_encoder.spatial_merge_size`: with DINOv2 at
 224 pixels, the current value `4` gives 16 target tokens per camera; `1`
 keeps all 256 spatial patches. Cached training uses the existing CLS+patch
@@ -179,6 +191,47 @@ with the resulting decision memory reused across Diffusion steps. New query
 parameters are created only when enabled; checkpoints without the flag retain
 the original path and load strictly. Enabling this option on an existing disabled
 checkpoint introduces new trainable parameters and requires training them.
+
+For RMBench, set `workspace.model.dit_three_view: true` to make each DiT
+block's direct current-image attention read `head_camera`, `left_camera`,
+and `right_camera`, in that order. The default is `false`. Only this DiT
+input expands: `workspace.train_dataset.image_keys` continues to select
+the observations used by history queries, slot gates, memory writes, and
+future-prediction inputs/targets. For example, with `image_keys: [head_camera]`
+and four merged patches per view, DiT reads 12 current-image tokens while
+memory slots and the final decision memory retain four tokens. The dataset
+loads the extra cameras automatically, for both raw images and cached features,
+and checkpoint-backed inference prepares all three inputs. Cache `auto`
+selection still follows the original `image_keys`; adding DiT views does not
+switch a patch cache to CLS. The extra views must exist in the selected cache.
+The image backbone and feature projector are shared; DiT has a separate
+position embedding for its three-view sequence. Disabled configurations create
+no additional encoder parameters and retain the previous checkpoint layout.
+
+History retrieval retains the query residual in every attention block, then
+blends the final retrieved representation `R` with the current visual/state
+representation `C`:
+
+```text
+g = sigmoid(Linear(concat(C, R)))
+h = g * C + (1 - g) * R
+```
+
+This is the same feature-wise gate formula and initialization used by
+MemoryVLA. Its retrieval blocks also retain query residuals before fusion.
+Our attention uses multiple heads, RMSNorm/QK normalization, per-slot gates,
+and optional learned queries, so the full retrieval implementation is not
+identical to MemoryVLA's single-head, LayerNorm blocks. Empty history returns
+the current representation rather than zeros. DiT receives `h` as its second
+condition; future prediction uses this same `h` (mean-pooled for `pooled`,
+kept as tokens for `tokens`) plus the action condition. It does not receive a
+second, separate copy of the current observation. The selected history cameras
+still determine `h` and future targets; extra direct DiT views remain separate.
+
+The retired pure-history switch and its empty-memory attention masking have
+been removed. Saved metadata carrying that switch is ignored for weight-loading
+compatibility; checkpoints trained with pure-history retrieval do not retain
+their old behavior under the restored fusion path.
 
 Set `workspace.model.denoising_network_partial.fusion_gate: false` to use
 `h=R` instead: `R` already contains the query plus history retrieval residuals.

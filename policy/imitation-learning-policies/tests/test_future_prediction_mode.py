@@ -42,6 +42,58 @@ class DummyDinoV2(nn.Module):
 
 
 class FuturePredictionModeTest(unittest.TestCase):
+    def test_chunk_action_condition_uses_one_token_for_both_tasks_and_future_modes(self):
+        for task in ("rmbench", "mikasa_remember_color_3"):
+            for mode in ("pooled", "tokens"):
+                for cached in (False, True):
+                    with self.subTest(task=task, mode=mode, cached=cached):
+                        cfg = self.make_config(mode, cached, task=task)
+                        policy = self.instantiate_policy(cfg)
+                        predictor = policy.future_feature_predictor
+                        self.assertEqual(predictor.action_condition_mode, "chunk")
+                        self.assertEqual(predictor.action_chunk_length, policy.execution_chunk_length)
+                        self.assertIsNone(predictor.action_position_embedding)
+                        batch = self.make_batch(cached)
+                        if task.startswith("mikasa"):
+                            image = batch.pop("head_camera_feature" if cached else "head_camera")
+                            for i, name in enumerate(cfg.workspace.train_dataset.image_keys):
+                                batch[name + ("_feature" if cached else "")] = image + i * .1
+                            batch["robot0_8d"] = batch.pop("agent_pos")[..., :8]
+                            batch["action0_8d"] = batch.pop("action")[..., :10, :8]
+                        expected, actual = [], []
+                        def capture_inputs(module, args, kwargs):
+                            count = kwargs["current_observation_tokens"].shape[-2]
+                            memory = kwargs.get("memory_context_tokens")
+                            if memory is not None:
+                                count += memory.shape[-2]
+                            self.assertEqual(kwargs["action_chunk"].shape[-2], 10)
+                            expected.append(count + 1 + module.future_token_num)
+                        handle = predictor.register_forward_pre_hook(capture_inputs, with_kwargs=True)
+                        attention_handle = predictor.transformer.register_forward_pre_hook(
+                            lambda module, args: actual.append(args[0].shape[1])
+                        )
+                        losses = policy.compute_loss(batch)
+                        sum(losses.values()).backward()
+                        self.assertTrue(expected)
+                        self.assertEqual(actual, expected)
+                        self.assertTrue(all(torch.isfinite(value) for value in losses.values()))
+                        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all()
+                                            for p in predictor.action_projector.parameters()))
+                        expected.clear()
+                        policy.eval()
+                        policy.reset()
+                        for anchor in range(2):
+                            obs = {key: value[:, anchor] for key, value in batch.items()
+                                   if key not in {"action", "action0_8d", "traj_idx", "entire_traj_is_padding"}}
+                            obs["episode_idx"] = torch.tensor([0])
+                            with torch.inference_mode():
+                                actions = policy.predict_action(obs)
+                            self.assertTrue(all(torch.isfinite(value).all() for value in actions.values()))
+                        self.assertEqual(expected, [])  # Auxiliary head is not used online.
+                        handle.remove()
+                        attention_handle.remove()
+                        del policy
+
     @classmethod
     def setUpClass(cls):
         if not OmegaConf.has_resolver("eval"):

@@ -1,0 +1,12 @@
+defaults:
+  - observe_and_pickup
+  - _self_
+
+workspace:
+  model:
+    action_length: 16
+    dit_three_view: true
+  trainer:
+    num_epochs: 301
+    checkpoint_every: 50
+    future_prediction_loss_weight: 0.01

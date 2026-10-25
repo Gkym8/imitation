@@ -2,6 +2,7 @@ defaults:
   - diffusion_transformer
   - cond_encoder@history_img_feature_encoder: multi_token_encoder
   - cond_encoder@future_img_feature_encoder: multi_token_encoder
+  - cond_encoder@dit_img_feature_encoder_partial: multi_token_encoder
   - future_prediction@future_feature_predictor: future_feature_predictor
   - override denoising_network@denoising_network_partial: memory_transformer
   - _self_
@@ -11,6 +12,26 @@ _target_: imitation_learning.policies.history_denoising_policy.HistoryDenoisingP
 use_cached_image_features: ${workspace.train_dataset.use_cached_image_features}
 
 skip_memory: false
+# Only DiT's direct current-image attention uses all three RMBench cameras.
+dit_three_view: false
+dit_img_feature_encoder_partial:
+  _partial_: true
+  name: dit_img_feature_encoder
+  data_entry_names: [head_camera, left_camera, right_camera]
+  feature_dim: ${workspace.model.global_cond_encoder.feature_dim}
+  # Keep leaf references: embedding an entire dictionary in checkpoint config
+  # text converts its interpolated numbers and booleans to strings.
+  image_encoder_partial:
+    _target_: ${workspace.model.global_cond_encoder.image_encoder_partial._target_}
+    model_name: ${workspace.model.global_cond_encoder.image_encoder_partial.model_name}
+    apply_image_norm: ${workspace.model.global_cond_encoder.image_encoder_partial.apply_image_norm}
+    resize_size: ${workspace.model.global_cond_encoder.image_encoder_partial.resize_size}
+    feature_aggregation: ${workspace.model.global_cond_encoder.image_encoder_partial.feature_aggregation}
+    individual_forward: ${workspace.model.global_cond_encoder.image_encoder_partial.individual_forward}
+    pretrained: ${workspace.model.global_cond_encoder.image_encoder_partial.pretrained}
+    frozen: ${workspace.model.global_cond_encoder.image_encoder_partial.frozen}
+    spatial_merge_size: ${workspace.model.global_cond_encoder.image_encoder_partial.spatial_merge_size}
+
 global_cond_encoder:
   image_encoder_partial:
     spatial_merge_size: ${visual_encoder.spatial_merge_size}

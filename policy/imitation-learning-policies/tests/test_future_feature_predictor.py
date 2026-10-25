@@ -7,7 +7,7 @@ from imitation_learning.models.future_prediction.future_feature_predictor import
 )
 
 
-def make_predictor(use_action_condition: bool = True) -> FutureFeaturePredictor:
+def make_predictor(use_action_condition: bool = True, **kwargs) -> FutureFeaturePredictor:
     torch.manual_seed(0)
     return FutureFeaturePredictor(
         hidden_dim=32,
@@ -20,10 +20,98 @@ def make_predictor(use_action_condition: bool = True) -> FutureFeaturePredictor:
         future_token_num=2,
         max_action_length=16,
         use_action_condition=use_action_condition,
+        **kwargs,
     )
 
 
 class FutureFeaturePredictorTest(unittest.TestCase):
+    def test_chunk_condition_has_one_token_at_nondivisible_width(self):
+        predictor = FutureFeaturePredictor(
+            hidden_dim=32, predictor_hidden_dim=512, output_feature_dim=24,
+            action_dim=14, head_num=8, layer_num=1, max_action_length=16,
+            action_condition_mode="chunk", action_chunk_length=10,
+        )
+        seen = []
+        handle = predictor.transformer.register_forward_pre_hook(
+            lambda module, args: seen.append(args[0].shape)
+        )
+        current = torch.randn(2, 1, 32, requires_grad=True)
+        actions = torch.randn(2, 10, 14, requires_grad=True)
+        prediction = predictor(current, action_chunk=actions)
+        handle.remove()
+        self.assertEqual(seen, [torch.Size([2, 4, 512])])  # current + action + 2 targets
+        self.assertIsNone(predictor.action_position_embedding)
+        prediction.square().mean().backward()
+        self.assertTrue(torch.isfinite(actions.grad).all())
+        self.assertTrue(bool((actions.grad.abs().sum(dim=-1) > 0).all()))
+        self.assertGreater(float(current.grad.abs().sum()), 0)
+        self.assertTrue(all(p.grad is not None for p in predictor.action_projector.parameters()))
+
+    def test_chunk_embedding_preserves_action_order(self):
+        predictor = FutureFeaturePredictor(
+            hidden_dim=4, output_feature_dim=4, action_dim=1, head_num=1,
+            layer_num=1, max_action_length=2, action_condition_mode="chunk",
+        )
+        with torch.no_grad():
+            predictor.action_type_embedding.zero_()
+            encoder = predictor.action_projector
+            encoder.patch_embed.weight.copy_(torch.tensor([[[1.]], [[2.]]]))
+            encoder.patch_embed.bias.zero_()
+            encoder.out_project.weight.copy_(torch.eye(4))
+            encoder.out_project.bias.zero_()
+        actions = torch.tensor([[[1.], [2.]]])
+        forward, _ = predictor._encode_actions(actions, None, 1)
+        reverse, _ = predictor._encode_actions(actions.flip(1), None, 1)
+        torch.testing.assert_close(forward, torch.tensor([[[1., 2., 2., 4.]]]))
+        self.assertFalse(torch.equal(forward, reverse))
+
+    def test_chunk_mask_ignores_nan_padding_and_preserves_short_input_positions(self):
+        predictor = make_predictor(action_condition_mode="chunk", action_chunk_length=10).eval()
+        current = torch.randn(2, 1, 32)
+        actions = torch.randn(2, 6, 8, requires_grad=True)
+        mask = torch.tensor([[True, True, False, True, False, False],
+                             [False, True, True, False, True, False]])
+        full = torch.nn.functional.pad(actions.detach(), (0, 0, 0, 4))
+        full_mask = torch.nn.functional.pad(mask, (0, 4), value=False)
+        full[~full_mask] = float("nan")
+        original = predictor(current, action_chunk=actions, action_mask=mask)
+        modified = predictor(current, action_chunk=full, action_mask=full_mask)
+        torch.testing.assert_close(original, modified, rtol=0, atol=0)
+        original.square().mean().backward()
+        self.assertTrue(torch.isfinite(actions.grad).all())
+        torch.testing.assert_close(actions.grad[~mask], torch.zeros_like(actions.grad[~mask]))
+        self.assertTrue(bool((actions.grad[mask].abs().sum(dim=-1) > 0).all()))
+        invalid = torch.full((2, 10, 8), float("nan"))
+        none_valid = torch.zeros(2, 10, dtype=torch.bool)
+        missing = predictor(current, action_chunk=invalid, action_mask=none_valid)
+        empty = predictor(current, action_chunk=torch.empty(2, 0, 8))
+        self.assertTrue(torch.isfinite(missing).all())
+        torch.testing.assert_close(missing, empty, rtol=0, atol=0)
+
+    def test_legacy_action_default_matches_explicit_tokens_and_loads_strictly(self):
+        original = make_predictor()
+        restored = make_predictor(action_condition_mode="tokens")
+        restored.load_state_dict(original.state_dict(), strict=True)
+        self.assertEqual(original.action_position_embedding.shape, (1, 16, 32))
+        self.assertIn("action_projector.weight", original.state_dict())
+        self.assertFalse(any("patch_embed" in key for key in original.state_dict()))
+        current, actions = torch.randn(2, 3, 32), torch.randn(2, 10, 8)
+        torch.testing.assert_close(original(current, action_chunk=actions),
+                                   restored(current, action_chunk=actions), rtol=0, atol=0)
+
+    def test_chunk_settings_validate_length_and_support_disabled_conditioning(self):
+        for kwargs in ({"action_condition_mode": "mean"},
+                       {"action_chunk_length": 0}, {"action_chunk_length": True},
+                       {"action_chunk_length": 17}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                make_predictor(**kwargs)
+        predictor = make_predictor(action_condition_mode="chunk", action_chunk_length=10)
+        with self.assertRaisesRegex(ValueError, "action_chunk_length"):
+            predictor(torch.randn(1, 32), action_chunk=torch.randn(1, 11, 8))
+        disabled = make_predictor(False, action_condition_mode="chunk", action_chunk_length=10)
+        self.assertIsNone(disabled.action_projector)
+        self.assertEqual(disabled(torch.randn(1, 32)).shape, (1, 2, 24))
+
     def test_mse_loss_preserves_magnitude_and_can_backpropagate_to_target(self):
         predicted = torch.tensor([[[2.0, 4.0]]], requires_grad=True)
         target = torch.tensor([[[1.0, 2.0]]], requires_grad=True)

@@ -13,9 +13,9 @@ workspace:
       max_history_len: 8
       shadow_horizon: 3
       shadow_window: true
-      use_learned_history_query: true
+      use_learned_history_query: false
       query_tokens: null
-      # history_time_encoding: absolute
+    dit_three_view: true
     action_length: 10
   trainer:
     num_epochs: 301

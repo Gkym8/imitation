@@ -16,9 +16,19 @@ from imitation_learning.datasets.mujoco_dataset import (
 )
 
 
-class RMBenchSingleTrajDataset(CachedDinoFeatureMixin, MujocoSingleTrajDataset):
+class _RMBenchCameraMixin(CachedDinoFeatureMixin):
+    def __init__(self, dit_three_view: bool = False, **kwargs):
+        if not isinstance(dit_three_view, bool):
+            raise ValueError("dit_three_view must be boolean")
+        super().__init__(
+            extra_image_keys=list(CAMERA_NAMES) if dit_three_view else None,
+            **kwargs,
+        )
+
+
+class RMBenchSingleTrajDataset(_RMBenchCameraMixin, MujocoSingleTrajDataset):
     """Read only selected RMBench cameras, optionally from a DINOv2 cache."""
 
 
-class RMBenchMultiTrajDataset(CachedDinoFeatureMixin, MujocoMultiTrajDataset):
+class RMBenchMultiTrajDataset(_RMBenchCameraMixin, MujocoMultiTrajDataset):
     """Use the shared ordered sampler with selected RMBench cameras."""

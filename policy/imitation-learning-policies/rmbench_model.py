@@ -33,6 +33,36 @@ if not OmegaConf.has_resolver("eval"):
     register_resolvers()
 
 
+def _restore_dit_encoder_value_types(cfg: DictConfig) -> None:
+    """Recover types lost by old whole-dictionary checkpoint interpolation."""
+
+    dit_encoder = OmegaConf.select(
+        cfg, "workspace.model.dit_img_feature_encoder_partial.image_encoder_partial"
+    )
+    current_encoder = OmegaConf.select(
+        cfg, "workspace.model.global_cond_encoder.image_encoder_partial"
+    )
+    if not isinstance(dit_encoder, DictConfig) or not isinstance(current_encoder, DictConfig):
+        return
+    saved_values = OmegaConf.to_container(dit_encoder, resolve=True)
+    current_values = OmegaConf.to_container(current_encoder, resolve=True)
+    restored = []
+    for name, value in saved_values.items():
+        reference = current_values.get(name)
+        # The DiT encoder aliases the current-image encoder. Only restore a
+        # scalar when its spelling matches that checkpoint's typed value;
+        # retain explicit differences and ordinary string identifiers.
+        if (
+            isinstance(value, str)
+            and isinstance(reference, (bool, int, float))
+            and value == str(reference)
+        ):
+            dit_encoder[name] = reference
+            restored.append(name)
+    if restored:
+        print(f"Restored checkpoint DiT encoder value types: {', '.join(restored)}")
+
+
 class RMBenchMemoryPolicy:
     """Load an imitation-learning checkpoint and expose RMBench methods.
 
@@ -70,6 +100,7 @@ class RMBenchMemoryPolicy:
         OmegaConf.set_struct(cfg, False)
         cfg.workspace.model.device = str(self.device)
         self.cfg = remove_keys_from_config(cfg)
+        _restore_dit_encoder_value_types(self.cfg)
 
         policy = hydra.utils.instantiate(self.cfg.workspace.model)
         if not isinstance(policy, BasePolicy):
@@ -88,9 +119,14 @@ class RMBenchMemoryPolicy:
                 record_entries.append(self._memory_attention_record_key)
             self.policy.denoising_network.record_data_entries = record_entries
         self.image_keys = list(self.cfg.workspace.train_dataset.image_keys)
+        dit_encoder = getattr(self.policy, "dit_img_feature_encoder", None)
+        input_image_keys = list(dict.fromkeys([
+            *self.image_keys,
+            *(dit_encoder.data_entry_names if dit_encoder is not None else []),
+        ]))
         selected_output_meta = _select_camera_meta(
             self.cfg.workspace.train_dataset.output_data_meta,
-            self.image_keys,
+            input_image_keys,
         )
         data_meta = construct_data_meta_dict(selected_output_meta)
         self.normalizer = FixedNormalizer(data_meta)
@@ -263,6 +299,9 @@ class RMBenchMemoryPolicy:
 
     def _collect_input_lengths(self) -> dict[str, int]:
         encoders = [self.policy.global_cond_encoder]
+        dit_encoder = getattr(self.policy, "dit_img_feature_encoder", None)
+        if dit_encoder is not None:
+            encoders.append(dit_encoder)
         if self.policy.local_cond_encoder is not None:
             encoders.append(self.policy.local_cond_encoder)
         history_encoder = getattr(
