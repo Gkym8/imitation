@@ -25,7 +25,7 @@ class FusionGateTest(unittest.TestCase):
 
     def retriever(self, enabled=True):
         return ObservationDrivenMemoryRetriever(
-            hidden_dim=16, head_num=4, decision_memory_token_num=4,
+            hidden_dim=16, head_num=4,
             history_attention_type="token_wise", ssmax_scaling_param=None,
             binary_gating=False, straight_through="",
             retrieval_mode="perception_patches", use_conditioned_slot_gate=True,
@@ -98,15 +98,13 @@ class FusionGateTest(unittest.TestCase):
         fixture = future_fixture.FuturePredictionModeTest()
         for mode in ("pooled", "tokens"):
             for cached in (False, True):
-                for learned in (False, True):
-                    with self.subTest(mode=mode, cached=cached, learned=learned):
+                for projected in (False, True):
+                    with self.subTest(mode=mode, cached=cached, projected=projected):
                         cfg = fixture.make_config(mode, cached, merge_size=8)
-                        cfg.workspace.model.dit_three_view = True
                         cfg.workspace.model.denoising_network_partial.shadow_horizon = 2
-                        cfg.workspace.model.denoising_network_partial.use_learned_history_query = learned
-                        cfg.workspace.model.denoising_network_partial.query_tokens = 8 if learned else None
+                        cfg.workspace.model.denoising_network_partial.query_tokens = 8 if projected else None
                         cfg.workspace.model.denoising_network_partial.history_time_encoding = (
-                            "absolute" if learned else "relative"
+                            "absolute" if projected else "relative"
                         )
                         policy = fixture.instantiate_policy(cfg)
                         batch = fixture.make_batch(cached, anchors=4)
@@ -134,15 +132,14 @@ class FusionGateTest(unittest.TestCase):
                                 retrieval_inputs[0].get("local_cond"),
                                 retrieval_inputs[0].get("local_cond_mask"),
                             )
+                            current = retriever.project_current_query(current)
                             torch.testing.assert_close(training_memory[:1], current)
                             self.assertNotIn("decision_memory_mask", dit_inputs[0])
-                            self.assertEqual(dit_inputs[0]["global_cond"].shape[1], 12)
+                            self.assertEqual(dit_inputs[0]["global_cond"].shape[1], 4)
                             torch.testing.assert_close(dit_inputs[0]["decision_memory"], training_memory)
                             self.assertEqual(len(future_inputs), 1)
                             self.assertNotIn("memory_context_tokens", future_inputs[0])
                             expected = training_memory[1:3]
-                            if mode == "pooled":
-                                expected = expected.mean(dim=1, keepdim=True)
                             torch.testing.assert_close(future_inputs[0]["current_observation_tokens"], expected)
                             self.assertEqual(future_inputs[0]["action_chunk"].shape[1], 10)
                             self.assertEqual(token_counts, [expected.shape[1] + 1 + policy.future_feature_predictor.future_token_num])

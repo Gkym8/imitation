@@ -13,11 +13,8 @@ workspace:
       max_history_len: 8
       shadow_horizon: 3
       shadow_window: true
-      use_learned_history_query: false
-      query_tokens: null
-    dit_three_view: true
     action_length: 10
   trainer:
     num_epochs: 301
     checkpoint_every: 50
-    future_prediction_loss_weight: 0.01
+    future_prediction_loss_weight: 0

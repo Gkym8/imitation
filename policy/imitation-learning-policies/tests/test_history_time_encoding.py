@@ -24,12 +24,12 @@ class HistoryTimeEncodingTest(unittest.TestCase):
         gc.collect()
         SharedModelManager.reset()
 
-    def config(self, mode="absolute", cached=True, future="tokens", learned=False):
+    def config(self, mode="absolute", cached=True, future="tokens", projected=False):
         cfg = self.fixture.make_config(future, cached, merge_size=8)
         network = cfg.workspace.model.denoising_network_partial
         network.history_time_encoding = mode
         network.shadow_horizon = 1
-        network.use_learned_history_query = learned
+        network.query_tokens = 8 if projected else None
         cfg.workspace.model.memory_eviction.keep_first = False
         return cfg
 
@@ -134,10 +134,10 @@ class HistoryTimeEncodingTest(unittest.TestCase):
             torch.testing.assert_close(projected["history_key_latents"], expected)
 
     def test_streaming_nonzero_start_keeps_frames_and_trains_both_query_modes(self):
-        for cached, future, learned in ((True, "pooled", False), (True, "tokens", True),
+        for cached, future, projected in ((True, "pooled", False), (True, "tokens", True),
                                          (False, "pooled", True), (False, "tokens", False)):
-            with self.subTest(cached=cached, future=future, learned=learned):
-                policy = self.fixture.instantiate_policy(self.config(cached=cached, future=future, learned=learned))
+            with self.subTest(cached=cached, future=future, projected=projected):
+                policy = self.fixture.instantiate_policy(self.config(cached=cached, future=future, projected=projected))
                 network = policy.denoising_network
                 optimizer = torch.optim.SGD(policy.parameters(), lr=0.001)
                 batch = self.fixture.make_batch(cached, anchors=7)
@@ -161,8 +161,8 @@ class HistoryTimeEncodingTest(unittest.TestCase):
                         total.backward()
                         self.assertIsNone(network.history_time_embedding.grad)
                         self.assertGreater(sum(float(p.grad.abs().sum()) for p in network.memory_retriever.slot_gate.parameters()), 0)
-                        if learned:
-                            self.assertGreater(float(network.memory_retriever.history_query_tokens.grad.abs().sum()), 0)
+                        if projected:
+                            self.assertGreater(float(network.memory_retriever.current_query_projector.weight.grad.abs().sum()), 0)
                         optimizer.step()
                 self.assertEqual(len(reads), 6)
                 self.assertEqual(reads[1][0, -1].item(), 30)
@@ -172,7 +172,7 @@ class HistoryTimeEncodingTest(unittest.TestCase):
                 del policy
 
     def test_online_and_chunked_training_use_the_same_absolute_frames(self):
-        policy = self.fixture.instantiate_policy(self.config(learned=True)).eval()
+        policy = self.fixture.instantiate_policy(self.config(projected=True)).eval()
         batch = self.fixture.make_batch(anchors=7)
         reads = []
         network = policy.denoising_network

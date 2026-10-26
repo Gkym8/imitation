@@ -19,7 +19,7 @@ def make_retriever():
     return ObservationDrivenMemoryRetriever(
         hidden_dim=16,
         head_num=4,
-        decision_memory_token_num=4,
+
         history_attention_type="token_wise",
         ssmax_scaling_param=None,
         binary_gating=False,

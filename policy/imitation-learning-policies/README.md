@@ -107,10 +107,10 @@ workspace:
     future_prediction_mode: pooled  # pooled (default) or tokens
 ```
 
-`pooled` mean-pools the retrieved decision memory `h` to one vector and
+Both modes pass the complete fused decision memory `h` token sequence to the
+future predictor, together with the configured action condition. `pooled`
 predicts the next anchor's CLS token (DINOv2) or MAP token (SigLIP), one per
-camera. `tokens` passes the complete `h` token sequence to the predictor and
-predicts the next anchor's spatial patch features, without pooling `h`.
+camera; `tokens` predicts spatial patch features. The input `h` is never pooled.
 The target encoder and predictor output token count switch together. `tokens`
 uses MSE on raw predicted/target features, without L2 normalization, averaged
 over valid target tokens and feature dimensions. `pooled` and legacy configs
@@ -123,6 +123,26 @@ eligibility whenever the carried bank has history. Invalid next-anchor
 transitions and padding are excluded; no eligible target skips the predictor
 and returns a differentiable zero. Action supervision still uses every valid
 anchor, and the first observation is stored for subsequent memory queries.
+
+Set `workspace.model.denoising_network_partial.query_tokens: 8` (the default)
+to project current visual/state features directly to eight history-query tokens.
+For current features `[B,N,D]`, state conditioning first preserves `[B,N,D]`,
+then a learned `Linear(N*D, Q*D)` and reshape produce `C_Q: [B,Q,D]`.
+There are no independent learned query tokens. `C_Q` queries the retained bank;
+the history-enhanced result `R_Q` and `C_Q` have the same length and fuse as
+`h_Q = g*C_Q + (1-g)*R_Q`. Every DiT layer first reads the selected current
+images and then reads the full `h_Q`; future prediction receives that same full
+sequence. Empty/masked history returns `C_Q`. Setting `query_tokens: null`
+preserves the original current-image token count and omits the new projector.
+
+All current/history/future image encoders and dataset/inference inputs follow
+`image_keys`. History storage and Slot Gate scoring keep the original current
+visual/state and per-slot representations; changing `Q` does not resize stored
+slots. Eviction, Shadow decay and time encodings retain their existing rules.
+Token-wise history attention supports different query and slot token counts.
+The new projection adds trainable weights, so checkpoints from an earlier
+architecture need training/migration before using the new projected layout;
+weights are not silently dropped or initialized by the inference adapter.
 
 New training compresses the future predictor's action condition into one token
 with `workspace.model.future_feature_predictor.action_condition_mode: chunk`.
@@ -164,53 +184,8 @@ each new observation recomputes scores against the retained slots.
 For `perception_patches`, the final `TokenGateFusion` blends current visual/state
 tokens `C` with the history-aware output `R` of the last retrieval block:
 `g = sigmoid(Linear(concat(C, R)))`, `h = g*C + (1-g)*R`.
-An optional `workspace.model.denoising_network_partial.use_learned_history_query`
-switch (default `false`) changes only the initial history query. When enabled,
-`Q_init` is a learned `[1, query_tokens, hidden_dim]` parameter. Set
-`workspace.model.denoising_network_partial.query_tokens` to a positive integer
-to choose its token count; the default `null` derives the count from the configured
-image encoder, including all cameras. Each query token has `hidden_dim` features
-(512 in the RMBench config). Every observation starts from this same parameter and forms
-`Q_t = Q_init + CrossAttn(Q_init, C_t, C_t)`, where `C_t` concatenates the
-projected current image and state tokens along the token dimension. The resulting
-`Q_t` enters the existing history-retrieval blocks; there is no additional
-self-attention or FFN in query initialization. The existing fusion gate still
-blends the original current visual/state representation with the final retrieval
-output. If an explicit query count differs from the image token count, the final
-retrieval output is aligned back with
-`R = current + CrossAttn(current, retrieved, retrieved)` before the existing gate.
-Only this differing-count configuration creates the extra alignment attention;
-equal counts and `null` keep the existing path and parameter layout. The final
-decision memory keeps the current image token count regardless of `query_tokens`,
-including empty-history rows and `fusion_gate: false`. This setting takes effect
-only with `use_learned_history_query: true`. Slot-gate scoring, slot storage,
-eviction, Shadow decay, and losses keep
-their existing inputs and rules. Empty-history rows still use the current
-visual/state representation. Initialization and retrieval run once per observation,
-with the resulting decision memory reused across Diffusion steps. New query
-parameters are created only when enabled; checkpoints without the flag retain
-the original path and load strictly. Enabling this option on an existing disabled
-checkpoint introduces new trainable parameters and requires training them.
-
-For RMBench, set `workspace.model.dit_three_view: true` to make each DiT
-block's direct current-image attention read `head_camera`, `left_camera`,
-and `right_camera`, in that order. The default is `false`. Only this DiT
-input expands: `workspace.train_dataset.image_keys` continues to select
-the observations used by history queries, slot gates, memory writes, and
-future-prediction inputs/targets. For example, with `image_keys: [head_camera]`
-and four merged patches per view, DiT reads 12 current-image tokens while
-memory slots and the final decision memory retain four tokens. The dataset
-loads the extra cameras automatically, for both raw images and cached features,
-and checkpoint-backed inference prepares all three inputs. Cache `auto`
-selection still follows the original `image_keys`; adding DiT views does not
-switch a patch cache to CLS. The extra views must exist in the selected cache.
-The image backbone and feature projector are shared; DiT has a separate
-position embedding for its three-view sequence. Disabled configurations create
-no additional encoder parameters and retain the previous checkpoint layout.
-
-History retrieval retains the query residual in every attention block, then
-blends the final retrieved representation `R` with the current visual/state
-representation `C`:
+Current-image token count and decision-memory token count are independent:
+`query_tokens` sets the latter throughout retrieval, fusion and both consumers.
 
 ```text
 g = sigmoid(Linear(concat(C, R)))
@@ -220,23 +195,17 @@ h = g * C + (1 - g) * R
 This is the same feature-wise gate formula and initialization used by
 MemoryVLA. Its retrieval blocks also retain query residuals before fusion.
 Our attention uses multiple heads, RMSNorm/QK normalization, per-slot gates,
-and optional learned queries, so the full retrieval implementation is not
+and queries projected from the current observation, so its implementation is not
 identical to MemoryVLA's single-head, LayerNorm blocks. Empty history returns
-the current representation rather than zeros. DiT receives `h` as its second
-condition; future prediction uses this same `h` (mean-pooled for `pooled`,
-kept as tokens for `tokens`) plus the action condition. It does not receive a
-second, separate copy of the current observation. The selected history cameras
-still determine `h` and future targets; extra direct DiT views remain separate.
-
-The retired pure-history switch and its empty-memory attention masking have
-been removed. Saved metadata carrying that switch is ignored for weight-loading
-compatibility; checkpoints trained with pure-history retrieval do not retain
-their old behavior under the restored fusion path.
+the projected current representation rather than zeros. DiT and future
+prediction receive the same full `h` sequence. Future prediction additionally
+receives the action condition; its target token count follows `image_keys` and
+its target encoder, independently of `query_tokens`.
 
 Set `workspace.model.denoising_network_partial.fusion_gate: false` to use
 `h=R` instead: `R` already contains the query plus history retrieval residuals.
-By default that query is the current visual/state representation; with learned
-history queries it is `Q_t`, conditioned on current image and state tokens.
+That query is the current visual/state representation projected to
+`query_tokens` tokens (or left at the image-token count when null).
 The default is `true`, including checkpoints without the new setting.
 The gate has one value per token and feature dimension: with width 512,
 the linear layer maps 1024 features to 512. Its weights and bias use the
@@ -531,7 +500,7 @@ end, carries the same gate memory bank between chunks, and truncates gradients
 between chunks. The default sampling interval and `execution_chunk_length` are
 both 10. If changing the execution interval, make the Mikasa evaluation server
 execute the same number of actions per policy call. Pooled mode predicts one
-future CLS token for the selected camera, while DiT retains all four context
+future CLS token for the selected camera, while DiT retains all configured decision-memory
 tokens. Future prediction is a training objective and is not executed online.
 
 Runtime overrides are also available, for example

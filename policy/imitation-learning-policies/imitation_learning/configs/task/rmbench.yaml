@@ -43,7 +43,7 @@ workspace:
     action_indices: ${range:0,${workspace.model.action_length}}
     execution_chunk_length: 10
 
-    # pooled: mean(h) -> future CLS; tokens: h -> future patch tokens.
+    # Both modes consume all h tokens; pooled predicts CLS, tokens predicts patches.
     future_prediction_mode: pooled
     denoising_network_partial:
       use_conditioned_slot_gate: true

@@ -17,6 +17,6 @@ workspace:
     action_length: 10
 
   trainer:
-    num_epochs: 301
+    num_epochs: 101
     checkpoint_every: 25
     val_every: 2

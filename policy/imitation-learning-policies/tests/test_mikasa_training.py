@@ -26,6 +26,13 @@ MODEL_NAME = future_fixture.MODEL_NAME
 
 
 class MikasaTrainingTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parents[1]
+        root_patch = patch.object(training, "POLICY_ROOT", root)
+        root_patch.start()
+        cls.addClassCleanup(root_patch.stop)
+
     def tearDown(self):
         gc.collect()
         SharedModelManager.reset()
@@ -50,21 +57,22 @@ class MikasaTrainingTest(unittest.TestCase):
                 "model_name": MODEL_NAME, "input_size": 224,
                 "feature_kind": "patches", "feature_dim": 8,
                 "feature_dtype": "float32", "patch_token_num": 256,
-                "camera_names": ["third_person_camera"],
+                "camera_names": list(cfg.workspace.train_dataset.image_keys),
             }
             episode = root.create_group("episode_0")
-            # Deliberately omit the wrist array: unused views must not be read.
-            episode.create_dataset("third_person_camera", data=np.zeros((frames, 128, 128, 3), dtype=np.uint8))
+            for camera in cfg.workspace.train_dataset.image_keys:
+                episode.create_dataset(camera, data=np.zeros((frames, 128, 128, 3), dtype=np.uint8))
             values = np.arange(frames, dtype=np.float32)[:, None]
             state = np.broadcast_to(values, (frames, 8)).copy()
             episode.create_dataset("robot0_8d", data=state)
             episode.create_dataset("action0_8d", data=state)
             features = np.broadcast_to(values[:, :, None], (frames, 257, 8)).copy()
-            feature_array = episode.create_dataset("third_person_camera_patch_feature", data=features)
-            feature_array.attrs["complete"] = True
+            for camera in cfg.workspace.train_dataset.image_keys:
+                feature_array = episode.create_dataset(camera + "_patch_feature", data=features)
+                feature_array.attrs["complete"] = True
             yield cfg, location
 
-    def test_all_mikasa_task_configs_use_shared_method_and_only_fixed_camera(self):
+    def test_all_mikasa_task_configs_use_shared_method_and_configured_cameras(self):
         tasks = sorted((training.POLICY_ROOT / "imitation_learning/configs/task").glob("mikasa_*.yaml"))
         self.assertGreaterEqual(len(tasks), 9)
         for path in tasks:
@@ -74,7 +82,7 @@ class MikasaTrainingTest(unittest.TestCase):
                 dataset = cfg.workspace.train_dataset
                 self.assertEqual(dataset.anchor_sampling_mode, "streaming")
                 self.assertIsNone(dataset.sample_range)
-                self.assertEqual(list(dataset.image_keys), ["third_person_camera"])
+                self.assertEqual(list(dataset.image_keys), list(training.load_config("mikasa").workspace.train_dataset.image_keys))
                 self.assertEqual(list(dataset.proprio_keys), ["robot0_8d"])
                 self.assertEqual(dataset.starting_percentile_max, 1.0)
                 self.assertEqual(dataset.future_padding_length, cfg.workspace.model.action_length - 1)
@@ -131,15 +139,14 @@ class MikasaTrainingTest(unittest.TestCase):
                     )
                     self.assertEqual(dataset.normalizer.data_meta["third_person_camera"].shape, (3, 224, 224))
 
-    def test_cache_and_raw_dataset_exclude_wrist_and_keep_eight_action_channels(self):
+    def test_cache_and_raw_dataset_select_configured_cameras_and_keep_eight_action_channels(self):
         for cached in (True, False):
             with self.subTest(cached=cached), self.dataset_config(cached=cached, sample_range=[0, 0]) as (cfg, _):
                 metadata = copy.deepcopy(OmegaConf.to_container(cfg.workspace.train_dataset.output_data_meta))
                 dataset = hydra.utils.instantiate(cfg.workspace.train_dataset)
                 sample = dataset[0]
-                self.assertNotIn("robot0_wrist_camera", dataset.source_data_meta)
-                self.assertNotIn("robot0_wrist_camera", sample)
-                self.assertNotIn("robot0_wrist_camera_feature", sample)
+                for camera in cfg.workspace.train_dataset.image_keys:
+                    self.assertIn(camera + ("_feature" if cached else ""), sample)
                 self.assertEqual(sample["action0_8d"].shape, (5, 10, 8))
                 self.assertEqual(sample["robot0_8d"].shape, (5, 1, 8))
                 key = "third_person_camera_feature" if cached else "third_person_camera"
@@ -276,9 +283,10 @@ class MikasaTrainingTest(unittest.TestCase):
                     dataset = hydra.utils.instantiate(cfg.workspace.train_dataset)
                     batch = default_collate([dataset[0]])
                     policy = fixture.instantiate_policy(cfg)
-                    self.assertEqual(policy.global_cond_encoder.token_num, 4)
-                    self.assertEqual(policy.history_img_feature_encoder.token_num, 4)
-                    self.assertEqual(policy.future_img_feature_encoder.token_num, 1 if mode == "pooled" else 4)
+                    views = len(cfg.workspace.train_dataset.image_keys)
+                    self.assertEqual(policy.global_cond_encoder.token_num, 4 * views)
+                    self.assertEqual(policy.history_img_feature_encoder.token_num, 4 * views)
+                    self.assertEqual(policy.future_img_feature_encoder.token_num, views * (1 if mode == "pooled" else 4))
                     losses = policy.compute_loss(batch)
                     total = losses["action"] + .01 * losses["future_prediction"] + .01 * losses["gate_selectivity"]
                     self.assertTrue(torch.isfinite(total))
@@ -289,9 +297,10 @@ class MikasaTrainingTest(unittest.TestCase):
                     policy.reset()
                     future_calls = []
                     hook = policy.future_feature_predictor.register_forward_hook(lambda *args: future_calls.append(True))
-                    image_key = "third_person_camera_feature" if cached else "third_person_camera"
+                    image_keys = [camera + ("_feature" if cached else "")
+                                  for camera in cfg.workspace.train_dataset.image_keys]
                     for anchor in range(4):
-                        observation = {key: batch[key][:, anchor] for key in (image_key, "robot0_8d")}
+                        observation = {key: batch[key][:, anchor] for key in (*image_keys, "robot0_8d")}
                         observation["episode_idx"] = torch.tensor([0])
                         with torch.inference_mode():
                             prediction = policy.predict_action(observation)

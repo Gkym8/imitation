@@ -26,7 +26,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         history_img_feature_encoder: MultiTokenEncoder | None,
         execution_chunk_length: int | None = None,
         future_img_feature_encoder: MultiTokenEncoder | None = None,
-        future_prediction_context_pooling: str = "none",
         use_cached_image_features: bool = True,
         future_feature_predictor: (
             FutureFeaturePredictor | Callable[..., FutureFeaturePredictor] | None
@@ -37,38 +36,15 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         memory_gate: MemoryGate | None = None,
         max_training_traj_num: int = -1,
         future_prediction_mode: str | None = None,
-        dit_three_view: bool = False,
-        dit_img_feature_encoder_partial: Callable[..., MultiTokenEncoder] | None = None,
         **kwargs,
     ):
-        if not isinstance(dit_three_view, bool):
-            raise ValueError("dit_three_view must be boolean")
-        dit_encoder = None
-        if dit_three_view:
-            if dit_img_feature_encoder_partial is None:
-                raise ValueError("dit_three_view requires a DiT image encoder")
-            dit_encoder = dit_img_feature_encoder_partial()
-            cameras = ("head_camera", "left_camera", "right_camera")
-            if tuple(dit_encoder.cond_meta) != cameras:
-                raise ValueError("dit_three_view requires head, left, and right cameras")
-            if dit_encoder.feature_dim != kwargs["global_cond_encoder"].feature_dim:
-                raise ValueError("DiT and current image feature dimensions must match")
-            kwargs["denoising_network_partial"] = partial(
-                kwargs["denoising_network_partial"],
-                dit_cond_token_num=dit_encoder.token_num,
-            )
-
-        # Checkpoints without a mode retain their explicit legacy pooling and
-        # target-encoder settings. New configs select both with one switch.
+        # This mode selects future targets/loss only; h is never pooled.
         if future_prediction_mode is not None:
             if future_prediction_mode not in {"pooled", "tokens"}:
                 raise ValueError(
                     "future_prediction_mode must be 'pooled' or 'tokens', "
                     f"got {future_prediction_mode!r}"
                 )
-            future_prediction_context_pooling = (
-                "mean" if future_prediction_mode == "pooled" else "none"
-            )
 
         # Discard retired checkpoint metadata; memory slots contain images only.
         legacy_chunk_length = kwargs.pop("history_action_num_per_chunk", None)
@@ -86,9 +62,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
         super().__init__(**kwargs)
 
-        self.dit_three_view = dit_three_view
-        self.dit_img_feature_encoder = dit_encoder
-
         if (
             not isinstance(self.denoising_network, MemoryTransformer)
             and not skip_memory
@@ -97,14 +70,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 "HistoryDenoisingPolicy requires MemoryTransformer"
             )
         self.future_prediction_mode = future_prediction_mode
-        if future_prediction_context_pooling not in {"none", "mean"}:
-            raise ValueError(
-                "future_prediction_context_pooling must be 'none' or 'mean', "
-                f"got {future_prediction_context_pooling!r}"
-            )
-        self.future_prediction_context_pooling = (
-            future_prediction_context_pooling
-        )
         self.use_cached_image_features = bool(use_cached_image_features)
         if future_img_feature_encoder is None:
             # Keep legacy checkpoints unchanged: the fallback is the already
@@ -297,22 +262,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             "history_img_feature_encoder",
         )
 
-    def _encode_input_add_noise(self, normalized_batch, mode):
-        data_dict, target = super()._encode_input_add_noise(normalized_batch, mode)
-        if self.dit_three_view:
-            data_dict["dit_cond"] = self._encode_current_image_features(
-                normalized_batch, data_dict["global_cond"].shape[0],
-                self.dit_img_feature_encoder, "dit_img_feature_encoder",
-            )
-        return data_dict, target
-
-    def _pool_future_prediction_context(
-        self, context_tokens: torch.Tensor
-    ) -> torch.Tensor:
-        if self.future_prediction_context_pooling == "mean":
-            return context_tokens.mean(dim=-2, keepdim=True)
-        return context_tokens
-
     @staticmethod
     def _mask_invalid_future_transitions(
         future_valid: torch.Tensor,
@@ -499,12 +448,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             "(b t) ... -> b t ...",
             b=batch_size,
         )
-
-        if self.dit_three_view:
-            data_dict["dit_cond"] = self._encode_current_image_features(
-                normalized_batch, batch_size * traj_num,
-                self.dit_img_feature_encoder, "dit_img_feature_encoder",
-            ).reshape(batch_size, traj_num, self.dit_img_feature_encoder.token_num, -1)
 
         target: dict[str, torch.Tensor] = {}
 
@@ -990,9 +933,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 actions = None
                 if self.future_feature_predictor.use_action_condition:
                     actions = target["future_action_condition"][:, :supervised][predict_rows]
-                context = self._pool_future_prediction_context(
-                    projected["decision_memory"][flat_rows]
-                )
+                context = projected["decision_memory"][flat_rows]
                 # Do not call the predictor for observations without past
                 # memory, rather than merely masking their loss afterwards.
                 prediction = self.future_feature_predictor(

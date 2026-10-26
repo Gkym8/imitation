@@ -5,8 +5,8 @@ defaults:
 _target_: imitation_learning.models.denoising_networks.memory_transformer.MemoryTransformer
 
 max_history_len: 8
-# relative: retain the existing Bank-rank position table.
-# absolute: sinusoidal encoding of each slot's episode frame index.
+
+# absolute & relative
 history_time_encoding: relative
 # Both training and inference: false hard-deletes the minimum eligible gate slot.
 shadow_window: true
@@ -15,11 +15,9 @@ shadow_horizon: 3
 shadow_gate_scale: 0.1
 
 fusion_gate: true
-# Q_init + CrossAttn(Q_init, concat(image, state)).
-# false keeps current visual/state tokens as the history-attention query.
-use_learned_history_query: false
-# null follows the image token count; a positive integer sets Q_init's length.
-query_tokens: null
+# Project current visual/state tokens to this many history-query/fusion tokens.
+# null preserves the original current-image token count.
+query_tokens: 8
 freeze_non_history_modules: false
 history_attention_type: token_wise
 memory_retrieval_mode: perception_patches
@@ -27,7 +25,6 @@ perception_retrieval_layers: 2
 use_conditioned_slot_gate: true
 slot_gate_hidden_dim: 128
 slot_gate_bias_init: 0.0
-decision_memory_token_num: 16
 record_data_entries: []
 record_history_attention_epoch_stats: false
 ssmax_scaling_param: null

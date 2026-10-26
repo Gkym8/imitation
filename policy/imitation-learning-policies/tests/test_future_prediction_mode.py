@@ -115,6 +115,7 @@ class FuturePredictionModeTest(unittest.TestCase):
             "history_img_feature_encoder", "future_img_feature_encoder",
         ):
             model[name].feature_dim = 8
+        model.denoising_network_partial.query_tokens = None
         model.denoising_network_partial.hidden_dim = 32
         model.denoising_network_partial.head_num = 4
         model.denoising_network_partial.layer_num = 1
@@ -287,7 +288,7 @@ class FuturePredictionModeTest(unittest.TestCase):
                 with self.subTest(mode=mode, cached=cached):
                     cfg = self.make_config(mode, cached)
                     expected_tokens = 1 if mode == "pooled" else 16
-                    expected_context = 1 if mode == "pooled" else 16
+                    expected_context = 16
                     policy = self.instantiate_policy(cfg)
                     self.assertEqual(policy.future_feature_predictor.future_token_num, expected_tokens)
                     self.assertEqual(policy.future_img_feature_encoder.token_num, expected_tokens)
@@ -369,7 +370,7 @@ class FuturePredictionModeTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 policy = self.instantiate_policy(self.make_config(mode))
                 batch = self.make_batch(anchors=4)
-                expected_context = 1 if mode == "pooled" else 16
+                expected_context = 16
                 contexts = []
                 handle = policy.future_feature_predictor.register_forward_pre_hook(
                     lambda module, args, kwargs: contexts.append(
@@ -402,12 +403,11 @@ class FuturePredictionModeTest(unittest.TestCase):
         pooled_policy = self.instantiate_policy(cfg)
         expected_state = pooled_policy.state_dict()
         del pooled_policy
-        cfg.workspace.model.future_prediction_context_pooling = "mean"
         cfg.workspace.model.future_img_feature_encoder.image_encoder_partial.feature_aggregation = "map"
         del cfg.workspace.model.future_prediction_mode
         legacy_policy = self.instantiate_policy(cfg)
         legacy_policy.load_state_dict(expected_state, strict=True)
-        self.assertEqual(legacy_policy.future_prediction_context_pooling, "mean")
+        self.assertFalse(hasattr(legacy_policy, "future_prediction_context_pooling"))
         self.assertEqual(legacy_policy.future_feature_predictor.future_token_num, 1)
 
     def test_mode_rejects_unknown_value_and_mismatched_target(self):

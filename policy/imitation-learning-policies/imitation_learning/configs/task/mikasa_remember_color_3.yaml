@@ -8,7 +8,7 @@ workspace:
     sample_range: [0, 3]
   model:
     denoising_network_partial:
-      max_history_len: 5
+      max_history_len: 6
       shadow_horizon: 2
       shadow_window: false
   trainer:

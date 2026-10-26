@@ -29,8 +29,6 @@ down_sample_steps: 1
 
 # Select the camera inputs consumed by the policy.
 image_keys: [head_camera]
-# Load extra current views without changing image_keys for memory/future modules.
-dit_three_view: ${oc.select:workspace.model.dit_three_view,false}
 proprio_keys: [agent_pos]
 action_keys: [action]
 apply_image_augmentation_in_cpu: true
