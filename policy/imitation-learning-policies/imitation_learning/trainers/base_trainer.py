@@ -10,6 +10,7 @@ import torch
 import tqdm
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.accelerator import KwargsHandler
+from accelerate.data_loader import BatchSamplerShard
 from accelerate.utils import broadcast
 from diffusers.optimization import get_scheduler
 from omegaconf import ListConfig, OmegaConf
@@ -31,7 +32,7 @@ class BaseTrainer:
         seed: int,
         optimizer_partial: Callable[..., torch.optim.Optimizer],
         lr_scheduler_name: str,
-        lr_warmup_steps: int,
+        lr_warmup_steps: int | None,
         num_epochs: int,
         val_every: int,
         sample_every: int,
@@ -51,12 +52,29 @@ class BaseTrainer:
         loss_temperatures: list[float],
         clip_grad_norms: list[float],  # 0 means no clipping
         finetune_lr_ratio: float,
+        lr_warmup_ratio: float | None = None,
         **unused_kwargs,
     ):
         print(f"BaseTrainer unused kwargs: {unused_kwargs}")
         
         self.output_dir: str = output_dir
-        self.lr_warmup_steps: int = lr_warmup_steps
+        if lr_warmup_steps is not None and (
+            isinstance(lr_warmup_steps, bool)
+            or not isinstance(lr_warmup_steps, int)
+            or lr_warmup_steps < 0
+        ):
+            raise ValueError("lr_warmup_steps must be a non-negative integer or null")
+        if lr_warmup_ratio is not None and (
+            isinstance(lr_warmup_ratio, bool)
+            or not isinstance(lr_warmup_ratio, (int, float))
+            or not math.isfinite(lr_warmup_ratio)
+            or not 0 <= lr_warmup_ratio <= 1
+        ):
+            raise ValueError("lr_warmup_ratio must be finite and in [0, 1], or null")
+        if lr_warmup_steps is None and lr_warmup_ratio is None:
+            raise ValueError("set lr_warmup_ratio or lr_warmup_steps")
+        self.lr_warmup_steps: int | None = lr_warmup_steps
+        self.lr_warmup_ratio: float | None = lr_warmup_ratio
         self.lr_scheduler_name: str = lr_scheduler_name
 
         self.num_epochs: int = num_epochs
@@ -159,6 +177,77 @@ class BaseTrainer:
             f"{type(self).__name__} does not implement streaming training"
         )
 
+
+    def _scheduler_step_counts(self) -> tuple[int, int]:
+        """Return optimizer updates per epoch and scheduler ticks per update.
+
+        This runs before Accelerator.prepare. BatchSamplerShard predicts the
+        real per-rank loader length, including DDP rounding and drop_last.
+        """
+        assert self.train_dataloader is not None and self.accelerator is not None
+        split_batches = self.accelerator.split_batches
+        sharded_sampler = BatchSamplerShard(
+            self.train_dataloader.batch_sampler,
+            num_processes=self.accelerator.num_processes,
+            process_index=self.accelerator.process_index,
+            split_batches=split_batches,
+            even_batches=self.accelerator.even_batches,
+        )
+        batches_per_rank = len(sharded_sampler)
+        streaming_steps_per_batch = 1
+        train_dataset = getattr(self.train_dataloader, "dataset", None)
+        if (
+            getattr(train_dataset, "anchor_sampling_mode", None)
+            == "streaming"
+        ):
+            streaming_chunk_length = getattr(
+                self, "streaming_chunk_length", None
+            )
+            streaming_chunk_accumulate = getattr(
+                self, "streaming_chunk_accumulate", None
+            )
+            streaming_traj_num = getattr(train_dataset, "traj_num", None)
+            if (
+                not isinstance(streaming_chunk_length, int)
+                or streaming_chunk_length <= 0
+                or not isinstance(streaming_chunk_accumulate, int)
+                or streaming_chunk_accumulate <= 0
+                or not isinstance(streaming_traj_num, int)
+                or streaming_traj_num <= 0
+            ):
+                raise ValueError(
+                    "streaming scheduler requires positive dataset traj_num "
+                    "and trainer streaming chunk settings"
+                )
+            streaming_chunks_per_batch = math.ceil(
+                streaming_traj_num / streaming_chunk_length
+            )
+            streaming_steps_per_batch = math.ceil(
+                streaming_chunks_per_batch / streaming_chunk_accumulate
+            )
+            if getattr(self.model, "requires_full_sequence_backward", False):
+                # Saved Shadow Gates can refer to any preceding chunk. Keep
+                # parameters fixed until the sequence's single optimizer update.
+                streaming_steps_per_batch = 1
+            print(
+                "Streaming scheduler: "
+                f"{streaming_chunks_per_batch} chunks and "
+                f"{streaming_steps_per_batch} optimizer groups per batch"
+            )
+        optimizer_steps_per_epoch = math.ceil(
+            batches_per_rank * streaming_steps_per_batch / self.gradient_accumulation_steps
+        )
+        if optimizer_steps_per_epoch <= 0:
+            raise ValueError("training requires at least one optimizer update per epoch")
+        # AcceleratedScheduler advances once per process unless batches are split.
+        scheduler_ticks = 1 if split_batches else self.accelerator.num_processes
+        return optimizer_steps_per_epoch, scheduler_ticks
+
+    def _resolved_warmup_steps(self, total_scheduler_steps: int) -> int:
+        # An explicit fixed count wins, preserving old checkpoint/task configs.
+        if self.lr_warmup_steps is not None:
+            return self.lr_warmup_steps
+        return math.ceil(total_scheduler_steps * self.lr_warmup_ratio)
 
     def init_trainer(
         self,
@@ -314,64 +403,26 @@ class BaseTrainer:
             self.optimizer.load_state_dict(optimizer_state_dict)
 
 
-        # The dataloader has not been sharded by Accelerator yet.  Scheduler
-        # steps must match the per-rank optimizer steps after DDP sharding.
-#        optimizer_steps_per_epoch = math.ceil(
-#            len(self.train_dataloader) / self.accelerator.num_processes
-#        )
-        scheduler_steps_per_epoch = len(self.train_dataloader)
-        train_dataset = getattr(self.train_dataloader, "dataset", None)
-        if (
-            getattr(train_dataset, "anchor_sampling_mode", None)
-            == "streaming"
-        ):
-            streaming_chunk_length = getattr(
-                self, "streaming_chunk_length", None
-            )
-            streaming_chunk_accumulate = getattr(
-                self, "streaming_chunk_accumulate", None
-            )
-            streaming_traj_num = getattr(train_dataset, "traj_num", None)
-            if (
-                not isinstance(streaming_chunk_length, int)
-                or streaming_chunk_length <= 0
-                or not isinstance(streaming_chunk_accumulate, int)
-                or streaming_chunk_accumulate <= 0
-                or not isinstance(streaming_traj_num, int)
-                or streaming_traj_num <= 0
-            ):
-                raise ValueError(
-                    "streaming scheduler requires positive dataset traj_num "
-                    "and trainer streaming chunk settings"
-                )
-            streaming_chunks_per_batch = math.ceil(
-                streaming_traj_num / streaming_chunk_length
-            )
-            streaming_steps_per_batch = math.ceil(
-                streaming_chunks_per_batch / streaming_chunk_accumulate
-            )
-            scheduler_steps_per_epoch *= streaming_steps_per_batch
-            print(
-                "Streaming scheduler: "
-                f"{streaming_chunks_per_batch} chunks and "
-                f"{streaming_steps_per_batch} optimizer groups per batch, "
-                f"{scheduler_steps_per_epoch} steps per epoch"
-            )
-
-        # Accelerate performs an optimizer/scheduler update only after this
-        # many accumulated groups. Keep the cosine horizon in optimizer-step
-        # units instead of silently stretching it with accumulation.
-        scheduler_steps_per_epoch = math.ceil(
-            scheduler_steps_per_epoch / self.gradient_accumulation_steps
+        optimizer_steps_per_epoch, scheduler_ticks = self._scheduler_step_counts()
+        self.optimizer_steps_per_epoch = optimizer_steps_per_epoch
+        self.total_optimizer_steps = self.num_epochs * optimizer_steps_per_epoch
+        total_scheduler_steps = self.total_optimizer_steps * scheduler_ticks
+        self.resolved_lr_warmup_steps = self._resolved_warmup_steps(total_scheduler_steps)
+        warmup_optimizer_steps = math.ceil(self.resolved_lr_warmup_steps / scheduler_ticks)
+        mode = (
+            f"ratio={self.lr_warmup_ratio:.2%}"
+            if self.lr_warmup_steps is None else "fixed scheduler steps"
         )
-
+        print(
+            f"LR schedule: {optimizer_steps_per_epoch} optimizer updates/epoch, "
+            f"{self.total_optimizer_steps} total; warmup {warmup_optimizer_steps} "
+            f"optimizer updates ({self.resolved_lr_warmup_steps} scheduler steps, {mode})"
+        )
         self.lr_scheduler = get_scheduler(
             name=self.lr_scheduler_name,
             optimizer=self.optimizer,
-            num_warmup_steps=self.lr_warmup_steps,
-            num_training_steps=(
-                self.num_epochs * scheduler_steps_per_epoch
-            ),
+            num_warmup_steps=self.resolved_lr_warmup_steps,
+            num_training_steps=total_scheduler_steps,
         )
 
         if lr_scheduler_state_dict is not None:

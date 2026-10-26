@@ -8,16 +8,16 @@ max_history_len: 8
 
 # absolute & relative
 history_time_encoding: relative
-# Both training and inference: false hard-deletes the minimum eligible gate slot.
+# Training only; inference always hard-deletes the minimum eligible gate slot.
 shadow_window: true
-# At age k, a Shadow's raw gate is scaled by shadow_gate_scale / 10**k.
-shadow_horizon: 3
-shadow_gate_scale: 0.1
+# Keep the demotion Gate for this many reads; read k uses saved_gate * scale**k.
+shadow_horizon: 10
+shadow_gate_scale: 0.5
 
 fusion_gate: true
-# Project current visual/state tokens to this many history-query/fusion tokens.
-# null preserves the original current-image token count.
-query_tokens: 8
+
+query_tokens: 12
+
 freeze_non_history_modules: false
 history_attention_type: token_wise
 memory_retrieval_mode: perception_patches

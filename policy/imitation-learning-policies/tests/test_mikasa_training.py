@@ -308,7 +308,7 @@ class MikasaTrainingTest(unittest.TestCase):
                     hook.remove()
                     self.assertEqual(future_calls, [])
                     self.assertEqual(policy.online_memory_banks[0].active_count, 2)
-                    self.assertGreater(policy.online_memory_banks[0].shadow_count, 0)
+                    self.assertEqual(policy.online_memory_banks[0].shadow_count, 0)
                     del policy, losses, total
                     gc.collect()
 

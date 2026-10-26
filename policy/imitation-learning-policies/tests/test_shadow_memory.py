@@ -1,7 +1,10 @@
 import gc
 import math
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from accelerate import Accelerator
+from imitation_learning.trainers.policy_trainer import PolicyTrainer
 
 import hydra
 from omegaconf import OmegaConf, open_dict
@@ -18,7 +21,8 @@ class ShadowMemoryBankTest(unittest.TestCase):
         i = bank.next_anchor_index
         if scores is None:
             scores = torch.ones(len(bank))
-        return bank.append(torch.full((2, 3), float(i)), 10 * i, scores)
+        return bank.append(torch.full((2, 3), float(i)), 10 * i, scores,
+                           log_gates=scores.clamp_min(1e-8).log()[:, None])
 
     def test_demotion_preserves_identity_and_expires_after_exact_future_reads(self):
         bank = GateMemoryBank(2, keep_first=False, keep_recent=0, shadow_horizon=2)
@@ -106,6 +110,8 @@ class ShadowMemoryRetrievalTest(unittest.TestCase):
         current = torch.randn(1, 4, 16)
         history = torch.randn(1, 1, 3, 16).expand(-1, 4, -1, -1)
         records = {"history_cross_attention_slot_weights": [], "slot_gate_training_log_gates": []}
+        retriever.shadow_gate_scale = 0.5
+        saved = retriever.slot_gate(history_tokens=history, current_tokens=current).detach()
         calls = []
         handle = retriever.slot_gate.register_forward_hook(lambda module, args, output: calls.append(output))
         output = retriever(
@@ -113,29 +119,32 @@ class ShadowMemoryRetrievalTest(unittest.TestCase):
             history_mask=torch.ones(1, 4, dtype=torch.bool),
             history_shadow_mask=torch.tensor([[False, True, True, True]]),
             history_shadow_age=torch.tensor([[0, 0, 1, 2]]), record_data_dict=records,
+            history_shadow_log_gates=saved,
         )
         handle.remove()
         self.assertTrue(torch.isfinite(output).all())
         self.assertEqual(len(calls), 1)
         weights = records["history_cross_attention_slot_weights"][0]
-        scales = torch.tensor([1.0, 0.01, 0.001, 0.0001])
+        scales = torch.tensor([1.0, 0.5, 0.25, 0.125])
         expected = scales / scales.sum()
         torch.testing.assert_close(weights, expected.expand_as(weights))
         raw, effective = retriever.latest_slot_gates, retriever.latest_effective_slot_gates
         torch.testing.assert_close(raw[:, 0], raw[:, 1])
         torch.testing.assert_close(effective[:, 0], raw[:, 0])
         torch.testing.assert_close(effective, raw * scales[None, :, None])
-        torch.testing.assert_close(records["slot_gate_training_log_gates"][0], calls[0])
+        torch.testing.assert_close(records["slot_gate_training_log_gates"][0][:, :1], calls[0])
+        self.assertEqual(calls[0].shape[1], 1)  # Only the Active slot enters the MLP.
 
     def test_shadow_task_gradients_reach_raw_gate_and_slot_features(self):
         retriever = gate_fixture.make_retriever()
         history = torch.randn(1, 3, 4, 16, requires_grad=True)
         records = {"slot_gate_training_log_gates": []}
+        saved = torch.full((1, 3, retriever.slot_gate.head_num), -0.7, requires_grad=True)
         output = retriever(
             global_cond=torch.randn(1, 4, 16), history_latents=history,
             history_mask=torch.tensor([[True, True, False]]),
             history_shadow_mask=torch.tensor([[False, True, False]]), record_data_dict=records,
-            history_shadow_age=torch.tensor([[0, 2, 0]]),
+            history_shadow_age=torch.tensor([[0, 2, 0]]), history_shadow_log_gates=saved,
         )
         raw_log_gates = records["slot_gate_training_log_gates"][0]
         gate_grad, feature_grad = torch.autograd.grad(output.square().sum(), (raw_log_gates, history))
@@ -179,7 +188,7 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
         network = cfg.workspace.model.denoising_network_partial
         network.max_history_len = 4
         network.shadow_horizon = 3
-        network.shadow_gate_scale = 0.01
+        network.shadow_gate_scale = 0.5
         cfg.workspace.model.memory_eviction.keep_recent = 2
         return cfg
 
@@ -191,7 +200,7 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
     def snapshot(self, bank):
         return tuple((slot.slot_id, slot.state, slot.expire_at, slot.frame_index) for slot in bank.slots)
 
-    def test_training_chunks_and_online_share_shadow_lifecycle_and_decay(self):
+    def test_training_chunks_keep_shadow_lifecycle_and_online_hard_deletes(self):
         for mode in ("pooled", "tokens"):
             with self.subTest(mode=mode):
                 policy = self.fixture.instantiate_policy(self.make_config(mode)).eval()
@@ -251,27 +260,22 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
                             })
                         self.assertTrue(torch.isfinite(output["action"]).all())
                 handle.remove()
-                self.assertEqual(reads, full_reads)
-                for full_age, packed in zip(full_ages, packed_reads):
-                    self.assertEqual(packed["history_mask"].shape[1], 7)
-                    torch.testing.assert_close(full_age, packed["history_shadow_age"])
+                active_reads = [tuple(tuple(row for row in bank if row[1] == "active") for bank in read) for read in full_reads]
+                self.assertEqual(reads, active_reads)
+                for packed in packed_reads:
+                    self.assertEqual(packed["history_mask"].shape[1], 4)
+                    self.assertFalse(bool(packed["history_shadow_mask"].any()))
                 bank = policy.online_memory_banks[0]
-                self.assertEqual(self.snapshot(bank), full_bank)
+                self.assertEqual(self.snapshot(bank), tuple(row for row in full_bank if row[1] == "active"))
                 self.assertEqual(len(calls), 12)
-                self.assertEqual((bank.active_count, bank.shadow_count), (4, 3))
-                self.assertEqual((bank.storage_capacity, bank.shadow_horizon), (7, 3))
+                self.assertEqual((bank.active_count, bank.shadow_count), (4, 0))
+                self.assertEqual((bank.storage_capacity, bank.shadow_horizon), (4, 0))
                 snapshot = policy.latest_online_memory_query_dict[0]
                 self.assertEqual(snapshot["active_slot_count"], 4)
-                self.assertEqual(snapshot["shadow_slot_count"], 3)
+                self.assertEqual(snapshot["shadow_slot_count"], 0)
                 raw = torch.tensor(snapshot["slot_gates"])
                 effective = torch.tensor(snapshot["slot_effective_gates"])
-                scales = torch.tensor([
-                    0.01 / 10 ** (snapshot["query_anchor_index"] + 3 - expiry - 1)
-                    if state == "shadow" else 1.0
-                    for state, expiry in zip(snapshot["slot_states"], snapshot["slot_expire_at"])
-                ])
-                torch.testing.assert_close(effective, raw * scales[:, None])
-                self.assertTrue(any(expiry == snapshot["query_anchor_index"] for expiry in snapshot["slot_expire_at"]))
+                torch.testing.assert_close(effective, raw)
                 policy.reset()
                 self.assertEqual(policy.online_memory_banks, {})
                 self.assertIsNone(policy.denoising_network.memory_retriever.latest_effective_slot_gates)
@@ -291,7 +295,10 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
         handle.remove()
         expected = 0.0
         for (raw, mask, capacity, threshold), mlp_output in zip(captured, raw_outputs):
-            torch.testing.assert_close(raw, mlp_output)
+            if raw.shape == mlp_output.shape:
+                torch.testing.assert_close(raw[mask], mlp_output[mask])
+            else:
+                torch.testing.assert_close(raw[mask], mlp_output[:, 0])
             self.assertLessEqual(int(mask.sum()), 4)
             if int(mask.sum()) == capacity:
                 std = raw.exp()[0, mask[0]].std(dim=0, unbiased=False)
@@ -299,46 +306,73 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
         self.assertTrue(any(int(mask.sum()) == 4 and mask.shape[1] == 7 for _, mask, _, _ in captured))
         torch.testing.assert_close(loss.detach(), torch.tensor(expected / 10))
 
-    def test_shadow_future_gradients_survive_chunk_and_optimizer_boundaries(self):
+    def test_original_shadow_gate_receives_later_chunk_action_and_future_gradients(self):
+        cfg = self.make_config()
+        cfg.workspace.model.denoising_network_partial.max_history_len = 2
+        cfg.workspace.model.denoising_network_partial.shadow_horizon = 6
+        cfg.workspace.model.memory_eviction.keep_recent = 0
+        policy = self.fixture.instantiate_policy(cfg)
+        optimizer = torch.optim.SGD(policy.parameters(), lr=0.001)
+        batch = self.fixture.make_batch(anchors=13)
+        first = policy.compute_loss(self.chunk(batch, 0, 4, True, False))
+        bank = policy._streaming_training_state[0]
+        saved = [slot.shadow_log_gate for slot in bank.slots if slot.state == "shadow"]
+        initial_values = [gate.detach().clone() for gate in saved]
+        self.assertTrue(saved)
+        self.assertTrue(all(gate.grad_fn is not None for gate in saved))
+        self.assertTrue(all(slot.latent.grad_fn is None for slot in bank.slots))
+        later_losses = []
+        for start in (4, 8):
+            losses = policy.compute_loss(self.chunk(batch, start, 4, False, start == 8))
+            later_losses.append(losses)
+            for name in ("action", "future_prediction"):
+                gradients = torch.autograd.grad(losses[name], saved, retain_graph=True, allow_unused=True)
+                self.assertGreater(sum(float(g.abs().sum()) for g in gradients if g is not None), 0)
+                self.assertTrue(all(torch.isfinite(g).all() for g in gradients if g is not None))
+        for gate, initial in zip(saved, initial_values):
+            torch.testing.assert_close(gate.detach(), initial, rtol=0, atol=0)
+        total = sum(loss["action"] + 0.05 * loss["future_prediction"] + 0.01 * loss["gate_selectivity"]
+                    for loss in [first] + later_losses)
+        total.backward()
+        self.assertGreater(sum(float(p.grad.abs().sum()) for p in policy.denoising_network.memory_retriever.slot_gate.parameters()), 0)
+        optimizer.step()
+        self.assertIsNone(policy._streaming_training_state)
+
+    def test_trainer_updates_once_per_shadow_sequence_and_can_repeat(self):
         cfg = self.make_config()
         cfg.workspace.model.denoising_network_partial.max_history_len = 2
         cfg.workspace.model.memory_eviction.keep_recent = 0
         policy = self.fixture.instantiate_policy(cfg)
-        optimizer = torch.optim.SGD(policy.parameters(), lr=0.001)
-        batch = self.fixture.make_batch(anchors=10)
-        retriever = policy.denoising_network.memory_retriever
-        raw_outputs, shadow_masks = [], []
-        gate_handle = retriever.slot_gate.register_forward_hook(
-            lambda module, args, output: raw_outputs.append(output),
-        )
-        def before_read(module, args, kwargs):
-            shadow_masks.append(kwargs["history_shadow_mask"].clone())
-        read_handle = retriever.register_forward_pre_hook(before_read, with_kwargs=True)
-        saw_shadow_gradient = False
-        for start in (0, 3, 6):
-            raw_outputs.clear()
-            shadow_masks.clear()
-            optimizer.zero_grad(set_to_none=True)
-            losses = policy.compute_loss(self.chunk(batch, start, 3, start == 0, start == 6))
-            selected = [(raw, mask) for raw, mask in zip(raw_outputs, shadow_masks) if mask.any()]
-            if selected:
-                gradients = torch.autograd.grad(losses["future_prediction"], [raw for raw, _ in selected], retain_graph=True)
-                for gradient, (_, mask) in zip(gradients, selected):
-                    self.assertTrue(torch.isfinite(gradient).all())
-                    self.assertGreater(float(gradient[mask].abs().sum()), 0)
-                    saw_shadow_gradient = True
-            total = losses["action"] + 0.05 * losses["future_prediction"] + 0.01 * losses["gate_selectivity"]
-            total.backward()
-            self.assertGreater(sum(float(p.grad.abs().sum()) for p in retriever.slot_gate.parameters()), 0)
-            optimizer.step()
-            if policy._streaming_training_state is not None:
-                for slot in policy._streaming_training_state[0].slots:
-                    self.assertIsNone(slot.latent.grad_fn)
-                    self.assertFalse(slot.raw_features.requires_grad)
-        gate_handle.remove()
-        read_handle.remove()
-        self.assertTrue(saw_shadow_gradient)
-        self.assertIsNone(policy._streaming_training_state)
+        trainer = PolicyTrainer.__new__(PolicyTrainer)
+        trainer.accelerator = Accelerator(cpu=True)
+        trainer.model = policy
+        trainer.optimizer = torch.optim.SGD(policy.parameters(), lr=0.001)
+        trainer.lr_scheduler = Mock()
+        trainer.ema_model = Mock()
+        trainer.epoch = 0
+        trainer.clip_grad_norms = [1.0]
+        trainer.streaming_chunk_length = 4
+        trainer.streaming_chunk_accumulate = 1
+        trainer.future_prediction_loss_weight = 0.05
+        trainer.gate_selectivity_loss_weight = 0.01
+        trainer.critical_action_loss_weights = [0.0]
+        batch = self.fixture.make_batch(anchors=13)
+        # Local trailing empty chunks remain safe (also needed on shorter DDP ranks).
+        batch["entire_traj_is_padding"][:, 10:] = True
+        for _ in range(2):
+            with patch.object(trainer.optimizer, "step", wraps=trainer.optimizer.step) as step, \
+                 patch.object(trainer.accelerator, "backward", wraps=trainer.accelerator.backward) as backward, \
+                 patch.object(policy.denoising_network, "prepare_parallel_forward", wraps=policy.denoising_network.prepare_parallel_forward) as forward:
+                loss, logs = trainer.backward_streaming_batch(batch)
+            self.assertTrue(torch.isfinite(loss))
+            self.assertEqual(step.call_count, 1)
+            self.assertEqual(backward.call_count, 3)
+            self.assertEqual(forward.call_count, 3)
+            self.assertEqual(trainer._last_streaming_step_count, 1)
+            self.assertIsNone(policy._streaming_training_state)
+            self.assertIn("train/gate_selectivity_loss", logs)
+        self.assertEqual(trainer.lr_scheduler.step.call_count, 2)
+        self.assertEqual(trainer.ema_model.step.call_count, 2)
 
     def test_padding_and_lookahead_do_not_age_or_enter_shadow_bank(self):
         cfg = self.make_config()
@@ -381,10 +415,11 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
                     "agent_pos": batch["agent_pos"][:, anchor], "episode_idx": torch.tensor([4, 9]),
                     "entire_traj_is_padding": batch["entire_traj_is_padding"][:, anchor],
                 })
-        self.assertEqual([self.snapshot(policy.online_memory_banks[episode]) for episode in (4, 9)], expected)
+        self.assertEqual([self.snapshot(policy.online_memory_banks[episode]) for episode in (4, 9)],
+                         [tuple(row for row in bank if row[1] == "active") for bank in expected])
         self.assertEqual([policy.online_memory_banks[episode].next_anchor_index for episode in (4, 9)], [18, 8])
         self.assertEqual([(policy.online_memory_banks[e].active_count, policy.online_memory_banks[e].shadow_count)
-                          for e in (4, 9)], [(8, 8), (8, 0)])
+                          for e in (4, 9)], [(8, 0), (8, 0)])
 
     def test_disabled_window_hard_deletes_in_training_and_online_in_both_feature_modes(self):
         for mode in ("pooled", "tokens"):
@@ -466,6 +501,8 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
     def test_projection_accepts_physical_capacity_and_rejects_overflow(self):
         policy = self.fixture.instantiate_policy(self.make_config())
         network = policy.denoising_network
+        saved_logits = torch.randn(1, 7, 4, requires_grad=True)
+        saved_log_gates = torch.nn.functional.logsigmoid(saved_logits)
         self.assertEqual(tuple(network.history_time_embedding.shape), (1, 7, 32))
         data = {
             "noisy_action": torch.randn(1, 16, 14), "step": torch.zeros(1, dtype=torch.long),
@@ -473,10 +510,19 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
             "history_img_features": torch.randn(1, 7, 16, 8),
             "history_mask": torch.ones(1, 7, dtype=torch.bool),
             "history_shadow_mask": torch.tensor([[False] * 4 + [True] * 3]),
+            "history_shadow_log_gates": saved_log_gates,
         }
         inputs = network.prepare_single_memory_retrieval(data)
         self.assertEqual(inputs["history_latents"].shape[1], 7)
-        self.assertTrue(torch.isfinite(network.retrieve_decision_memory(inputs)).all())
+        self.assertIs(inputs["history_shadow_log_gates"], saved_log_gates)
+        memory = network.retrieve_decision_memory(inputs)
+        self.assertTrue(torch.isfinite(memory).all())
+        gradient, = torch.autograd.grad(memory.square().sum(), saved_logits, retain_graph=True)
+        self.assertGreater(float(gradient[:, 4:].abs().sum()), 0)
+        self.assertEqual(float(gradient[:, :4].abs().sum()), 0)
+        result = network(data)
+        action_gradient, = torch.autograd.grad(result["action"].square().sum(), saved_logits)
+        self.assertGreater(float(action_gradient[:, 4:].abs().sum()), 0)
         data["history_img_features"] = torch.randn(1, 8, 16, 8)
         with self.assertRaisesRegex(ValueError, "storage capacity"):
             network.prepare_single_memory_retrieval(data)

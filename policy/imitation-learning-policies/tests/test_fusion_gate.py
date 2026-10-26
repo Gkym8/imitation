@@ -149,10 +149,16 @@ class FusionGateTest(unittest.TestCase):
                             self.assertTrue(all(g is not None and torch.isfinite(g).all() for g in slot_grads))
                             if cached:
                                 self.assertGreater(sum(float(g.abs().sum()) for g in slot_grads), 0)
-                            expected_online = training_memory.detach().clone()
+                            # Inference hard-deletes. Compare its numerical path
+                            # to an Active-only training reference, while the
+                            # preceding gradient checks still exercise Shadow.
+                            memories.clear()
+                            policy.eval()
+                            with patch.object(policy.denoising_network, "effective_shadow_horizon", 0), torch.no_grad():
+                                policy.compute_loss(batch)
+                            expected_online = torch.cat(memories).detach().clone()
                             memories.clear()
                             future_inputs.clear()
-                            policy.eval()
                             policy.reset()
                             for anchor in range(4):
                                 obs = {key: value[:, anchor] for key, value in batch.items()

@@ -69,11 +69,11 @@ class HistoryTimeEncodingTest(unittest.TestCase):
         initial = policy._pack_history([bank], reference)
         self.assertEqual(initial["history_mask"].tolist(), [[False, True, True]])
         torch.testing.assert_close(initial["history_key_latents"][0, 1:, 0], self.expected([30, 70]))
-        bank.append(slot, 100, torch.tensor([0.1, 0.9]))
+        bank.append(slot, 100, torch.tensor([0.1, 0.9]), log_gates=torch.zeros(2, 4))
         first = policy._pack_history([bank], reference)
         self.assertEqual([item.state for item in bank.slots], ["shadow", "active", "active"])
         torch.testing.assert_close(first["history_key_latents"][0, :, 0], self.expected([30, 70, 100]))
-        bank.append(slot, 150, torch.tensor([0.9, 0.8, 0.1]))
+        bank.append(slot, 150, torch.tensor([0.9, 0.8, 0.1]), log_gates=torch.zeros(3, 4))
         second = policy._pack_history([bank], reference)
         self.assertEqual([item.frame_index for item in bank.slots], [70, 100, 150])
         torch.testing.assert_close(second["history_key_latents"][0, :, 0], self.expected([70, 100, 150]))
@@ -149,21 +149,18 @@ class HistoryTimeEncodingTest(unittest.TestCase):
                     reads.append(history_frame_indices.clone())
                     return add_encoding(history, table, history_frame_indices)
 
+                optimizer.zero_grad(set_to_none=True)
+                batch.update(_streaming_sequence_chunk_length=3, _streaming_sequence_length=6)
                 with patch.object(network, "add_history_key_encoding", side_effect=capture):
-                    for start in (0, 3):
-                        chunk = {key: value[:, start:start + 4] for key, value in batch.items()}
-                        chunk.update(_streaming_supervised_length=3, _streaming_reset=start == 0,
-                                     _streaming_final=start == 3)
-                        optimizer.zero_grad(set_to_none=True)
-                        losses = policy.compute_loss(chunk)
-                        total = losses["action"] + .05 * losses["future_prediction"] + .01 * losses["gate_selectivity"]
-                        self.assertTrue(torch.isfinite(total))
-                        total.backward()
-                        self.assertIsNone(network.history_time_embedding.grad)
-                        self.assertGreater(sum(float(p.grad.abs().sum()) for p in network.memory_retriever.slot_gate.parameters()), 0)
-                        if projected:
-                            self.assertGreater(float(network.memory_retriever.current_query_projector.weight.grad.abs().sum()), 0)
-                        optimizer.step()
+                    losses = policy.compute_loss(batch)
+                    total = losses["action"] + .05 * losses["future_prediction"] + .01 * losses["gate_selectivity"]
+                    self.assertTrue(torch.isfinite(total))
+                    total.backward()
+                    self.assertIsNone(network.history_time_embedding.grad)
+                    self.assertGreater(sum(float(p.grad.abs().sum()) for p in network.memory_retriever.slot_gate.parameters()), 0)
+                    if projected:
+                        self.assertGreater(float(network.memory_retriever.current_query_projector.weight.grad.abs().sum()), 0)
+                    optimizer.step()
                 self.assertEqual(len(reads), 6)
                 self.assertEqual(reads[1][0, -1].item(), 30)
                 self.assertEqual(reads[3][0, -1].item(), 80)
@@ -174,7 +171,7 @@ class HistoryTimeEncodingTest(unittest.TestCase):
     def test_online_and_chunked_training_use_the_same_absolute_frames(self):
         policy = self.fixture.instantiate_policy(self.config(projected=True)).eval()
         batch = self.fixture.make_batch(anchors=7)
-        reads = []
+        reads, masks = [], []
         network = policy.denoising_network
         add_encoding = network.add_history_key_encoding
 
@@ -183,7 +180,15 @@ class HistoryTimeEncodingTest(unittest.TestCase):
             reads.append((history_frame_indices.detach().clone(), encoded.detach().clone()))
             return encoded
 
-        with patch.object(network, "add_history_key_encoding", side_effect=capture):
+        pack_history = policy._pack_history
+
+        def capture_pack(banks, reference):
+            packed = pack_history(banks, reference)
+            masks.append(packed["history_active_mask"].clone())
+            return packed
+
+        with patch.object(network, "add_history_key_encoding", side_effect=capture), \
+             patch.object(policy, "_pack_history", side_effect=capture_pack):
             for start in (0, 3):
                 chunk = {key: value[:, start:start + 4] for key, value in batch.items()}
                 chunk.update(_streaming_supervised_length=3, _streaming_reset=start == 0,
@@ -191,7 +196,9 @@ class HistoryTimeEncodingTest(unittest.TestCase):
                 with torch.no_grad():
                     policy.compute_loss(chunk)
             training_reads = list(reads)
+            training_masks = list(masks)
             reads.clear()
+            masks.clear()
             for anchor in range(6):
                 with torch.no_grad():
                     output = policy.predict_action({
@@ -201,9 +208,9 @@ class HistoryTimeEncodingTest(unittest.TestCase):
                     })
                 self.assertTrue(torch.isfinite(output["action"]).all())
         self.assertEqual(len(reads), 6)
-        for (train_frames, train_keys), (online_frames, online_keys) in zip(training_reads, reads):
-            torch.testing.assert_close(online_frames, train_frames, rtol=0, atol=0)
-            torch.testing.assert_close(online_keys, train_keys)
+        for (train_frames, train_keys), (online_frames, online_keys), train_mask, online_mask in zip(training_reads, reads, training_masks, masks):
+            torch.testing.assert_close(online_frames[online_mask], train_frames[train_mask], rtol=0, atol=0)
+            torch.testing.assert_close(online_keys[online_mask], train_keys[train_mask])
         self.assertEqual(policy.next_frame_index_dict[0], 60)
         policy.reset()
         self.assertEqual(policy.next_frame_index_dict, {})

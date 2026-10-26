@@ -28,8 +28,6 @@ future_img_feature_encoder:
     feature_aggregation: ${eval:"dict(pooled='map', tokens='patches')['${workspace.model.future_prediction_mode}']"}
     spatial_merge_size: ${visual_encoder.spatial_merge_size}
     frozen: true
-    # A frozen backbone can serve current/history inputs and future targets.
-    # Keep targets separate only when the online backbone is trainable.
     shared_model_key: ${cond:${visual_encoder.frozen},${visual_encoder.model_name},future_target_dinov2}
   name: future_img_feature_encoder
   data_entry_names: ${workspace.train_dataset.image_keys}
@@ -38,7 +36,9 @@ future_prediction_mode: pooled
 execution_chunk_length: 10
 
 memory_eviction:
+  # Evict the eligible slot with the smallest sum of its largest k head Gates.
+  top_k: 3
   keep_first: true
   keep_recent: 2
 
-gate_selectivity_min_std: 0.1
+gate_selectivity_min_std: 0.2

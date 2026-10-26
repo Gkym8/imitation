@@ -11,7 +11,10 @@ optimizer_partial:
   weight_decay: 1.0e-6
 
 lr_scheduler_name: cosine
-lr_warmup_steps: 2000
+# Fraction of the complete LR schedule; 0.05 means 5%.
+lr_warmup_ratio: 0.05
+# Set an integer to override the ratio (legacy fixed-step behavior).
+lr_warmup_steps: null
 num_epochs: 21
 val_every: ${cond:${in:${policy_name},memory,gated},${cond:${in:${policy_name},large},0,2},2} # Skip validation fror large models to save memory
 sample_every: 2

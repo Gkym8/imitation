@@ -3,7 +3,9 @@ import unittest
 from unittest.mock import patch
 
 import torch
+import hydra
 from torch import nn
+from omegaconf import open_dict
 
 from imitation_learning.models.memory.gate_memory import (
     GateMemoryBank,
@@ -53,6 +55,7 @@ class GateMemoryBankTest(unittest.TestCase):
                 removed = bank.append(
                     torch.full((2, 3), 8.0), 80,
                     torch.tensor([0.0, 0.8, 0.7, 0.6, 0.5, 0.4, 0.01, 0.0]),
+                    log_gates=torch.zeros(len(bank), 2),
                 )
                 # Slot 7 is protected despite its lower gate. Slot 6 is not:
                 # the two recent slots after insertion are 7 and 8.
@@ -66,7 +69,7 @@ class GateMemoryBankTest(unittest.TestCase):
                     for s in bank.slots
                 ])
                 # Next insertion protects 8 and 9, so 7 can now be demoted.
-                self.assertEqual(bank.append(torch.full((2, 3), 9.0), 90, scores), 7)
+                self.assertEqual(bank.append(torch.full((2, 3), 9.0), 90, scores, log_gates=torch.zeros(len(bank), 2)), 7)
                 self.assertEqual(
                     [s.slot_id for s in bank.slots if s.state == "active"],
                     [0, 1, 2, 3, 4, 5, 8, 9],
@@ -193,6 +196,46 @@ class GateMemoryPolicyTest(unittest.TestCase):
         self.assertEqual(tuple(slot.slot_id for slot in policy.online_memory_banks[0].slots), training_ids)
         self.assertEqual(training_ids[0], 0)
 
+    def test_top_three_sum_preserves_specialist_slot_and_excludes_padding(self):
+        cfg = self.fixture.make_config()
+        cfg.workspace.model.denoising_network_partial.head_num = 8
+        cfg.workspace.model.memory_eviction.keep_first = False
+        cfg.workspace.model.memory_eviction.keep_recent = 0
+        policy = self.fixture.instantiate_policy(cfg)
+        self.assertEqual(policy.eviction_top_k, 3)
+        bank, empty_bank = policy._new_memory_bank(), policy._new_memory_bank()
+        for anchor in range(2):
+            bank.append(torch.zeros(4, 32), anchor * 10, torch.empty(0))
+        specialist = torch.tensor([0.9, 0.9, 0.9, 0.01, 0.01, 0.01, 0.01, 0.01])
+        generalist = torch.full((8,), 0.5)
+        self.assertLess(float(specialist.mean()), float(generalist.mean()))
+        gates = torch.full((2, 4, 8), 0.99)
+        gates[0, -2:] = torch.stack([specialist, generalist])
+        policy.denoising_network.memory_retriever.latest_slot_gates = gates
+        scores, empty_scores = policy._current_gate_scores([bank, empty_bank])
+        torch.testing.assert_close(scores, torch.tensor([2.7, 1.5]))
+        self.assertEqual(empty_scores.numel(), 0)
+        evicted = bank.append(torch.zeros(4, 32), 20, scores)
+        self.assertEqual(evicted, 1)  # The mean rule would pick slot 0.
+
+    def test_top_k_configuration_validation_and_legacy_default(self):
+        cfg = self.fixture.make_config()
+        cfg.workspace.model.memory_eviction.top_k = 1
+        policy = self.fixture.instantiate_policy(cfg)
+        self.assertEqual(policy.eviction_top_k, 1)
+        del policy
+        with open_dict(cfg.workspace.model.memory_eviction):
+            del cfg.workspace.model.memory_eviction["top_k"]
+        policy = self.fixture.instantiate_policy(cfg)
+        self.assertEqual(policy.eviction_top_k, 3)
+        del policy
+        for value in (0, -1, True, 1.5, "3", 5):
+            with self.subTest(top_k=value):
+                cfg = self.fixture.make_config()
+                cfg.workspace.model.memory_eviction.top_k = value
+                with self.assertRaisesRegex(hydra.errors.InstantiationException, "memory_eviction.top_k"):
+                    self.fixture.instantiate_policy(cfg)
+
     def test_future_lookahead_does_not_change_eviction_or_enter_bank(self):
         policy = self.fixture.instantiate_policy(self.fixture.make_config()).eval()
         batch = self.fixture.make_batch(anchors=7)
@@ -252,6 +295,11 @@ class GateMemoryPolicyTest(unittest.TestCase):
                         "episode_idx": torch.tensor([0]),
                     })
                 self.assertTrue(torch.isfinite(output["action"]).all())
+                snapshot = policy.latest_online_memory_query_dict[0]
+                if snapshot["slot_gates"]:
+                    raw = torch.tensor(snapshot["slot_gates"])
+                    expected = raw.topk(policy.eviction_top_k, dim=-1).values.sum(dim=-1)
+                    torch.testing.assert_close(torch.tensor(snapshot["gate_scores"]), expected)
         policy.reset()
         self.assertEqual(policy.online_memory_banks, {})
 

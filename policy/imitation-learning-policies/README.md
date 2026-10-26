@@ -267,8 +267,9 @@ parameter shapes; older configurations without either setting keep all phases.
 For saved training-config compatibility, the retired `sample_nums: N` maps to
 `sample_range: [0, N]`; specifying both non-null settings is rejected.
 
-Training and inference use the same chronological memory bank. With
-`shadow_window: true` (the default), slots have `active` and `shadow` states.
+Training and inference keep slots in chronological order. Training with
+`shadow_window: true` (the default) uses Active and Shadow slots; inference
+always retains only Active slots.
 
 `workspace.model.denoising_network_partial.history_time_encoding` selects how
 history keys receive time positions. `relative` (default) keeps the existing
@@ -289,7 +290,7 @@ during inference. Direct non-streaming network calls in absolute mode must suppl
 `history_frame_indices` for their history slots/source anchors.
 With `shadow_window: false`, both training and inference hard-delete evictions
 and retain only Active capacity. After reading history, a full Active bank selects the
-eligible Active slot with the lowest mean raw gate over heads, then inserts
+eligible Active slot with the lowest sum of its largest k raw head Gates, then inserts
 the current observation as Active. Ties demote the oldest eligible slot.
 The original first slot and the newest two Active slots after insertion are
 protected by default. `keep_recent` includes the incoming slot, so before
@@ -304,11 +305,12 @@ workspace:
   model:
     denoising_network_partial:
       max_history_len: 8       # Active capacity
-      shadow_window: true     # Enable Shadow in both training and inference
+      shadow_window: true     # Enable Shadow during training; inference hard-deletes
       shadow_horizon: 3       # Number of future valid Shadow reads
-      shadow_gate_scale: 0.01  # First Shadow read, then divide by 10 per read
+      shadow_gate_scale: 0.5   # Per-read decay: 0.5, 0.25, 0.125, ...
       fusion_gate: true       # False uses current + retrieved history residuals
     memory_eviction:
+      top_k: 3                # Sum the largest 3 of 8 head Gates for eviction
       keep_first: true
       keep_recent: 2
     gate_selectivity_min_std: 0.1
@@ -316,31 +318,60 @@ workspace:
     gate_selectivity_loss_weight: 0.01
 ```
 
-Shadow slots share the same MLP and Attention normalization with Active slots.
-Their effective log-gates are
-`logsigmoid(MLP) + log(shadow_gate_scale) - age * log(10)`, with age starting at 0;
-raw gates are recomputed at every read. A slot demoted after anchor `t` is
-read as Shadow at `t+1` through `t+shadow_horizon`, then physically deleted
-after the final read. It never re-enters the eviction candidates or consumes
-an Active place. Total feature storage and history position embeddings are
-bounded by `max_history_len + shadow_horizon`. With horizon 3 and scale 0.01,
-the next three reads multiply the newly computed raw gate by 0.01, 0.001,
-and 0.0001. The scale is not accumulated on the previous read's gate.
-When disabled, banks and packed history contain only `max_history_len` slots
-in both training and inference. The configured `shadow_horizon` is retained for
-checkpoint positional-table compatibility, and reads use the final
-`max_history_len` positions. When enabled, both use Active plus Shadow capacity.
-Counters advance only on valid supervised/online anchors, excluding padding
-and lookahead. State and expiry survive chunk boundaries along with features.
+At demotion, a Shadow slot saves that read's raw per-head log-gate with its
+computation graph. It does not run the Gate MLP against subsequent observations.
+Active slots continue to receive freshly observation-conditioned gates. All slots
+participate in the same Attention normalization. At the k-th Shadow read,
+starting with k=1, its effective gate is
+`saved_gate * shadow_gate_scale**k`, or in log space
+`saved_log_gate + k * log(shadow_gate_scale)`. With horizon 3 and scale 0.5,
+the three reads use 0.5, 0.25, and 0.125 times the saved gate. The decay rate
+must be finite and in (0, 1]. No factor of 10 is hard-coded.
+
+A slot demoted after anchor t is read as Shadow at t+1 through
+t+shadow_horizon, then physically deleted after its final read. It never
+re-enters the eviction candidates or consumes an Active place. Training feature
+storage and position embeddings are bounded by max_history_len + shadow_horizon.
+Counters advance only on valid supervised anchors, excluding padding and
+lookahead. Saved gates, state and expiry survive chunk boundaries.
+
+Online inference always immediately deletes the selected slot and retains only
+Active capacity, including when shadow_window is true in the checkpoint.
+shadow_window=false or shadow_horizon=0 also disables Shadow during training.
+The configured horizon still determines the checkpoint position-table shape;
+Active-only reads use its final max_history_len positions. Toggling the flag
+or switching between training and inference does not change parameter shapes.
 
 The selectivity loss computes population standard deviation over valid Active
 slots' raw gates for each head, then averages `relu(0.1 - std)**2` over heads.
 Shadow gates are excluded. Only full Active banks
 receive this penalty; unfilled banks contribute zero to the average over valid
 training anchors. The default total loss is
-`action + 0.05 * future_prediction + 0.01 * gate_selectivity`.
-Both task losses and this regularizer train the gate. Chunk boundaries detach
-stored features; the next chunk reprojects them using current parameters.
+`action + 0.01 * future_prediction + 0.01 * gate_selectivity` (task overrides apply).
+Both task losses and this regularizer train the gate. With Shadow enabled,
+each chunk immediately backpropagates its valid-anchor-weighted loss, releasing
+its action and future-prediction graphs. Gradients accumulate until the complete
+stream ends; clipping, optimizer, scheduler and EMA still run once per stream
+batch (subject to Accelerate's outer gradient accumulation).
+streaming_chunk_accumulate applies only when Shadow is disabled, and scheduler
+step counts continue to follow the same one-update-per-stream rule.
+
+Chunk boundaries detach stored visual features, and the next chunk reprojects
+raw cached features. Only live Shadow Gates retain their original generation
+branches, including upstream operations, so losses throughout the full decay
+window train the original demotion Gate. New demotion Gates reference only fresh
+Active outputs, avoiding graph chains through older Shadows. Expired branches
+are released when no remaining Shadow or current chunk references them. The
+live activation window is controlled by chunk length and Shadow lifetime, rather
+than total stream length. Do not update parameters between chunks.
+
+All Shadow chunk forwards/backwards run with DDP no_sync. At the stream boundary,
+16 MiB gradient buckets (or one larger parameter) synchronize once, including
+parameters unused on a shorter rank. Gradient averaging occurs before clipping,
+and AMP-scaled gradients follow the normal scaler/optimizer path.
+Input loading is unchanged: the full padded sample can still reside on GPU, so
+input memory continues to grow with sample length despite bounded live graphs.
+When Shadow is disabled, the original detached-state chunk updates remain.
 Future lookahead anchors provide targets without entering the memory bank.
 Online inference only reads gates and predicts actions, without running the
 future predictor or future target encoder. The obsolete prediction-error queue,
@@ -355,21 +386,42 @@ RMBench evaluation writes one row per historical slot read to
 `memory_slot_gates.csv`, with only `episode_index`, `query_anchor_index`,
 `slot_id`, `slot_state`, `gate_mean`, `gate_head_0` through `gate_head_{H-1}`,
 and `attention_mean`. Gates are raw MLP sigmoid outputs; `gate_mean` averages
-the heads, matching the eviction score. Attention is the actual post-softmax
+the heads for inspection. The eviction score is the sum of the largest
+`memory_eviction.top_k` raw Gates (default 3), rather than `gate_mean`.
+The same score is used in training and inference; protection rules still apply.
+`top_k` must be an integer from 1 to the number of Gate heads.
+Attention is the actual post-softmax
 slot probability (summed over its patches), averaged over heads and current
-query tokens in the final retrieval layer. Online CSV rows include Shadow slots
-when the window is enabled; otherwise they contain only Active slots;
-padding does not. An empty bank produces one row with blank slot values.
+query tokens in the final retrieval layer. Online CSV rows contain only Active slots; padding is excluded. An empty bank produces one row with blank slot values.
 Episodes append to the same file without repeating its header.
 
 Checkpoints save the Shadow configuration and matching positional embedding
-shape. `shadow_window` is saved in checkpoint config and controls both training
-and inference. Checkpoints without this flag default to enabled; a zero horizon
-still means immediate eviction. Toggling the flag does not change parameter shapes.
+shape. `shadow_window` is saved in checkpoint config and controls training
+Shadow retention; inference always deletes immediately. Checkpoints without this
+flag default to enabled for training; a zero horizon still means immediate eviction. Toggling the flag does not change parameter shapes.
 Configs without `shadow_horizon` retain immediate eviction and their
 original shape. Enabling a nonzero horizon changes that shape and requires
 training a matching model. Old checkpoint configs containing removed memory
 settings must be updated before loading this policy version.
+
+Warmup defaults to a fraction of the complete training schedule:
+
+```yaml
+workspace:
+  trainer:
+    lr_warmup_ratio: 0.05  # First 5% of training; 0 disables warmup.
+    lr_warmup_steps: null # A non-null integer overrides the ratio.
+```
+
+The trainer accounts for the per-rank DataLoader length, Shadow sequence or
+chunk update groups, gradient accumulation, and Accelerate's internal scheduler
+ticks. It prints the total and warmup in optimizer updates. For 301 epochs,
+16 updates per epoch and a 5% ratio, warmup lasts about 241 of 4816 updates.
+Changing the dataset, batch size, GPU count or epoch count recalculates this
+budget at startup. Ratios must be finite and in [0, 1]. Older configurations
+with a fixed lr_warmup_steps retain their fixed schedule. Existing optimizer
+and scheduler checkpoints still resume their saved progress. Editing the YAML
+does not change the schedule of a process that is already running.
 
 Please go through all comments in `shell_scripts/train_sim.sh` for detailed instructions.
 
@@ -496,8 +548,10 @@ workspace:
 ```
 
 `sample_range: null` keeps all original phases. Streaming continues to the episode
-end, carries the same gate memory bank between chunks, and truncates gradients
-between chunks. The default sampling interval and `execution_chunk_length` are
+end and carries the gate memory bank between chunks. Feature graphs are
+truncated at chunk boundaries; each chunk backpropagates immediately while live
+Shadow Gate generation graphs remain connected for their full decay windows.
+Parameters update only after the complete stream when Shadow is enabled. The default sampling interval and `execution_chunk_length` are
 both 10. If changing the execution interval, make the Mikasa evaluation server
 execute the same number of actions per policy call. Pooled mode predicts one
 future CLS token for the selected camera, while DiT retains all configured decision-memory

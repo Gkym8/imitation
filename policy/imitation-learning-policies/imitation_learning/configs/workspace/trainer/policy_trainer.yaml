@@ -21,4 +21,5 @@ future_prediction_loss_weight: 0.01
 gate_selectivity_loss_weight: 0.01
 critical_action_loss_weights: [0.0] 
 streaming_chunk_length: 4
+# With Shadow enabled, all chunks form one sequence update instead.
 streaming_chunk_accumulate: 1

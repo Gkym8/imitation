@@ -419,10 +419,124 @@ class PolicyTrainer(BaseTrainer):
         logs["train/loss"] = float(loss.detach().cpu())
         return loss, logs
 
+    @torch.no_grad()
+    def _synchronize_shadow_gradients(self):
+        """Average accumulated DDP gradients once, including unused parameters.
+
+        Chunk backwards revisit saved Gate graphs from earlier forwards. DDP's
+        per-forward unused-parameter reducer cannot describe those graphs, so
+        all forwards/backwards use no_sync and we reduce bounded buckets here.
+        Gradients remain AMP-scaled until the normal clip/optimizer path.
+        """
+        if self.accelerator.num_processes <= 1 or not self.accelerator.sync_gradients:
+            return
+        parameters = [p for p in self.model.parameters() if p.requires_grad]
+        used = torch.tensor(
+            [p.grad is not None for p in parameters],
+            device=parameters[0].device, dtype=torch.int32,
+        )
+        used = self.accelerator.reduce(used, reduction="sum").bool().cpu().tolist()
+        bucket, bucket_bytes = [], 0
+
+        def flush():
+            if not bucket:
+                return
+            gradients = [p.grad if p.grad is not None else torch.zeros_like(p) for p in bucket]
+            flat = torch.cat([g.reshape(-1) for g in gradients])
+            flat = self.accelerator.reduce(flat, reduction="sum") / self.accelerator.num_processes
+            offset = 0
+            for p in bucket:
+                gradient = flat[offset:offset + p.numel()].view_as(p)
+                if p.grad is None:
+                    p.grad = gradient.clone()
+                else:
+                    p.grad.copy_(gradient)
+                offset += p.numel()
+            bucket.clear()
+
+        for p, globally_used in zip(parameters, used):
+            if not globally_used:
+                continue
+            size = p.numel() * p.element_size()
+            if bucket and (bucket_bytes + size > 16 * 1024**2
+                           or p.dtype != bucket[0].dtype or p.device != bucket[0].device):
+                flush()
+                bucket_bytes = 0
+            bucket.append(p)
+            bucket_bytes += size
+        flush()
+
+    def _backward_shadow_sequence(
+        self, batch: batch_type, sequence_length: int, local_valid_num: int
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Backward chunks early, keeping only live Shadow generation branches.
+
+        Parameters, scheduler and EMA still update once per complete stream.
+        Loss weights equal the former full-sequence backward, including DDP
+        ranks with unequal valid lengths and gradient accumulation.
+        """
+        padding = batch["entire_traj_is_padding"]
+        batch_size, padded_length = padding.shape
+        global_valid_num = self.accelerator.reduce(
+            torch.tensor(float(local_valid_num), device=padding.device), reduction="sum",
+        ).clamp_min(1)
+        policy = self.accelerator.unwrap_model(self.model)
+        total_loss = torch.zeros((), device=padding.device)
+        logs: dict[str, float] = {}
+        try:
+            with self.accelerator.accumulate(self.model):
+                # Synchronize only after all chunk gradients are accumulated;
+                # old Gate branches are absent from later DDP forward outputs.
+                with self.accelerator.no_sync(self.model):
+                    for start in range(0, sequence_length, self.streaming_chunk_length):
+                        end = min(start + self.streaming_chunk_length, sequence_length)
+                        chunk = self._slice_streaming_batch(
+                            batch, start, min(end + 1, padded_length), batch_size, padded_length,
+                        )
+                        chunk.update(
+                            _streaming_supervised_length=end - start,
+                            _streaming_reset=start == 0,
+                            _streaming_final=end == sequence_length,
+                        )
+                        valid_num = int((~padding[:, start:end].bool()).sum().item())
+                        with self.accelerator.autocast():
+                            chunk_loss, chunk_logs = self.compute_loss(chunk)
+                            scaled_loss = chunk_loss * (
+                                self.accelerator.num_processes * valid_num / global_valid_num
+                            )
+                        banks = policy._streaming_training_state
+                        retain_gate_graph = banks is not None and any(
+                            slot.shadow_log_gate is not None for bank in banks for slot in bank.slots
+                        )
+                        self.accelerator.backward(scaled_loss, retain_graph=retain_gate_graph)
+                        weight = valid_num / local_valid_num
+                        total_loss += chunk_loss.detach() * weight
+                        for name, value in chunk_logs.items():
+                            logs[name] = logs.get(name, 0.0) + value * weight
+                        # retain_graph preserves only branches still referenced
+                        # by live Gates once these action/prediction roots die.
+                        del chunk_loss, scaled_loss, chunk, banks
+                self._synchronize_shadow_gradients()
+                if self.accelerator.sync_gradients and self.clip_grad_norms:
+                    max_norm = self.clip_grad_norms[min(self.epoch, len(self.clip_grad_norms) - 1)]
+                    max_norm = float("inf") if max_norm == 0 else max_norm
+                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=max_norm)
+                    logs["info/grad_norm"] = float(grad_norm)
+                    logs["info/clipped_grad_norm"] = min(float(grad_norm), max_norm)
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                self.lr_scheduler.step()
+                if self.accelerator.sync_gradients and self.accelerator.is_main_process:
+                    self.ema_model.step(policy)
+        finally:
+            policy._streaming_training_state = None
+        self._last_streaming_step_count = 1
+        return total_loss, logs
+
     def backward_streaming_batch(
         self, batch: batch_type
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Run one phase stream with a persistent bank and bounded graphs."""
+        """Backward bounded chunks; keep Shadow parameters fixed per stream."""
 
         assert self.model is not None
         assert self.accelerator is not None
@@ -467,6 +581,10 @@ class PolicyTrainer(BaseTrainer):
         assert self.optimizer is not None
         assert self.lr_scheduler is not None
         assert self.ema_model is not None
+
+        policy = self.accelerator.unwrap_model(self.model)
+        if getattr(policy, "requires_full_sequence_backward", False):
+            return self._backward_shadow_sequence(batch, effective_sequence_length, total_valid_anchor_num)
 
         total_loss = torch.zeros((), device=padding.device)
         detached_totals: dict[str, float] = {}

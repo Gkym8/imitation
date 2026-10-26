@@ -319,8 +319,8 @@ class ConditionedSlotGatePolicyTest(unittest.TestCase):
             for cached in (True, False):
                 with self.subTest(mode=mode, cached=cached):
                     cfg = self.fixture.make_config(mode, cached)
-                    self.assertEqual(cfg.workspace.model.gate_selectivity_min_std, 0.1)
                     policy = self.fixture.instantiate_policy(cfg)
+                    self.assertEqual(policy.gate_selectivity_min_std, cfg.workspace.model.gate_selectivity_min_std)
                     retriever = policy.denoising_network.memory_retriever
                     gate = retriever.slot_gate
                     self.assertIsNotNone(gate)
