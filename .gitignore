@@ -1,5 +1,6 @@
 models/
 !policy/Mem-0/source/models
+!policy/imitation-learning-policies/imitation_learning/models/
 data/*
 !data/process_stuck.py
 __pycache__/

@@ -36,64 +36,10 @@ class DummyDinoV2(nn.Module):
         positions = torch.arange(261, dtype=pixel_values.dtype)[None, :, None]
         channels = torch.arange(8, dtype=pixel_values.dtype)[None, None, :]
         content = pixel_values.mean(dim=(1, 2, 3)).reshape(batch_size, 1, 1)
-        return SimpleNamespace(
-            last_hidden_state=content + (positions + channels).sin() + self.anchor * channels
-        )
+        return SimpleNamespace(last_hidden_state=content + (positions + channels).sin())
 
 
 class FuturePredictionModeTest(unittest.TestCase):
-    def test_chunk_action_condition_uses_one_token_for_both_tasks_and_future_modes(self):
-        for task in ("rmbench", "mikasa_remember_color_3"):
-            for mode in ("pooled", "tokens"):
-                for cached in (False, True):
-                    with self.subTest(task=task, mode=mode, cached=cached):
-                        cfg = self.make_config(mode, cached, task=task)
-                        policy = self.instantiate_policy(cfg)
-                        predictor = policy.future_feature_predictor
-                        self.assertEqual(predictor.action_condition_mode, "chunk")
-                        self.assertEqual(predictor.action_chunk_length, policy.execution_chunk_length)
-                        self.assertIsNone(predictor.action_position_embedding)
-                        batch = self.make_batch(cached)
-                        if task.startswith("mikasa"):
-                            image = batch.pop("head_camera_feature" if cached else "head_camera")
-                            for i, name in enumerate(cfg.workspace.train_dataset.image_keys):
-                                batch[name + ("_feature" if cached else "")] = image + i * .1
-                            batch["robot0_8d"] = batch.pop("agent_pos")[..., :8]
-                            batch["action0_8d"] = batch.pop("action")[..., :10, :8]
-                        expected, actual = [], []
-                        def capture_inputs(module, args, kwargs):
-                            count = kwargs["current_observation_tokens"].shape[-2]
-                            memory = kwargs.get("memory_context_tokens")
-                            if memory is not None:
-                                count += memory.shape[-2]
-                            self.assertEqual(kwargs["action_chunk"].shape[-2], 10)
-                            expected.append(count + 1 + module.future_token_num)
-                        handle = predictor.register_forward_pre_hook(capture_inputs, with_kwargs=True)
-                        attention_handle = predictor.transformer.register_forward_pre_hook(
-                            lambda module, args: actual.append(args[0].shape[1])
-                        )
-                        losses = policy.compute_loss(batch)
-                        sum(losses.values()).backward()
-                        self.assertTrue(expected)
-                        self.assertEqual(actual, expected)
-                        self.assertTrue(all(torch.isfinite(value) for value in losses.values()))
-                        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all()
-                                            for p in predictor.action_projector.parameters()))
-                        expected.clear()
-                        policy.eval()
-                        policy.reset()
-                        for anchor in range(2):
-                            obs = {key: value[:, anchor] for key, value in batch.items()
-                                   if key not in {"action", "action0_8d", "traj_idx", "entire_traj_is_padding"}}
-                            obs["episode_idx"] = torch.tensor([0])
-                            with torch.inference_mode():
-                                actions = policy.predict_action(obs)
-                            self.assertTrue(all(torch.isfinite(value).all() for value in actions.values()))
-                        self.assertEqual(expected, [])  # Auxiliary head is not used online.
-                        handle.remove()
-                        attention_handle.remove()
-                        del policy
-
     @classmethod
     def setUpClass(cls):
         if not OmegaConf.has_resolver("eval"):
@@ -102,9 +48,9 @@ class FuturePredictionModeTest(unittest.TestCase):
     def tearDown(self):
         SharedModelManager.reset()
 
-    def make_config(self, mode="pooled", cached=True, merge_size=4, task="rmbench"):
+    def make_config(self, mode="pooled", cached=True, merge_size=4):
         with hydra.initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
-            cfg = compose_hydra_config(task, "diffusion_memory_transformer")
+            cfg = compose_hydra_config("rmbench", "diffusion_memory_transformer")
         cfg.device = "cpu"
         cfg.visual_encoder.spatial_merge_size = merge_size
         cfg.workspace.train_dataset.use_cached_image_features = cached
@@ -115,7 +61,6 @@ class FuturePredictionModeTest(unittest.TestCase):
             "history_img_feature_encoder", "future_img_feature_encoder",
         ):
             model[name].feature_dim = 8
-        model.denoising_network_partial.query_tokens = None
         model.denoising_network_partial.hidden_dim = 32
         model.denoising_network_partial.head_num = 4
         model.denoising_network_partial.layer_num = 1
@@ -136,137 +81,13 @@ class FuturePredictionModeTest(unittest.TestCase):
         gc.collect()
         SharedModelManager.reset()
         manager = SharedModelManager(cache_size=10)
-        manager.register_vit_model(
-            MODEL_NAME, frozen=bool(cfg.visual_encoder.frozen), model=DummyDinoV2()
-        )
-        target_key = cfg.workspace.model.future_img_feature_encoder.image_encoder_partial.get(
-            "shared_model_key", MODEL_NAME
-        )
-        if target_key != MODEL_NAME:
+        manager.register_vit_model(MODEL_NAME, frozen=True, model=DummyDinoV2())
+        if not cfg.workspace.train_dataset.use_cached_image_features:
             manager.register_vit_model(
                 MODEL_NAME, frozen=True, model=DummyDinoV2(),
-                registry_name=target_key,
+                registry_name="future_target_dinov2",
             )
         return hydra.utils.instantiate(cfg.workspace.model)
-
-    def test_frozen_backbone_is_shared_for_both_datasets_and_camera_layouts(self):
-        layouts = (
-            ("rmbench", ["head_camera"]),
-            ("rmbench", ["head_camera", "left_camera", "right_camera"]),
-            ("mikasa_remember_color_3", ["third_person_camera"]),
-            ("mikasa_remember_color_3", ["third_person_camera", "robot0_wrist_camera"]),
-        )
-        for task, cameras in layouts:
-            for cached in (True, False):
-                with self.subTest(task=task, cameras=cameras, cached=cached):
-                    cfg = self.make_config(cached=cached, task=task)
-                    cfg.workspace.train_dataset.image_keys = cameras
-                    policy = self.instantiate_policy(cfg)
-                    manager = policy.shared_model_manager
-                    self.assertEqual(list(manager.vit_models), [MODEL_NAME])
-                    backbone = manager.vit_models[MODEL_NAME]
-                    self.assertTrue(all(not p.requires_grad for p in backbone.parameters()))
-                    for encoder in (
-                        policy.global_cond_encoder,
-                        policy.history_img_feature_encoder,
-                        policy.future_img_feature_encoder,
-                    ):
-                        for camera in cameras:
-                            image_encoder = encoder.encoder_dict[camera]
-                            self.assertEqual(image_encoder.shared_model_key, MODEL_NAME)
-                            self.assertIs(
-                                image_encoder.manager[0].vit_models[image_encoder.shared_model_key],
-                                backbone,
-                            )
-                    self.assertFalse(any(
-                        "future_target_dinov2" in key for key in policy.state_dict()
-                    ))
-                    del policy
-
-    def test_trainable_backbone_retains_a_separate_frozen_target(self):
-        cfg = self.make_config(cached=False)
-        cfg.visual_encoder.frozen = False
-        policy = self.instantiate_policy(cfg)
-        manager = policy.shared_model_manager
-        self.assertEqual(set(manager.vit_models), {MODEL_NAME, "future_target_dinov2"})
-        online = manager.vit_models[MODEL_NAME]
-        target = manager.vit_models["future_target_dinov2"]
-        self.assertIsNot(online, target)
-        self.assertTrue(all(p.requires_grad for p in online.parameters()))
-        self.assertTrue(all(not p.requires_grad for p in target.parameters()))
-        losses = policy.compute_loss(self.make_batch(cached=False))
-        (losses["action"] + 0.05 * losses["future_prediction"]).backward()
-        self.assertIsNotNone(online.anchor.grad)
-        self.assertTrue(torch.isfinite(online.anchor.grad))
-        self.assertGreater(float(online.anchor.grad.abs()), 0)
-        self.assertIsNone(target.anchor.grad)
-
-    def test_old_two_backbone_config_loads_strictly_and_shared_outputs_match(self):
-        cfg = self.make_config(cached=False)
-        legacy_cfg = OmegaConf.create(OmegaConf.to_yaml(cfg, resolve=False))
-        legacy_cfg.workspace.model.future_img_feature_encoder.image_encoder_partial.shared_model_key = (
-            "${cond:${workspace.train_dataset.use_cached_image_features},"
-            "${visual_encoder.model_name},future_target_dinov2}"
-        )
-        saved_config = OmegaConf.to_yaml(legacy_cfg, resolve=False)
-        batch = self.make_batch(cached=False)
-
-        def collect(policy):
-            policy.train()
-            policy.reset_rng()
-            torch.manual_seed(11)
-            calls = []
-            handles = [
-                backbone.register_forward_hook(
-                    lambda module, args, output: calls.append(module)
-                )
-                for backbone in policy.shared_model_manager.vit_models.values()
-            ]
-            losses = {
-                name: value.detach().clone()
-                for name, value in policy.compute_loss(batch).items()
-            }
-            for handle in handles:
-                handle.remove()
-            policy.eval()
-            policy.reset()
-            policy.reset_rng()
-            actions = []
-            for anchor in range(2):
-                observation = {
-                    "head_camera": batch["head_camera"][:, anchor],
-                    "agent_pos": batch["agent_pos"][:, anchor],
-                    "episode_idx": torch.tensor([0]),
-                }
-                with torch.inference_mode():
-                    actions.append(policy.predict_action(observation)["action"].clone())
-            return losses, actions, len(calls)
-
-        legacy_policy = self.instantiate_policy(legacy_cfg)
-        saved_state = {key: value.detach().clone() for key, value in legacy_policy.state_dict().items()}
-        expected_losses, expected_actions, legacy_calls = collect(legacy_policy)
-        self.assertEqual(legacy_calls, 2)
-        del legacy_policy
-
-        restored = self.instantiate_policy(OmegaConf.create(saved_config))
-        restored.load_state_dict(saved_state, strict=True)
-        self.assertEqual(len(restored.shared_model_manager.vit_models), 2)
-        _, restored_actions, _ = collect(restored)
-        for actual, expected in zip(restored_actions, expected_actions):
-            torch.testing.assert_close(actual, expected)
-        del restored
-
-        shared_policy = self.instantiate_policy(cfg)
-        shared_policy.load_state_dict({
-            key: value for key, value in saved_state.items()
-            if not key.startswith("shared_model_manager.vit_models.future_target_dinov2.")
-        }, strict=True)
-        actual_losses, actual_actions, shared_calls = collect(shared_policy)
-        self.assertEqual(shared_calls, 1)
-        for name, expected in expected_losses.items():
-            torch.testing.assert_close(actual_losses[name], expected)
-        for actual, expected in zip(actual_actions, expected_actions):
-            torch.testing.assert_close(actual, expected)
 
     def make_batch(self, cached=True, anchors=3):
         torch.manual_seed(2)
@@ -288,7 +109,7 @@ class FuturePredictionModeTest(unittest.TestCase):
                 with self.subTest(mode=mode, cached=cached):
                     cfg = self.make_config(mode, cached)
                     expected_tokens = 1 if mode == "pooled" else 16
-                    expected_context = 16
+                    expected_context = 1 if mode == "pooled" else 16
                     policy = self.instantiate_policy(cfg)
                     self.assertEqual(policy.future_feature_predictor.future_token_num, expected_tokens)
                     self.assertEqual(policy.future_img_feature_encoder.token_num, expected_tokens)
@@ -320,19 +141,13 @@ class FuturePredictionModeTest(unittest.TestCase):
                     prediction_handle.remove()
                     self.assertTrue(contexts)
                     self.assertEqual(set(contexts), {expected_context})
-                    # Only the middle anchor has both a past observation
-                    # and a valid future target; the first is action-only.
-                    eligible = target["future_feature_mask"].any(dim=-1)
-                    eligible[:, 0] = False
-                    prediction = predictions[-1]
-                    self.assertEqual(prediction.shape[0], int(eligible.sum()))
-                    expected_target = target["future_features"][eligible]
-                    mask = target["future_feature_mask"][eligible]
+                    prediction = predictions[-1].reshape_as(target["future_features"])
+                    mask = target["future_feature_mask"]
                     expected_prediction_loss = (
-                        (prediction[mask].float() - expected_target[mask].float()).square().mean()
+                        (prediction[mask].float() - target["future_features"][mask].float()).square().mean()
                         if mode == "tokens"
                         else (1.0 - torch.nn.functional.cosine_similarity(
-                            prediction[mask], expected_target[mask], dim=-1,
+                            prediction[mask], target["future_features"][mask], dim=-1,
                         )).mean()
                     )
                     torch.testing.assert_close(losses["future_prediction"].detach(), expected_prediction_loss)
@@ -370,7 +185,7 @@ class FuturePredictionModeTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 policy = self.instantiate_policy(self.make_config(mode))
                 batch = self.make_batch(anchors=4)
-                expected_context = 16
+                expected_context = 1 if mode == "pooled" else 16
                 contexts = []
                 handle = policy.future_feature_predictor.register_forward_pre_hook(
                     lambda module, args, kwargs: contexts.append(
@@ -403,11 +218,12 @@ class FuturePredictionModeTest(unittest.TestCase):
         pooled_policy = self.instantiate_policy(cfg)
         expected_state = pooled_policy.state_dict()
         del pooled_policy
+        cfg.workspace.model.future_prediction_context_pooling = "mean"
         cfg.workspace.model.future_img_feature_encoder.image_encoder_partial.feature_aggregation = "map"
         del cfg.workspace.model.future_prediction_mode
         legacy_policy = self.instantiate_policy(cfg)
         legacy_policy.load_state_dict(expected_state, strict=True)
-        self.assertFalse(hasattr(legacy_policy, "future_prediction_context_pooling"))
+        self.assertEqual(legacy_policy.future_prediction_context_pooling, "mean")
         self.assertEqual(legacy_policy.future_feature_predictor.future_token_num, 1)
 
     def test_mode_rejects_unknown_value_and_mismatched_target(self):

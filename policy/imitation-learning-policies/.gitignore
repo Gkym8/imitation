@@ -14,3 +14,11 @@ tests/test_data
 *.svg
 mikasa_data/*
 eval_output/*
+
+# Keep generated model weights out of the source tree tracked by Git.
+imitation_learning/models/**/*.ckpt
+imitation_learning/models/**/*.pt
+imitation_learning/models/**/*.pth
+imitation_learning/models/**/*.safetensors
+imitation_learning/models/**/*.bin
+imitation_learning/models/**/*.onnx

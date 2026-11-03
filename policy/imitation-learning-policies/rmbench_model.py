@@ -88,10 +88,9 @@ class RMBenchMemoryPolicy:
                 record_entries.append(self._memory_attention_record_key)
             self.policy.denoising_network.record_data_entries = record_entries
         self.image_keys = list(self.cfg.workspace.train_dataset.image_keys)
-        input_image_keys = self.image_keys
         selected_output_meta = _select_camera_meta(
             self.cfg.workspace.train_dataset.output_data_meta,
-            input_image_keys,
+            self.image_keys,
         )
         data_meta = construct_data_meta_dict(selected_output_meta)
         self.normalizer = FixedNormalizer(data_meta)
@@ -159,9 +158,7 @@ class RMBenchMemoryPolicy:
             f"execution_chunk_length={self.execution_chunk_length}, "
             f"keep_first={self.policy.keep_first_memory}, "
             f"keep_recent={self.policy.keep_recent_memory}, "
-            f"shadow_window={self.policy.denoising_network.shadow_window}, "
-            f"shadow_horizon={self.policy.denoising_network.effective_shadow_horizon}, "
-            f"fusion_gate={self.policy.denoising_network.fusion_gate}, "
+            f"shadow_horizon={self.policy.denoising_network.shadow_horizon}, "
             f"shadow_gate_scale={self.policy.denoising_network.memory_retriever.shadow_gate_scale}, "
             "config_source=checkpoint, "
             f"image_keys={self.image_keys}, "

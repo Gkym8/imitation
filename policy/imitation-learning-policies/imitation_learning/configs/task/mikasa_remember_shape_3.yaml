@@ -5,4 +5,3 @@ defaults:
 workspace:
   train_dataset:
     name: RememberShape3-v0
-    sample_range: [0, 2]

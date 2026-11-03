@@ -107,54 +107,16 @@ workspace:
     future_prediction_mode: pooled  # pooled (default) or tokens
 ```
 
-Both modes pass the complete fused decision memory `h` token sequence to the
-future predictor, together with the configured action condition. `pooled`
+`pooled` mean-pools the retrieved decision memory `h` to one vector and
 predicts the next anchor's CLS token (DINOv2) or MAP token (SigLIP), one per
-camera; `tokens` predicts spatial patch features. The input `h` is never pooled.
+camera. `tokens` passes the complete `h` token sequence to the predictor and
+predicts the next anchor's spatial patch features, without pooling `h`.
 The target encoder and predictor output token count switch together. `tokens`
 uses MSE on raw predicted/target features, without L2 normalization, averaged
 over valid target tokens and feature dimensions. `pooled` and legacy configs
 without a mode retain cosine-distance loss. Both modes use the same action
-conditioning and memory update path. Future prediction runs only when the
-current decision already has history in its memory bank and a valid next-anchor
-target. Each stream's first valid observation trains only action prediction,
-including streams starting at a nonzero frame. Chunk boundaries retain this
-eligibility whenever the carried bank has history. Invalid next-anchor
-transitions and padding are excluded; no eligible target skips the predictor
-and returns a differentiable zero. Action supervision still uses every valid
-anchor, and the first observation is stored for subsequent memory queries.
-
-Set `workspace.model.denoising_network_partial.query_tokens: 8` (the default)
-to project current visual/state features directly to eight history-query tokens.
-For current features `[B,N,D]`, state conditioning first preserves `[B,N,D]`,
-then a learned `Linear(N*D, Q*D)` and reshape produce `C_Q: [B,Q,D]`.
-There are no independent learned query tokens. `C_Q` queries the retained bank;
-the history-enhanced result `R_Q` and `C_Q` have the same length and fuse as
-`h_Q = g*C_Q + (1-g)*R_Q`. Every DiT layer first reads the selected current
-images and then reads the full `h_Q`; future prediction receives that same full
-sequence. Empty/masked history returns `C_Q`. Setting `query_tokens: null`
-preserves the original current-image token count and omits the new projector.
-
-All current/history/future image encoders and dataset/inference inputs follow
-`image_keys`. History storage and Slot Gate scoring keep the original current
-visual/state and per-slot representations; changing `Q` does not resize stored
-slots. Eviction, Shadow decay and time encodings retain their existing rules.
-Token-wise history attention supports different query and slot token counts.
-The new projection adds trainable weights, so checkpoints from an earlier
-architecture need training/migration before using the new projected layout;
-weights are not silently dropped or initialized by the inference adapter.
-
-New training compresses the future predictor's action condition into one token
-with `workspace.model.future_feature_predictor.action_condition_mode: chunk`.
-Following DynaGuide, a 1x1 Conv1d projects each action, then the ordered chunk is
-flattened and linearly projected to the predictor width. At width 512 and chunk
-length 10: `[B,10,A] -> [B,51,10] -> [B,1,510] -> [B,1,512]`.
-The chunk length follows `execution_chunk_length`, so the condition still uses
-only actions before the next visual target. Masked/padded steps contribute zero;
-shorter inputs are padded in their original temporal positions. Feature targets
-and cosine/MSE losses retain their existing definitions. `tokens` selects the
-original per-action projection and position embeddings. Checkpoints without the
-new settings retain that original parameter layout and inference behavior.
+conditioning and memory update path. Invalid next-anchor transitions and
+padding are excluded; no valid target returns a differentiable zero.
 
 Patch targets follow `visual_encoder.spatial_merge_size`: with DINOv2 at
 224 pixels, the current value `4` gives 16 target tokens per camera; `1`
@@ -184,113 +146,23 @@ each new observation recomputes scores against the retained slots.
 For `perception_patches`, the final `TokenGateFusion` blends current visual/state
 tokens `C` with the history-aware output `R` of the last retrieval block:
 `g = sigmoid(Linear(concat(C, R)))`, `h = g*C + (1-g)*R`.
-Current-image token count and decision-memory token count are independent:
-`query_tokens` sets the latter throughout retrieval, fusion and both consumers.
-
-```text
-g = sigmoid(Linear(concat(C, R)))
-h = g * C + (1 - g) * R
-```
-
-This is the same feature-wise gate formula and initialization used by
-MemoryVLA. Its retrieval blocks also retain query residuals before fusion.
-Our attention uses multiple heads, RMSNorm/QK normalization, per-slot gates,
-and queries projected from the current observation, so its implementation is not
-identical to MemoryVLA's single-head, LayerNorm blocks. Empty history returns
-the projected current representation rather than zeros. DiT and future
-prediction receive the same full `h` sequence. Future prediction additionally
-receives the action condition; its target token count follows `image_keys` and
-its target encoder, independently of `query_tokens`.
-
-Set `workspace.model.denoising_network_partial.fusion_gate: false` to use
-`h=R` instead: `R` already contains the query plus history retrieval residuals.
-That query is the current visual/state representation projected to
-`query_tokens` tokens (or left at the image-token count when null).
-The default is `true`, including checkpoints without the new setting.
 The gate has one value per token and feature dimension: with width 512,
 the linear layer maps 1024 features to 512. Its weights and bias use the
 original normal initialization with standard deviation 1e-3. Query residuals
 remain inside the retrieval blocks; with no valid history, `R=C`, so the
 blend reduces to the current tokens. This fusion gate is distinct from the
-per-slot, per-head gate inside history attention. When enabled, both receive
-gradients from the action and future-prediction losses.
+per-slot, per-head gate inside history attention, and both receive gradients
+from the action and future-prediction losses.
 
 Fusion parameters are saved and loaded as `perception_gate.proj.weight` and
 `perception_gate.proj.bias` under the memory retriever. Checkpoint loading is
 strict: checkpoints trained with the fusion layer removed do not contain these
 parameters and cannot be directly evaluated with the restored architecture.
-Disabling the new flag keeps these parameter names for checkpoint compatibility
-but freezes and bypasses the fusion layer. The flag is saved in checkpoint config.
+Train a matching model to evaluate the restored fusion gate.
 
-RMBench `train.sh` first looks for `imitation_learning/configs/task/<TASK_NAME>.yaml`
-using the task name from its first argument, and falls back to `task/rmbench.yaml`
-when that file is absent. Selection adds no startup message. A task-specific
-file can inherit the shared RMBench defaults and override only a few settings:
-
-```yaml
-defaults:
-  - rmbench
-  - _self_
-
-workspace:
-  model:
-    denoising_network_partial:
-      max_history_len: 4
-      shadow_window: false
-```
-
-Streaming training can select the first frame of each stream through
-`workspace.train_dataset.sample_range`, an inclusive `[start, end]` range of
-episode-frame indices. `[30, 40]` selects 11 streams starting at frames 30..40;
-each bank starts empty at its selected frame, without reading frames 0..29.
-`[0, 5]` selects six starts, `[0, 0]` selects only frame 0, and `null` (the
-default) keeps all original phases, 0..9 with interval 10 and valid start 0.
-Explicit ranges can extend beyond the sampling interval. Starts are intersected
-with the valid episode range; episodes with no overlap contribute no streams,
-and an empty dataset raises an error. Each selected stream still runs to the
-end at the unchanged interval; padding, bank updates, and
-future-target alignment keep their original rules. Repetition duplicates the
-selected streams, and shuffling changes only their training order.
-
-For example, add this under `workspace` in a task YAML:
-
-```yaml
-workspace:
-  train_dataset:
-    sample_range: [30, 40]
-```
-
-This differs from `episode_starting_idx_max`, which also limits the end of a
-stream in the existing implementation. `sample_range` only controls stream starts
-and is supported by streaming sampling. It does not affect evaluation or model
-parameter shapes; older configurations without either setting keep all phases.
-For saved training-config compatibility, the retired `sample_nums: N` maps to
-`sample_range: [0, N]`; specifying both non-null settings is rejected.
-
-Training and inference keep slots in chronological order. Training with
-`shadow_window: true` (the default) uses Active and Shadow slots; inference
-always retains only Active slots.
-
-`workspace.model.denoising_network_partial.history_time_encoding` selects how
-history keys receive time positions. `relative` (default) keeps the existing
-trainable, sinusoidally initialized table, its Bank-rank ordering, and left-padding
-alignment unchanged. `absolute` computes sinusoidal encodings directly
-from each retained slot's episode frame index. For retained frames `[0, 30, 80]`,
-it encodes `[0, 30, 80]` regardless of eviction or the slot's position in the Bank.
-It uses frame indices directly, without dividing by the anchor interval or
-subtracting the stream's starting frame. Training uses `traj_idx`; online inference
-starts at frame 0 and advances by `execution_chunk_length` per valid observation.
-Active and Shadow slots use the same frame convention across chunk boundaries.
-Only history keys receive the encoding; stored slot values and slot-gate inputs
-remain unchanged. Absolute encodings are generated on demand, so frame numbers
-can exceed Bank capacity. The unused rank table stays in absolute-mode checkpoint
-state for shape compatibility but is frozen. Older configs without the setting
-keep `relative`; the selected mode is saved with the checkpoint and restored
-during inference. Direct non-streaming network calls in absolute mode must supply
-`history_frame_indices` for their history slots/source anchors.
-With `shadow_window: false`, both training and inference hard-delete evictions
-and retain only Active capacity. After reading history, a full Active bank selects the
-eligible Active slot with the lowest sum of its largest k raw head Gates, then inserts
+Training and inference share one chronological memory bank with `active` and
+`shadow` slot states. After reading history, a full Active bank demotes the
+eligible Active slot with the lowest mean raw gate over heads, then inserts
 the current observation as Active. Ties demote the oldest eligible slot.
 The original first slot and the newest two Active slots after insertion are
 protected by default. `keep_recent` includes the incoming slot, so before
@@ -305,12 +177,9 @@ workspace:
   model:
     denoising_network_partial:
       max_history_len: 8       # Active capacity
-      shadow_window: true     # Enable Shadow during training; inference hard-deletes
-      shadow_horizon: 3       # Number of future valid Shadow reads
-      shadow_gate_scale: 0.5   # Per-read decay: 0.5, 0.25, 0.125, ...
-      fusion_gate: true       # False uses current + retrieved history residuals
+      shadow_horizon: 8        # Future valid anchors; 0 deletes immediately
+      shadow_gate_scale: 0.01  # Multiply each Shadow's raw per-head gate
     memory_eviction:
-      top_k: 3                # Sum the largest 3 of 8 head Gates for eviction
       keep_first: true
       keep_recent: 2
     gate_selectivity_min_std: 0.1
@@ -318,67 +187,31 @@ workspace:
     gate_selectivity_loss_weight: 0.01
 ```
 
-At demotion, a Shadow slot saves that read's raw per-head log-gate with its
-computation graph. It does not run the Gate MLP against subsequent observations.
-Active slots continue to receive freshly observation-conditioned gates. All slots
-participate in the same Attention normalization. At the k-th Shadow read,
-starting with k=1, its effective gate is
-`saved_gate * shadow_gate_scale**k`, or in log space
-`saved_log_gate + k * log(shadow_gate_scale)`. With horizon 3 and scale 0.5,
-the three reads use 0.5, 0.25, and 0.125 times the saved gate. The decay rate
-must be finite and in (0, 1]. No factor of 10 is hard-coded.
-
-A slot demoted after anchor t is read as Shadow at t+1 through
-t+shadow_horizon, then physically deleted after its final read. It never
-re-enters the eviction candidates or consumes an Active place. Training feature
-storage and position embeddings are bounded by max_history_len + shadow_horizon.
-Counters advance only on valid supervised anchors, excluding padding and
-lookahead. Saved gates, state and expiry survive chunk boundaries.
-
-Online inference always immediately deletes the selected slot and retains only
-Active capacity, including when shadow_window is true in the checkpoint.
-shadow_window=false or shadow_horizon=0 also disables Shadow during training.
-The configured horizon still determines the checkpoint position-table shape;
-Active-only reads use its final max_history_len positions. Toggling the flag
-or switching between training and inference does not change parameter shapes.
+Shadow slots share the same MLP and Attention normalization with Active slots.
+Their effective log-gates are `logsigmoid(MLP) + log(shadow_gate_scale)`;
+raw gates are recomputed at every read. A slot demoted after anchor `t` is
+read as Shadow at `t+1` through `t+shadow_horizon`, then physically deleted
+after the final read. It never re-enters the eviction candidates or consumes
+an Active place. Total feature storage and history position embeddings are
+bounded by `max_history_len + shadow_horizon` (16 slots by default).
+Counters advance only on valid supervised/online anchors, excluding padding
+and lookahead. State and expiry survive chunk boundaries along with features.
 
 The selectivity loss computes population standard deviation over valid Active
 slots' raw gates for each head, then averages `relu(0.1 - std)**2` over heads.
 Shadow gates are excluded. Only full Active banks
 receive this penalty; unfilled banks contribute zero to the average over valid
 training anchors. The default total loss is
-`action + 0.01 * future_prediction + 0.01 * gate_selectivity` (task overrides apply).
-Both task losses and this regularizer train the gate. With Shadow enabled,
-each chunk immediately backpropagates its valid-anchor-weighted loss, releasing
-its action and future-prediction graphs. Gradients accumulate until the complete
-stream ends; clipping, optimizer, scheduler and EMA still run once per stream
-batch (subject to Accelerate's outer gradient accumulation).
-streaming_chunk_accumulate applies only when Shadow is disabled, and scheduler
-step counts continue to follow the same one-update-per-stream rule.
-
-Chunk boundaries detach stored visual features, and the next chunk reprojects
-raw cached features. Only live Shadow Gates retain their original generation
-branches, including upstream operations, so losses throughout the full decay
-window train the original demotion Gate. New demotion Gates reference only fresh
-Active outputs, avoiding graph chains through older Shadows. Expired branches
-are released when no remaining Shadow or current chunk references them. The
-live activation window is controlled by chunk length and Shadow lifetime, rather
-than total stream length. Do not update parameters between chunks.
-
-All Shadow chunk forwards/backwards run with DDP no_sync. At the stream boundary,
-16 MiB gradient buckets (or one larger parameter) synchronize once, including
-parameters unused on a shorter rank. Gradient averaging occurs before clipping,
-and AMP-scaled gradients follow the normal scaler/optimizer path.
-Input loading is unchanged: the full padded sample can still reside on GPU, so
-input memory continues to grow with sample length despite bounded live graphs.
-When Shadow is disabled, the original detached-state chunk updates remain.
+`action + 0.05 * future_prediction + 0.01 * gate_selectivity`.
+Both task losses and this regularizer train the gate. Chunk boundaries detach
+stored features; the next chunk reprojects them using current parameters.
 Future lookahead anchors provide targets without entering the memory bank.
 Online inference only reads gates and predicts actions, without running the
 future predictor or future target encoder. The obsolete prediction-error queue,
 manually updated slot weights, and scalar attention-bias settings are removed.
 
 For inspection, `policy.denoising_network.memory_retriever.latest_slot_gates`
-contains detached raw `[batch, storage_capacity, head]` scores
+contains detached raw `[batch, Active_capacity + shadow_horizon, head]` scores
 for the latest read, with zero for padded slots. `latest_effective_slot_gates`
 also includes the Shadow scaling. Adding `history_slot_gates` and/or
 `history_effective_slot_gates` to `record_data_entries` records these values.
@@ -386,42 +219,17 @@ RMBench evaluation writes one row per historical slot read to
 `memory_slot_gates.csv`, with only `episode_index`, `query_anchor_index`,
 `slot_id`, `slot_state`, `gate_mean`, `gate_head_0` through `gate_head_{H-1}`,
 and `attention_mean`. Gates are raw MLP sigmoid outputs; `gate_mean` averages
-the heads for inspection. The eviction score is the sum of the largest
-`memory_eviction.top_k` raw Gates (default 3), rather than `gate_mean`.
-The same score is used in training and inference; protection rules still apply.
-`top_k` must be an integer from 1 to the number of Gate heads.
-Attention is the actual post-softmax
+the heads, matching the eviction score. Attention is the actual post-softmax
 slot probability (summed over its patches), averaged over heads and current
-query tokens in the final retrieval layer. Online CSV rows contain only Active slots; padding is excluded. An empty bank produces one row with blank slot values.
+query tokens in the final retrieval layer. Active and Shadow slots both appear;
+padding does not. An empty bank produces one row with blank slot values.
 Episodes append to the same file without repeating its header.
 
 Checkpoints save the Shadow configuration and matching positional embedding
-shape. `shadow_window` is saved in checkpoint config and controls training
-Shadow retention; inference always deletes immediately. Checkpoints without this
-flag default to enabled for training; a zero horizon still means immediate eviction. Toggling the flag does not change parameter shapes.
-Configs without `shadow_horizon` retain immediate eviction and their
+shape. Configs without `shadow_horizon` retain immediate eviction and their
 original shape. Enabling a nonzero horizon changes that shape and requires
 training a matching model. Old checkpoint configs containing removed memory
 settings must be updated before loading this policy version.
-
-Warmup defaults to a fraction of the complete training schedule:
-
-```yaml
-workspace:
-  trainer:
-    lr_warmup_ratio: 0.05  # First 5% of training; 0 disables warmup.
-    lr_warmup_steps: null # A non-null integer overrides the ratio.
-```
-
-The trainer accounts for the per-rank DataLoader length, Shadow sequence or
-chunk update groups, gradient accumulation, and Accelerate's internal scheduler
-ticks. It prints the total and warmup in optimizer updates. For 301 epochs,
-16 updates per epoch and a 5% ratio, warmup lasts about 241 of 4816 updates.
-Changing the dataset, batch size, GPU count or epoch count recalculates this
-budget at startup. Ratios must be finite and in [0, 1]. Older configurations
-with a fixed lr_warmup_steps retain their fixed schedule. Existing optimizer
-and scheduler checkpoints still resume their saved progress. Editing the YAML
-does not change the schedule of a process that is already running.
 
 Please go through all comments in `shell_scripts/train_sim.sh` for detailed instructions.
 
@@ -462,113 +270,3 @@ This repository is developed during the following [research project](https://git
   url           = {https://arxiv.org/abs/2604.18933},
 }
 ```
-
-
-### Mikasa streaming-memory training
-
-The same policy code supports RMBench and Mikasa. RMBench keeps using `train.sh`.
-For Mikasa, activate the policy environment and run from this directory:
-
-```bash
-bash train_mikasa.sh mikasa_remember_color_3 0 my_run
-# Multiple GPUs:
-bash train_mikasa.sh mikasa_remember_color_3 0,1 my_run
-# Explicit dataset root (contains RememberColor3-v0/episode_data.zarr):
-bash train_mikasa.sh mikasa_remember_color_3 0 my_run --data-root /path/to/mikasa-zarr
-```
-
-Data preparation can also be run explicitly before training, in this order.
-Use the already converted `--max-episodes 250 --abs-joint-pos` Mikasa data:
-
-```bash
-python fit_mikasa_normalizer.py \
-  /path/to/mikasa-zarr-250/ShellGameTouch-v0 \
-  mikasa_shell_game_touch
-
-python scripts/extract_mikasa_dinov2_features.py \
-  /path/to/mikasa-zarr-250/ShellGameTouch-v0/episode_data.zarr \
-  --batch-size 128 --feature-chunk-length 10 --device cuda:0
-
-bash train_mikasa.sh mikasa_shell_game_touch 0 my_run
-```
-
-The normalizer command accepts either the task directory or `episode_data.zarr`;
-it does not require an image-feature cache. It reuses existing action statistics
-and backs up an old file before adding missing state statistics. The feature
-command always selects `third_person_camera` and stores CLS+patch features.
-Training reuses the completed normalizer and feature cache.
-
-`MIKASA_DATA_DIR` can also supply the data root. When neither is set, the launcher
-looks in this policy's `data/mikasa`, RMBench's `data/mikasa`, then the sibling
-`gated-memory-policy/data/mikasa-zarr-250` directory. It reads existing converted
-Mikasa Zarr stores; NPZ conversion is still handled by the Mikasa project.
-`POLICY_PYTHON` can select the policy Python executable.
-
-The first run prepares missing frozen DINOv2 CLS+patch features and normalizer
-fields, then starts `scripts/train_policy.py`. Existing action statistics are
-reused exactly. Old action-only normalizers are backed up before adding the
-missing `robot0_8d` state statistics; complete normalizers are left untouched.
-The active file is `<task>_normalizer.json`; `.backup.<timestamp>` files preserve
-the previous contents and are not loaded for training. Legacy image augmentation
-metadata may remain in the JSON, but the loader reads only normalization values
-from it. Transforms use the current YAML, which specifies only deterministic
-Resize; neither cached-feature training nor raw-image training uses the old
-random crop or color jitter settings.
-Preparation is done once before DDP starts, and complete compatible caches are
-reused. Only the fixed
-third-person camera (`third_person_camera`) is selected; the wrist view is not
-loaded, encoded, or cached. Input images are 128x128, resized to 224x224 by the same
-deterministic transform in offline extraction and online inference. The default
-spatial merge produces four patch tokens per slot, each 768-dimensional before
-projection. `robot0_8d` provides the state and `action0_8d` the eight action channels.
-Data converted with `--abs-joint-pos` already contains absolute joint targets.
-The loader only normalizes those values; it does not convert them again. Use
-`abs_joint_pos: true` in the Mikasa evaluator (the current default).
-
-`configs/task/mikasa.yaml` (under `imitation_learning/`) inherits the current
-`rmbench.yaml` method. Mikasa deliberately keeps a 10-step prediction horizon,
-51 epochs, checkpointing every 5 epochs and validation every 2 epochs; camera,
-state/action field names and their eight-channel shapes follow the Mikasa data.
-Other method settings, including history capacity, gates, shadow memory, visual
-encoder and loss weights, use the same shared defaults as RMBench. The old
-45-slot overrides in ShellGame and Rotate task YAMLs have been removed.
-`mikasa_remember_color_3.yaml` inherits the common configuration and other Mikasa
-task YAMLs inherit that task; explicit task overrides still apply. For example, put the following override in the desired task YAML:
-
-```yaml
-workspace:
-  train_dataset:
-    sample_range: [0, 0] # Only streams beginning at original frame 0.
-  model:
-    future_prediction_mode: pooled # Or tokens; same losses as RMBench.
-    denoising_network_partial:
-      max_history_len: 4
-      shadow_window: false
-      fusion_gate: true
-```
-
-`sample_range: null` keeps all original phases. Streaming continues to the episode
-end and carries the gate memory bank between chunks. Feature graphs are
-truncated at chunk boundaries; each chunk backpropagates immediately while live
-Shadow Gate generation graphs remain connected for their full decay windows.
-Parameters update only after the complete stream when Shadow is enabled. The default sampling interval and `execution_chunk_length` are
-both 10. If changing the execution interval, make the Mikasa evaluation server
-execute the same number of actions per policy call. Pooled mode predicts one
-future CLS token for the selected camera, while DiT retains all configured decision-memory
-tokens. Future prediction is a training objective and is not executed online.
-
-Runtime overrides are also available, for example
-`--override 'workspace.train_dataset.sample_range=[0,0]'` or
-`--override workspace.model.denoising_network_partial.shadow_window=false`.
-`--dry-run` prints the launch command without changing data or starting training;
-`--skip-prepare` requires a compatible cache and normalizer to exist already.
-Raw-image training is available with `use_cached_image_features: false`.
-When `visual_encoder.frozen: true`, current images, historical images and future
-targets share one DINOv2 backbone in both cached-feature and raw-image training.
-Only `visual_encoder.frozen: false` creates a separate frozen
-`future_target_dinov2` for future supervision. Frozen raw-image runs therefore
-avoid saving and loading an extra approximately 330 MiB of backbone weights.
-Existing checkpoints retain their saved encoder registration settings and
-continue to load strictly, including older checkpoints with two frozen backbones;
-their files are not converted automatically.
-The older `shell_scripts/train_mikasa.sh` path forwards to the same entry point.
