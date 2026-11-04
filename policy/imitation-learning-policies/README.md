@@ -119,11 +119,39 @@ conditioning and memory update path. Invalid next-anchor transitions and
 padding are excluded; no valid target returns a differentiable zero.
 
 Patch targets follow `visual_encoder.spatial_merge_size`: with DINOv2 at
-224 pixels, the current value `4` gives 16 target tokens per camera; `1`
+224 pixels, `8` gives 4 target tokens per camera; `1`
 keeps all 256 spatial patches. Cached training uses the existing CLS+patch
 cache for either mode; raw-image training and online inference use the same
 encoder settings. The mode is saved in checkpoints. Existing checkpoints
 without this setting retain their original pooling and target shapes.
+
+Select learnable current/history patch merging in the same task YAML:
+
+```yaml
+visual_encoder:
+  spatial_merge_size: 8
+  patch_merge: true  # false (default): retain spatial averaging
+```
+
+With `patch_merge: true`, frozen DINO features keep all 256 patches until
+the shared current/history projector. It normalizes each patch, concatenates
+each local `8 x 8` group, and applies `49152 -> 512 -> GELU -> 512`, producing
+4 tokens per camera at the default width. Cameras are grouped independently.
+Cached training reads the existing full CLS+patch caches. Training banks keep
+detached, unmerged DINO patches and rebuild their merged latents at each chunk
+boundary using the latest parameters. Online inference stores only merged
+latents. The frozen future CLS/patch targets retain their existing behavior.
+The new merger requires training a new model; disabling the flag, or loading
+an old checkpoint without it, retains the original weights and computation.
+
+Current images, history images, and future supervision share one frozen DINO
+backbone in both cached and online modes. Frozen DINO parameters and forward
+computation use FP32, with autocast disabled only for that backbone; it stays
+in eval mode during policy training. The patch merger, DiT, and future
+predictor retain the trainer's mixed precision and their gradients. Existing
+FP32 feature caches remain usable. Legacy checkpoints containing a second
+`future_target_dinov2` backbone are folded into the shared model when their
+weights match; differing legacy target weights are not silently discarded.
 
 RMBench also enables an observation-conditioned, multi-head slot gate in
 `workspace.model.denoising_network_partial`:

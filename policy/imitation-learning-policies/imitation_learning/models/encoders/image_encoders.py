@@ -484,6 +484,9 @@ class SharedModelManager(nn.Module):
                 nn.ModuleDict()
             )  # ViT backbone, usually shared
             self.vit_frozen: dict[str, bool] = {}
+            # Legacy online checkpoints used a redundant frozen target DINO.
+            # Aliases are metadata only, never duplicate registered modules.
+            self.vit_aliases: dict[str, str] = {}
             self.map_models: nn.ModuleDict = (
                 nn.ModuleDict()
             )  # Multihead Attention Pooling, usually different for each camera
@@ -520,6 +523,13 @@ class SharedModelManager(nn.Module):
         two copies to share the same ``requires_grad`` state.
         """
         key = registry_name or model_name
+        if (
+            key == "future_target_dinov2"
+            and frozen
+            and self.vit_frozen.get(model_name) is True
+        ):
+            self.vit_aliases[key] = model_name
+            key = model_name
 
         if key in self.vit_models:
             assert (
@@ -547,6 +557,52 @@ class SharedModelManager(nn.Module):
             for param in self.vit_models[key].parameters():
                 param.requires_grad = not frozen
             print(f"Model {model_name} registered as {key} with frozen={frozen}")
+
+        if self._is_frozen_dino(key):
+            self.vit_models[key].float().eval()
+            if key == model_name:
+                self.vit_aliases["future_target_dinov2"] = key
+        return key
+
+    def _is_frozen_dino(self, key: str) -> bool:
+        config = getattr(self.vit_models[key], "config", None)
+        return self.vit_frozen[key] and "dinov2" in str(
+            getattr(config, "model_type", key)
+        ).lower()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        for key in self.vit_models:
+            if self._is_frozen_dino(key):
+                self.vit_models[key].eval()
+        return self
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        # Fold identical legacy target tensors into the shared backbone. A
+        # divergent target cannot be discarded without changing the policy.
+        for alias, canonical in self.vit_aliases.items():
+            if alias in self.vit_models:
+                continue
+            old_prefix = prefix + "vit_models." + alias + "."
+            new_prefix = prefix + "vit_models." + canonical + "."
+            for key in list(state_dict):
+                if not key.startswith(old_prefix):
+                    continue
+                new_key = new_prefix + key[len(old_prefix):]
+                if new_key in state_dict and not torch.equal(state_dict[key], state_dict[new_key]):
+                    error_msgs.append(
+                        f"Cannot share legacy frozen DINO: {key} differs from {new_key}"
+                    )
+                else:
+                    state_dict.setdefault(new_key, state_dict[key])
+                del state_dict[key]
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     def compile(self):
         for model in self.vit_models.values():
@@ -595,6 +651,8 @@ class SharedModelManager(nn.Module):
         return: (batch_size, patch_num, feature_dim)
         """
         assert self.cache_size is not None, "cache_size is not set"
+        if model_name not in self.vit_models:
+            model_name = self.vit_aliases.get(model_name, model_name)
 
         for (cached_model_name, key), value in self.patches_cache.items():
             if (
@@ -610,7 +668,13 @@ class SharedModelManager(nn.Module):
             self.patches_cache.pop(pop_key)
 
         # print(f"Patches cache miss for {model_name}, {x.shape=}, {len(self.patches_cache)=}")
-        y: torch.Tensor = self.vit_models[model_name](x).last_hidden_state
+        if self._is_frozen_dino(model_name):
+            # Freezing weights does not disable the trainer's BF16 autocast.
+            # Match offline feature extraction in every frozen DINO caller.
+            with torch.no_grad(), torch.autocast(device_type=x.device.type, enabled=False):
+                y = self.vit_models[model_name](x.float()).last_hidden_state
+        else:
+            y = self.vit_models[model_name](x).last_hidden_state
         self.patches_cache[(model_name, x)] = y
         return y
 
@@ -831,7 +895,7 @@ class SharedDinoV2ImageEncoder(BaseImageEncoder):
         self.manager = [
             SharedModelManager()
         ]  # Bypass nn.Module registration; the manager owns the shared model.
-        self.manager[0].register_vit_model(
+        self.shared_model_key = self.manager[0].register_vit_model(
             self.model_name,
             self.frozen,
             registry_name=self.shared_model_key,

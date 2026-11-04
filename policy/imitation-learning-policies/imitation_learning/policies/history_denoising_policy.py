@@ -59,10 +59,17 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             execution_chunk_length = legacy_chunk_length
 
         if history_img_feature_encoder is not None:
+            patch_counts = {
+                getattr(encoder, "patch_token_num", 0)
+                for encoder in history_img_feature_encoder.encoder_dict.values()
+            }
             kwargs["denoising_network_partial"] = partial(
                 kwargs["denoising_network_partial"],
                 history_img_features_dim=history_img_feature_encoder.feature_dim,
                 history_img_features_token_num=history_img_feature_encoder.token_num,
+                patch_merge_patch_token_num=(
+                    next(iter(patch_counts)) if len(patch_counts) == 1 else 0
+                ),
             )
 
         super().__init__(**kwargs)
@@ -715,7 +722,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 global_cond_mask=retrieval_inputs.get("global_cond_mask"),
                 local_cond_mask=retrieval_inputs.get("local_cond_mask"),
             )
-        return network.history_img_features_projector(raw_features)
+        return network.project_history_image_features(raw_features)
 
     def _current_gate_scores(self, banks):
         gates = self.denoising_network.memory_retriever.latest_slot_gates
@@ -800,7 +807,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             frame = self.next_frame_index_dict.get(episode, 0)
             bank.append(
                 current_latents[i].detach(), frame, gate_scores[i],
-                raw_features=raw_features[i].detach(),
+                raw_features=(None if network.patch_merge else raw_features[i].detach()),
             )
             self.next_frame_index_dict[episode] = frame + self.execution_chunk_length
         return self.action_decoder(data_dict["noisy_action"])
@@ -818,7 +825,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         can_reproject = not (network.compact_multiview_slot or network.state_conditioned_history_slot)
         if can_reproject:
             for bank in banks:
-                bank.reproject(network.history_img_features_projector)
+                bank.reproject(network.project_history_image_features)
         for anchor in range(supervised):
             flat_indices = offsets + anchor
             inputs = {

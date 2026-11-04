@@ -7,6 +7,7 @@ import torch.nn as nn
 from timm.models.vision_transformer import Attention, Mlp, RmsNorm
 
 from imitation_learning.models.common.modules import Projector
+from imitation_learning.models.common.patch_merger import SpatialPatchMerger
 from imitation_learning.models.common.slot_gate import ObservationConditionedSlotGate
 from imitation_learning.models.common.pos_embeddings import (
     get_1d_sincos_pos_embed_from_grid,
@@ -672,6 +673,9 @@ class MemoryTransformer(ConditionalTransformer):
         use_conditioned_slot_gate: bool = False,
         slot_gate_hidden_dim: int = 128,
         slot_gate_bias_init: float = 0.0,
+        patch_merge: bool = False,
+        patch_merge_size: int = 1,
+        patch_merge_patch_token_num: int = 0,
         **kwargs,
     ):
         # Old image-only checkpoints may still contain these retired settings.
@@ -679,11 +683,35 @@ class MemoryTransformer(ConditionalTransformer):
         kwargs.pop("history_action_num_per_chunk", None)
         kwargs["name"] = "memory_transformer"
 
+        if not isinstance(patch_merge, bool):
+            raise ValueError("patch_merge must be boolean")
+        if patch_merge:
+            if compact_multiview_slot or state_conditioned_history_slot:
+                raise ValueError("patch_merge requires plain perception patch slots")
+            if (
+                isinstance(patch_merge_size, bool)
+                or not isinstance(patch_merge_size, int)
+                or patch_merge_size <= 0
+                or patch_merge_patch_token_num <= 0
+            ):
+                raise ValueError("patch_merge requires positive merge size and DINO patch count")
+            if kwargs["global_cond_dim"] != history_img_features_dim:
+                raise ValueError("patch_merge requires matching current/history feature widths")
+            factor = patch_merge_size**2
+            for token_num in (kwargs["global_cond_token_num"], history_img_features_token_num):
+                if token_num <= 0 or token_num % patch_merge_patch_token_num:
+                    raise ValueError("patch_merge requires complete current/history DINO patch grids")
+                if token_num % factor:
+                    raise ValueError("patch_merge_size must divide the DINO patch grid")
+            kwargs["global_cond_token_num"] //= factor
+            history_img_features_token_num //= factor
+
         if compact_multiview_slot:
             kwargs["global_cond_pos_emb_type"] = "none"
 
         super().__init__(**kwargs)
 
+        self.patch_merge = patch_merge
         self.binary_gating: bool = binary_gating
         self.skip_history_attn: bool = skip_history_attn
         self.memory_retrieval_mode = memory_retrieval_mode
@@ -804,7 +832,15 @@ class MemoryTransformer(ConditionalTransformer):
             self.history_img_features_dim > 0
             and self.history_img_features_token_num > 0
         ):
-            if compact_multiview_slot or state_conditioned_history_slot:
+            if patch_merge:
+                # Register one merger under the current-image projector. All
+                # history projection calls reuse it without a second alias in
+                # the state dict or a second set of trainable parameters.
+                self.global_cond_projector = SpatialPatchMerger(
+                    self.global_cond_dim, self.hidden_dim,
+                    patch_merge_patch_token_num, patch_merge_size,
+                )
+            elif compact_multiview_slot or state_conditioned_history_slot:
                 if (
                     compact_multiview_slot
                     and self.history_img_features_token_num != history_view_num
@@ -849,6 +885,13 @@ class MemoryTransformer(ConditionalTransformer):
             ) # Two tokens: [0] when memory gate == 0, [1] when memory gate == 1
         else:
             self.memory_gate_tokens = None
+
+    def project_history_image_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self.patch_merge:
+            return self.global_cond_projector(features)
+        if self.history_img_features_projector is None:
+            raise ValueError("history image features require an image projector")
+        return self.history_img_features_projector(features)
 
     def _update_history_attention_metric(
         self, name: str, values: torch.Tensor
@@ -1127,9 +1170,7 @@ class MemoryTransformer(ConditionalTransformer):
             history_len = history_img_features.shape[1]
             if history_len > self.max_history_storage_len:
                 raise ValueError("history_len exceeds Active plus Shadow storage capacity")
-            if self.history_img_features_projector is None:
-                raise ValueError("history image features require an image projector")
-            history_latents = self.history_img_features_projector(history_img_features)
+            history_latents = self.project_history_image_features(history_img_features)
             if history_len == 0:
                 positioned_history_latents = history_latents
             else:
@@ -1178,6 +1219,11 @@ class MemoryTransformer(ConditionalTransformer):
         """Keep current image/proprioception in the retrieval branch only."""
 
         local_cond_mask = data_dict.get("local_cond_mask")
+        if self.patch_merge and "global_cond_mask" in data_dict:
+            data_dict = dict(data_dict)
+            data_dict["global_cond_mask"] = self.global_cond_projector.merge_mask(
+                data_dict["global_cond_mask"]
+            )
         input_dict = super()._project_to_latent_space(data_dict)
         local_token_num = self.local_cond_token_num
 
@@ -1263,11 +1309,11 @@ class MemoryTransformer(ConditionalTransformer):
         history_latents: torch.Tensor | None = None
 
         if (
-            self.history_img_features_projector is not None
+            (self.patch_merge or self.history_img_features_projector is not None)
             and not self.compact_multiview_slot
             and not self.state_conditioned_history_slot
         ):
-            projected_history_img_features_latent = self.history_img_features_projector(
+            projected_history_img_features_latent = self.project_history_image_features(
                 data_dict["history_img_features"]
             )  # (batch, traj_num, traj_length, hidden_dim)
             history_latents = projected_history_img_features_latent

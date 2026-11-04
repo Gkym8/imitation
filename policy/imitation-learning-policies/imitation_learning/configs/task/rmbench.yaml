@@ -11,9 +11,8 @@ visual_encoder:
   pretrained: true
   frozen: true
   individual_forward: false
-  # Spatially average each merge_size x merge_size patch block. 1 keeps all
-  # 256 DINO patches; 2/4/8 produce 64/16/4 history patch tokens.
-  spatial_merge_size: 8
+  spatial_merge_size: 8 
+  patch_merge: true
 
 workspace:
   train_dataset:
@@ -25,8 +24,8 @@ workspace:
     image_keys: [head_camera]
     # true: preserve the existing offline cached-feature training path.
     # false: load raw images and backpropagate through the current/history DINO.
-    use_cached_image_features: true
-    cached_image_feature_kind: auto
+    use_cached_image_features: false
+    cached_image_feature_kind: ${cond:${visual_encoder.patch_merge},patches,auto}
     cached_image_feature_dim: 768
     cached_image_feature_patch_token_num: 256
     cached_image_feature_model_name: ${visual_encoder.model_name}
@@ -55,7 +54,7 @@ workspace:
     streaming_chunk_length: 4
     streaming_chunk_accumulate: 1
     num_epochs: 301
-    checkpoint_every: 50
+    checkpoint_every: 25
     rollout_every: 0
     sample_every: 0
     val_every: 25
