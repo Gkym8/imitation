@@ -578,7 +578,7 @@ class SharedModelManager(nn.Module):
             print(f"Model {model_name} registered as {key} with frozen={frozen}")
 
         if self._is_frozen_dino(key):
-            self.vit_models[key].float().eval()
+            self.vit_models[key].eval()
             if key == model_name:
                 self.vit_aliases["future_target_dinov2"] = key
         return key
@@ -688,10 +688,9 @@ class SharedModelManager(nn.Module):
 
         # print(f"Patches cache miss for {model_name}, {x.shape=}, {len(self.patches_cache)=}")
         if self._is_frozen_dino(model_name):
-            # Freezing weights does not disable the trainer's BF16 autocast.
-            # Match offline feature extraction in every frozen DINO caller.
-            with torch.no_grad(), torch.autocast(device_type=x.device.type, enabled=False):
-                y = self.vit_models[model_name](x.float()).last_hidden_state
+            # Keep the backbone frozen while following the caller's autocast.
+            with torch.no_grad():
+                y = self.vit_models[model_name](x).last_hidden_state
         else:
             y = self.vit_models[model_name](x).last_hidden_state
         self.patches_cache[(model_name, x)] = y

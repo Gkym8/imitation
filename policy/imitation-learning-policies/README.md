@@ -145,10 +145,12 @@ The new merger requires training a new model; disabling the flag, or loading
 an old checkpoint without it, retains the original weights and computation.
 
 Current images, history images, and future supervision share one frozen DINO
-backbone in both cached and online modes. Frozen DINO parameters and forward
-computation use FP32, with autocast disabled only for that backbone; it stays
-in eval mode during policy training. The patch merger, DiT, and future
-predictor retain the trainer's mixed precision and their gradients. Existing
+backbone in both cached and online modes. Online DINO forwards follow the
+caller's autocast: BF16 mixed precision during training and FP32 during the
+default RMBench evaluation. It stays frozen and in eval mode during policy
+training. Frozen parameters are copied exactly into the EMA model rather
+than averaged. The patch merger, DiT, and future predictor retain the
+trainer's mixed precision and their gradients. Existing
 FP32 feature caches remain usable. Legacy checkpoints containing a second
 `future_target_dinov2` backbone are folded into the shared model when their
 weights match; differing legacy target weights are not silently discarded.

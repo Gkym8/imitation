@@ -36,23 +36,29 @@ class FrozenDinoPrecisionTest(unittest.TestCase):
     def tearDown(self):
         SharedModelManager.reset()
 
-    def test_frozen_backbone_stays_fp32_eval_without_disabling_head_autocast(self):
-        model = MatrixDino().to(dtype=torch.bfloat16)
+    def test_frozen_backbone_stays_eval_and_follows_caller_autocast(self):
+        model = MatrixDino()
         self.manager.register_vit_model(MODEL_NAME, True, model=model)
         self.manager.train()
         self.assertFalse(model.training)
         self.assertEqual(model.projection.weight.dtype, torch.float32)
         image = torch.randn(2, 3, 12, 12)
-        expected = self.manager.forward_patches(MODEL_NAME, image)
+        full_precision = self.manager.forward_patches(MODEL_NAME, image)
+        self.assertEqual(full_precision.dtype, torch.float32)
+        self.assertFalse(full_precision.requires_grad)
         self.manager.clear_cache()
         head = nn.Linear(8, 4)
         with torch.autocast('cpu', dtype=torch.bfloat16):
+            with torch.no_grad():
+                expected = model(image).last_hidden_state
             actual = self.manager.forward_patches(MODEL_NAME, image)
             prediction = head(actual)
             loss = prediction.float().square().mean()
         loss.backward()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        self.assertEqual(model.matrix_dtype, torch.float32)
+        self.assertEqual(model.matrix_dtype, torch.bfloat16)
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        self.assertEqual(model.projection.weight.dtype, torch.float32)
         self.assertFalse(model.grad_enabled)
         self.assertFalse(actual.requires_grad)
         self.assertEqual(prediction.dtype, torch.bfloat16)
