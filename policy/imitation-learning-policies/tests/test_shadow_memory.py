@@ -99,7 +99,8 @@ class ShadowMemoryRetrievalTest(unittest.TestCase):
         output = retriever(
             global_cond=current, history_latents=history,
             history_mask=torch.ones(1, 2, dtype=torch.bool),
-            history_shadow_mask=torch.tensor([[False, True]]), record_data_dict=records,
+            history_shadow_mask=torch.tensor([[False, True]]),
+            history_shadow_steps=torch.tensor([[0, 1]]), record_data_dict=records,
         )
         handle.remove()
         self.assertTrue(torch.isfinite(output).all())
@@ -113,6 +114,32 @@ class ShadowMemoryRetrievalTest(unittest.TestCase):
         torch.testing.assert_close(effective[:, 1], 0.01 * raw[:, 1])
         torch.testing.assert_close(records["slot_gate_training_log_gates"][0], calls[0])
 
+    def test_four_shadow_read_powers_scale_each_head_before_softmax(self):
+        for rate in (0.5, 0.3):
+            with self.subTest(rate=rate):
+                retriever = gate_fixture.make_retriever()
+                retriever.shadow_gate_scale = rate
+                for block in retriever.perception_retrieval_blocks:
+                    with torch.no_grad():
+                        block.history_cross_attn.q.weight.zero_()
+                        block.history_cross_attn.q.bias.zero_()
+                        block.history_cross_attn.kv.weight.zero_()
+                        block.history_cross_attn.kv.bias.zero_()
+                history = torch.randn(1, 1, 3, 16).expand(-1, 5, -1, -1)
+                records = {"history_cross_attention_slot_weights": []}
+                retriever(
+                    global_cond=torch.randn(1, 4, 16), history_latents=history,
+                    history_mask=torch.ones(1, 5, dtype=torch.bool),
+                    history_shadow_mask=torch.tensor([[False, True, True, True, True]]),
+                    history_shadow_steps=torch.tensor([[0, 1, 2, 3, 4]]),
+                    record_data_dict=records,
+                )
+                multipliers = torch.tensor([1.0, rate, rate**2, rate**3, rate**4])
+                expected = retriever.latest_slot_gates * multipliers[None, :, None]
+                torch.testing.assert_close(retriever.latest_effective_slot_gates, expected)
+                weights = records["history_cross_attention_slot_weights"][0]
+                torch.testing.assert_close(weights, (multipliers / multipliers.sum()).expand_as(weights))
+
     def test_shadow_task_gradients_reach_raw_gate_and_slot_features(self):
         retriever = gate_fixture.make_retriever()
         history = torch.randn(1, 3, 4, 16, requires_grad=True)
@@ -120,7 +147,8 @@ class ShadowMemoryRetrievalTest(unittest.TestCase):
         output = retriever(
             global_cond=torch.randn(1, 4, 16), history_latents=history,
             history_mask=torch.tensor([[True, True, False]]),
-            history_shadow_mask=torch.tensor([[False, True, False]]), record_data_dict=records,
+            history_shadow_mask=torch.tensor([[False, True, False]]),
+            history_shadow_steps=torch.tensor([[0, 3, 0]]), record_data_dict=records,
         )
         raw_log_gates = records["slot_gate_training_log_gates"][0]
         gate_grad, feature_grad = torch.autograd.grad(output.square().sum(), (raw_log_gates, history))
@@ -138,6 +166,11 @@ class ShadowMemoryRetrievalTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "valid history"):
             retriever(**inputs, history_mask=torch.tensor([[True, False]]),
                        history_shadow_mask=torch.tensor([[False, True]]))
+        for steps in (None, torch.tensor([[0, 1, 2]]), torch.tensor([[0.0, 1.0]]),
+                      torch.tensor([[0, 0]]), torch.tensor([[1, 1]]), torch.tensor([[0, -1]])):
+            with self.subTest(steps=steps), self.assertRaisesRegex(ValueError, "history_shadow_steps"):
+                retriever(**inputs, history_shadow_mask=torch.tensor([[False, True]]),
+                          history_shadow_steps=steps)
 
 
 class ShadowMemoryPolicyTest(unittest.TestCase):
@@ -171,19 +204,26 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
     def test_training_chunks_and_online_share_lifecycle_in_both_feature_modes(self):
         for mode in ("pooled", "tokens"):
             with self.subTest(mode=mode):
-                policy = self.fixture.instantiate_policy(self.make_config(mode)).eval()
+                cfg = self.make_config(mode)
+                cfg.workspace.model.denoising_network_partial.shadow_horizon = 4
+                cfg.workspace.model.denoising_network_partial.shadow_gate_scale = 0.5
+                policy = self.fixture.instantiate_policy(cfg).eval()
                 batch = self.fixture.make_batch(anchors=13)
-                reads = []
+                reads, shadow_step_reads = [], []
                 pack_history = policy._pack_history
 
                 def capture_history(banks, reference):
                     reads.append(tuple(self.snapshot(bank) for bank in banks))
-                    return pack_history(banks, reference)
+                    packed = pack_history(banks, reference)
+                    shadow_step_reads.append(packed["history_shadow_steps"].tolist())
+                    return packed
 
                 with patch.object(policy, "_pack_history", side_effect=capture_history):
                     full_loss = policy.compute_loss(self.chunk(batch, 0, 12, True, False))["gate_selectivity"].detach()
                 full_reads = list(reads)
+                full_shadow_step_reads = list(shadow_step_reads)
                 reads.clear()
+                shadow_step_reads.clear()
                 full_bank = self.snapshot(policy._streaming_training_state[0])
                 chunk_losses = []
                 with patch.object(policy, "_pack_history", side_effect=capture_history):
@@ -192,15 +232,26 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
                             self.chunk(batch, start, 3, start == 0, start == 9),
                         )["gate_selectivity"].detach())
                 self.assertEqual(reads, full_reads)
+                self.assertEqual(shadow_step_reads, full_shadow_step_reads)
                 self.assertEqual(len(reads), 12)
                 # Each read sees only preceding valid anchors, even at a
                 # chunk boundary; lookahead/current slots are never inserted early.
+                first_shadow_read = {}
                 for anchor, (snapshot,) in enumerate(reads):
                     ids = [row[0] for row in snapshot]
                     self.assertTrue(all(slot_id < anchor for slot_id in ids))
                     if anchor:
                         self.assertIn(anchor - 1, ids)
+                    retained_steps = shadow_step_reads[anchor][0][-len(snapshot):] if snapshot else []
+                    for (slot_id, state, _, _), step in zip(snapshot, retained_steps):
+                        if state == "shadow":
+                            first_shadow_read.setdefault(slot_id, anchor)
+                            self.assertEqual(step, anchor - first_shadow_read[slot_id] + 1)
+                            self.assertLessEqual(step, 4)
+                        else:
+                            self.assertEqual(step, 0)
                 reads.clear()
+                shadow_step_reads.clear()
                 self.assertIsNone(policy._streaming_training_state)
                 self.assertEqual(policy.latest_training_slot_ids[0], tuple(row[0] for row in full_bank))
                 self.assertEqual(policy.latest_training_slot_states[0], tuple(row[1] for row in full_bank))
@@ -221,17 +272,23 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
                         self.assertTrue(torch.isfinite(output["action"]).all())
                 handle.remove()
                 self.assertEqual(reads, full_reads)
+                self.assertEqual(shadow_step_reads, full_shadow_step_reads)
                 bank = policy.online_memory_banks[0]
                 self.assertEqual(self.snapshot(bank), full_bank)
                 self.assertEqual(len(calls), 12)
-                self.assertEqual((bank.active_count, bank.shadow_count), (4, 3))
+                self.assertEqual((bank.active_count, bank.shadow_count), (4, 4))
                 snapshot = policy.latest_online_memory_query_dict[0]
                 self.assertEqual(snapshot["active_slot_count"], 4)
-                self.assertEqual(snapshot["shadow_slot_count"], 3)
+                self.assertEqual(snapshot["shadow_slot_count"], 4)
                 raw = torch.tensor(snapshot["slot_gates"])
                 effective = torch.tensor(snapshot["slot_effective_gates"])
                 shadow = torch.tensor([state == "shadow" for state in snapshot["slot_states"]])
-                torch.testing.assert_close(effective[shadow], 0.01 * raw[shadow])
+                steps = torch.tensor([
+                    snapshot["query_anchor_index"] - first_shadow_read[slot_id] + 1
+                    for slot_id, state in zip(snapshot["slot_ids"], snapshot["slot_states"])
+                    if state == "shadow"
+                ])
+                torch.testing.assert_close(effective[shadow], raw[shadow] * (0.5**steps[:, None]))
                 torch.testing.assert_close(effective[~shadow], raw[~shadow])
                 self.assertTrue(any(expiry == snapshot["query_anchor_index"] for expiry in snapshot["slot_expire_at"]))
                 policy.reset()
@@ -368,9 +425,11 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
             "history_img_features": torch.randn(1, 7, 16, 8),
             "history_mask": torch.ones(1, 7, dtype=torch.bool),
             "history_shadow_mask": torch.tensor([[False] * 4 + [True] * 3]),
+            "history_shadow_steps": torch.tensor([[0] * 4 + [1, 2, 3]]),
         }
         inputs = network.prepare_single_memory_retrieval(data)
         self.assertEqual(inputs["history_latents"].shape[1], 7)
+        torch.testing.assert_close(inputs["history_shadow_steps"], data["history_shadow_steps"])
         self.assertTrue(torch.isfinite(network.retrieve_decision_memory(inputs)).all())
         data["history_img_features"] = torch.randn(1, 8, 16, 8)
         with self.assertRaisesRegex(ValueError, "storage capacity"):

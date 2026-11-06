@@ -7,7 +7,8 @@ _target_: imitation_learning.models.denoising_networks.memory_transformer.Memory
 max_history_len: 8
 # Shadows share storage/attention with Active slots but do not count toward
 # max_history_len. Zero restores immediate hard eviction.
-shadow_horizon: 4
+shadow_horizon: 3
+# At Shadow read k=1..shadow_horizon, multiply each raw gate by this rate**k.
 shadow_gate_scale: 0.01
 freeze_non_history_modules: false
 history_attention_type: token_wise

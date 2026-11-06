@@ -370,6 +370,7 @@ class ObservationDrivenMemoryRetriever(nn.Module):
         current_mask: torch.Tensor | None,
         record_data_dict: dict[str, list[torch.Tensor]] | None,
         history_shadow_mask: torch.Tensor | None = None,
+        history_shadow_steps: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         if self.slot_gate is None:
             return None
@@ -393,7 +394,22 @@ class ObservationDrivenMemoryRetriever(nn.Module):
             shadow_mask = history_shadow_mask.to(device=log_gate.device, dtype=torch.bool)
             if history_mask is not None and (shadow_mask & ~history_mask.bool()).any():
                 raise ValueError("history_shadow_mask may only mark valid history slots")
-            log_gate = log_gate + shadow_mask[:, :, None] * math.log(self.shadow_gate_scale)
+            if history_shadow_steps is None:
+                if shadow_mask.any():
+                    raise ValueError("history_shadow_steps is required for Shadow slots")
+                history_shadow_steps = torch.zeros_like(shadow_mask, dtype=torch.long)
+            if history_shadow_steps.shape != log_gate.shape[:2]:
+                raise ValueError("history_shadow_steps must have shape [batch, slot]")
+            if history_shadow_steps.is_floating_point() or history_shadow_steps.dtype == torch.bool:
+                raise ValueError("history_shadow_steps must contain integer read counts")
+            steps = history_shadow_steps.to(device=log_gate.device)
+            if (steps < 0).any() or not torch.equal(steps > 0, shadow_mask):
+                raise ValueError("history_shadow_steps must be positive only for Shadow slots")
+            # Recompute from the raw gate: g_eff = g_raw * rate**k.
+            # Log space avoids repeatedly multiplying already-decayed gates.
+            log_gate = log_gate + steps[:, :, None].to(log_gate.dtype) * math.log(self.shadow_gate_scale)
+        elif history_shadow_steps is not None:
+            raise ValueError("history_shadow_steps requires history_shadow_mask")
         effective_gates = log_gate.detach().exp()
         if history_mask is not None:
             effective_gates = effective_gates.masked_fill(~history_mask[:, :, None].bool(), 0)
@@ -415,10 +431,11 @@ class ObservationDrivenMemoryRetriever(nn.Module):
         skip_history: bool = False,
         record_data_dict: dict[str, list[torch.Tensor]] | None = None,
         history_shadow_mask: torch.Tensor | None = None,
+        history_shadow_steps: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.latest_slot_gates = None
         self.latest_effective_slot_gates = None
-        if history_shadow_mask is not None and self.slot_gate is None:
+        if (history_shadow_mask is not None or history_shadow_steps is not None) and self.slot_gate is None:
             raise ValueError("Shadow memory requires an observation-conditioned slot gate")
         if global_cond.ndim != 3 or global_cond.shape[-1] != self.hidden_dim:
             raise ValueError(
@@ -453,7 +470,7 @@ class ObservationDrivenMemoryRetriever(nn.Module):
                 history_log_gate = self._compute_slot_log_gate(
                     current_tokens, history_latents, history_mask,
                     global_cond_mask, record_data_dict,
-                    history_shadow_mask,
+                    history_shadow_mask, history_shadow_steps,
                 )
                 if self.compact_multiview_slot:
                     # S_t is kept pure for storage and future supervision.  A
@@ -557,7 +574,7 @@ class ObservationDrivenMemoryRetriever(nn.Module):
         ):
             history_log_gate = self._compute_slot_log_gate(
                 query, history_latents, history_mask, None, record_data_dict,
-                history_shadow_mask,
+                history_shadow_mask, history_shadow_steps,
             )
             retrieved_history = self.history_cross_attn(
                 x=self.history_norm(query),
@@ -1163,6 +1180,7 @@ class MemoryTransformer(ConditionalTransformer):
         history_latents: torch.Tensor | None = None
         history_mask = data_dict.pop("history_mask", None)
         history_shadow_mask = data_dict.pop("history_shadow_mask", None)
+        history_shadow_steps = data_dict.pop("history_shadow_steps", None)
         memory_gate_val = data_dict.pop("memory_gate_val", None)
 
         if "history_img_features" in data_dict:
@@ -1190,6 +1208,8 @@ class MemoryTransformer(ConditionalTransformer):
             input_dict["history_mask"] = history_mask
         if history_shadow_mask is not None:
             input_dict["history_shadow_mask"] = history_shadow_mask
+        if history_shadow_steps is not None:
+            input_dict["history_shadow_steps"] = history_shadow_steps
         if memory_gate_val is not None:
             input_dict["memory_gate_val"] = memory_gate_val
         if decision_memory is not None:
@@ -1499,6 +1519,7 @@ class MemoryTransformer(ConditionalTransformer):
             "history_key_latents",
             "history_mask",
             "history_shadow_mask",
+            "history_shadow_steps",
             "memory_gate_val",
         )
         return {
@@ -1523,6 +1544,7 @@ class MemoryTransformer(ConditionalTransformer):
             history_key_latents=retrieval_inputs.get("history_key_latents"),
             history_mask=retrieval_inputs.get("history_mask"),
             history_shadow_mask=retrieval_inputs.get("history_shadow_mask"),
+            history_shadow_steps=retrieval_inputs.get("history_shadow_steps"),
             memory_gate_val=retrieval_inputs.get("memory_gate_val"),
             skip_history=self.skip_history_attn,
             record_data_dict=record_data_dict,
@@ -1607,6 +1629,7 @@ class MemoryTransformer(ConditionalTransformer):
                 history_key_latents=input_dict.get("history_key_latents"),
                 history_mask=input_dict.get("history_mask"),
                 history_shadow_mask=input_dict.get("history_shadow_mask"),
+                history_shadow_steps=input_dict.get("history_shadow_steps"),
                 memory_gate_val=input_dict.get("memory_gate_val"),
                 skip_history=self.skip_history_attn,
                 record_data_dict=record_data_dict,

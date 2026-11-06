@@ -207,8 +207,8 @@ workspace:
   model:
     denoising_network_partial:
       max_history_len: 8       # Active capacity
-      shadow_horizon: 8        # Future valid anchors; 0 deletes immediately
-      shadow_gate_scale: 0.01  # Multiply each Shadow's raw per-head gate
+      shadow_horizon: 4       # Future valid anchors; 0 deletes immediately
+      shadow_gate_scale: 0.5  # Per-read decay rate; effective gate = raw gate * rate**k
     memory_eviction:
       keep_first: true
       keep_recent: 2
@@ -218,14 +218,19 @@ workspace:
 ```
 
 Shadow slots share the same MLP and Attention normalization with Active slots.
-Their effective log-gates are `logsigmoid(MLP) + log(shadow_gate_scale)`;
-raw gates are recomputed at every read. A slot demoted after anchor `t` is
+Their effective log-gates are `logsigmoid(MLP) + k * log(shadow_gate_scale)`,
+where `k=1..shadow_horizon` counts valid reads since that slot was demoted.
+Raw gates are recomputed at every read, then multiplied by the rate to the
+power `k`; previously decayed gates are not reused. With rate `0.5` and horizon
+4 the multipliers are `0.5, 0.25, 0.125, 0.0625`; rate `0.3` gives
+`0.3, 0.09, 0.027, 0.0081`. A slot demoted after anchor `t` is
 read as Shadow at `t+1` through `t+shadow_horizon`, then physically deleted
 after the final read. It never re-enters the eviction candidates or consumes
 an Active place. Total feature storage and history position embeddings are
-bounded by `max_history_len + shadow_horizon` (16 slots by default).
+bounded by `max_history_len + shadow_horizon`.
 Counters advance only on valid supervised/online anchors, excluding padding
-and lookahead. State and expiry survive chunk boundaries along with features.
+and lookahead. State, expiry, and decay progress survive chunk boundaries
+along with features. Training and inference use the same per-slot clock.
 
 The selectivity loss computes population standard deviation over valid Active
 slots' raw gates for each head, then averages `relu(0.1 - std)**2` over heads.

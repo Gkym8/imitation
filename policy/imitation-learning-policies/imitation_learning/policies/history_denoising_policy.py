@@ -673,7 +673,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
     ) -> dict[str, torch.Tensor]:
         network = self.denoising_network
         capacity = network.max_history_storage_len
-        rows, masks, active_masks, shadow_masks = [], [], [], []
+        rows, masks, active_masks, shadow_masks, shadow_steps = [], [], [], [], []
         for bank in banks:
             padding = capacity - len(bank)
             empty = reference.new_zeros((padding, *reference.shape[1:]))
@@ -689,12 +689,24 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             )
             active_masks.append(active)
             shadow_masks.append(masks[-1] & ~active)
+            steps = [0] * padding
+            for slot in bank.slots:
+                if slot.state == "shadow":
+                    if slot.expire_at is None:
+                        raise RuntimeError("Shadow slots must have an expiry anchor")
+                    # Demotion follows a read. The next valid read is k=1,
+                    # and the expiry anchor itself is read with k=horizon.
+                    steps.append(bank.next_anchor_index + bank.shadow_horizon - slot.expire_at)
+                else:
+                    steps.append(0)
+            shadow_steps.append(torch.tensor(steps, device=reference.device, dtype=torch.long))
         history = torch.stack(rows)
         positioned = network.add_history_key_encoding(history, network.history_time_embedding)
         result = {
             "history_mask": torch.stack(masks),
             "history_active_mask": torch.stack(active_masks),
             "history_shadow_mask": torch.stack(shadow_masks),
+            "history_shadow_steps": torch.stack(shadow_steps),
         }
         if network.memory_retrieval_mode == "perception_patches":
             result["history_latents"] = history

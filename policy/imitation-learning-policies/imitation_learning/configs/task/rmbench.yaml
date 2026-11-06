@@ -12,7 +12,7 @@ visual_encoder:
   frozen: true
   individual_forward: false
   spatial_merge_size: 8 
-  patch_merge: false
+  patch_merge: true
 
 workspace:
   train_dataset:
