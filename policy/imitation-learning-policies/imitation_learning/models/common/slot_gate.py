@@ -19,6 +19,7 @@ class ObservationConditionedSlotGate(nn.Module):
         head_num: int,
         hidden_dim: int = 128,
         bias_init: float = 0.0,
+        use_state_condition: bool = False,
     ):
         super().__init__()
         if feature_dim <= 0 or head_num <= 0 or hidden_dim <= 0:
@@ -28,10 +29,13 @@ class ObservationConditionedSlotGate(nn.Module):
         self.feature_dim = feature_dim
         self.head_num = head_num
         self.bias_init = float(bias_init)
+        self.use_state_condition = use_state_condition
         self.slot_norm = nn.LayerNorm(feature_dim)
         self.observation_norm = nn.LayerNorm(feature_dim)
+        if use_state_condition:
+            self.state_norm = nn.LayerNorm(feature_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(2 * feature_dim, hidden_dim),
+            nn.Linear((3 if use_state_condition else 2) * feature_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, head_num),
         )
@@ -52,6 +56,8 @@ class ObservationConditionedSlotGate(nn.Module):
         current_tokens: torch.Tensor,
         history_mask: torch.Tensor | None = None,
         current_mask: torch.Tensor | None = None,
+        state_tokens: torch.Tensor | None = None,
+        state_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if history_tokens.ndim != 4 or history_tokens.shape[-1] != self.feature_dim:
             raise ValueError(
@@ -88,7 +94,29 @@ class ObservationConditionedSlotGate(nn.Module):
             ).sum(dim=-2) / current_mask.sum(dim=-1, keepdim=True).clamp_min(1)
         current_summary = self.observation_norm(current_summary)
         current_summary = current_summary[:, None, :].expand(-1, slot_num, -1)
-        logits = self.mlp(torch.cat([slot_summary, current_summary], dim=-1))
+        summaries = [slot_summary, current_summary]
+        if self.use_state_condition:
+            if state_tokens is None:
+                if state_mask is not None:
+                    raise ValueError("state_mask requires state_tokens")
+                state_summary = current_tokens.new_zeros((batch_size, self.feature_dim))
+            else:
+                if (state_tokens.ndim != 3 or state_tokens.shape[0] != batch_size
+                        or state_tokens.shape[-1] != self.feature_dim or state_tokens.shape[1] == 0):
+                    raise ValueError("state_tokens must have shape [batch, token, feature_dim]")
+                if state_mask is None:
+                    state_summary = state_tokens.mean(dim=-2)
+                else:
+                    if state_mask.shape != state_tokens.shape[:2]:
+                        raise ValueError("state_mask must match [batch, token]")
+                    state_mask = state_mask.to(device=state_tokens.device, dtype=torch.bool)
+                    state_summary = state_tokens.masked_fill(~state_mask[:, :, None], 0).sum(dim=-2)
+                    state_summary = state_summary / state_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+            state_summary = self.state_norm(state_summary)
+            summaries.append(state_summary[:, None, :].expand(-1, slot_num, -1))
+        elif state_tokens is not None or state_mask is not None:
+            raise ValueError("state conditioning is not enabled for this slot gate")
+        logits = self.mlp(torch.cat(summaries, dim=-1))
         # Float32 log-sigmoid remains stable with mixed precision and very
         # small gates. Do not clamp sigmoid outputs and cut off gradients.
         log_gate = F.logsigmoid(logits.float())

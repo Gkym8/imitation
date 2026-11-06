@@ -67,6 +67,9 @@ class FuturePredictionModeTest(unittest.TestCase):
         model.denoising_network_partial.head_num = 4
         model.denoising_network_partial.layer_num = 1
         model.denoising_network_partial.max_history_len = 2
+        # These existing cases cover legacy checkpoints. The state-token route
+        # is exercised explicitly in test_state_dit_tokens.py.
+        model.denoising_network_partial.state_as_dit_token = False
         # Existing feature-mode tests exercise immediate eviction. Shadow
         # lifecycle and both feature modes are covered in test_shadow_memory.
         model.denoising_network_partial.shadow_horizon = 0

@@ -174,6 +174,7 @@ class ObservationDrivenMemoryRetriever(nn.Module):
         slot_gate_hidden_dim: int = 128,
         slot_gate_bias_init: float = 0.0,
         shadow_gate_scale: float = 0.01,
+        state_as_dit_token: bool = False,
     ):
         super().__init__()
         if retrieval_mode not in {"learned_queries", "perception_patches"}:
@@ -195,6 +196,7 @@ class ObservationDrivenMemoryRetriever(nn.Module):
         self.straight_through = straight_through
         self.retrieval_mode = retrieval_mode
         self.compact_multiview_slot = compact_multiview_slot
+        self.state_as_dit_token = state_as_dit_token
         if not math.isfinite(shadow_gate_scale) or not 0 < shadow_gate_scale <= 1:
             raise ValueError("shadow_gate_scale must be finite and in (0, 1]")
         self.shadow_gate_scale = float(shadow_gate_scale)
@@ -206,6 +208,7 @@ class ObservationDrivenMemoryRetriever(nn.Module):
                 head_num=head_num,
                 hidden_dim=slot_gate_hidden_dim,
                 bias_init=slot_gate_bias_init,
+                use_state_condition=state_as_dit_token,
             )
             if use_conditioned_slot_gate
             else None
@@ -260,20 +263,21 @@ class ObservationDrivenMemoryRetriever(nn.Module):
         # perception-module parameters.  These modules exist only when the new
         # retrieval mode is explicitly selected by configuration.
         if retrieval_mode == "perception_patches":
-            self.state_condition_norm = RmsNorm(hidden_dim, eps=1e-6)
-            self.state_condition_attn = CrossAttention(
-                dim=hidden_dim,
-                head_num=head_num,
-                qkv_bias=True,
-                qk_norm=True,
-                norm_layer=RmsNorm,
-            )
-            self.state_condition_ff_norm = RmsNorm(hidden_dim, eps=1e-6)
-            self.state_condition_ff = Mlp(
-                in_features=hidden_dim,
-                hidden_features=hidden_dim * 4,
-                act_layer=nn.GELU,
-            )
+            if not state_as_dit_token:
+                self.state_condition_norm = RmsNorm(hidden_dim, eps=1e-6)
+                self.state_condition_attn = CrossAttention(
+                    dim=hidden_dim,
+                    head_num=head_num,
+                    qkv_bias=True,
+                    qk_norm=True,
+                    norm_layer=RmsNorm,
+                )
+                self.state_condition_ff_norm = RmsNorm(hidden_dim, eps=1e-6)
+                self.state_condition_ff = Mlp(
+                    in_features=hidden_dim,
+                    hidden_features=hidden_dim * 4,
+                    act_layer=nn.GELU,
+                )
             self.perception_retrieval_blocks = nn.ModuleList(
                 [
                     PerceptionHistoryRetrievalBlock(
@@ -323,8 +327,10 @@ class ObservationDrivenMemoryRetriever(nn.Module):
         local_cond: torch.Tensor | None = None,
         local_cond_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return the pure current visual/state tokens stored in a slot."""
+        """Return image tokens, with legacy state conditioning when selected."""
 
+        if self.state_as_dit_token:
+            return global_cond
         current_tokens = global_cond
         if local_cond is not None:
             if (
@@ -371,6 +377,8 @@ class ObservationDrivenMemoryRetriever(nn.Module):
         record_data_dict: dict[str, list[torch.Tensor]] | None,
         history_shadow_mask: torch.Tensor | None = None,
         history_shadow_steps: torch.Tensor | None = None,
+        state_tokens: torch.Tensor | None = None,
+        state_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         if self.slot_gate is None:
             return None
@@ -379,6 +387,8 @@ class ObservationDrivenMemoryRetriever(nn.Module):
             current_tokens=current_tokens,
             history_mask=history_mask,
             current_mask=current_mask,
+            state_tokens=state_tokens,
+            state_mask=state_mask,
         )
         if record_data_dict is not None and "slot_gate_training_log_gates" in record_data_dict:
             record_data_dict["slot_gate_training_log_gates"].append(log_gate)
@@ -471,6 +481,8 @@ class ObservationDrivenMemoryRetriever(nn.Module):
                     current_tokens, history_latents, history_mask,
                     global_cond_mask, record_data_dict,
                     history_shadow_mask, history_shadow_steps,
+                    state_tokens=local_cond if self.state_as_dit_token else None,
+                    state_mask=local_cond_mask if self.state_as_dit_token else None,
                 )
                 if self.compact_multiview_slot:
                     # S_t is kept pure for storage and future supervision.  A
@@ -527,7 +539,9 @@ class ObservationDrivenMemoryRetriever(nn.Module):
 
         observation_groups = [global_cond]
         mask_groups: list[torch.Tensor] = []
-        any_mask = global_cond_mask is not None or local_cond_mask is not None
+        any_mask = global_cond_mask is not None or (
+            local_cond_mask is not None and not self.state_as_dit_token
+        )
         if any_mask:
             if global_cond_mask is None:
                 global_cond_mask = torch.ones(
@@ -535,7 +549,7 @@ class ObservationDrivenMemoryRetriever(nn.Module):
                 )
             mask_groups.append(global_cond_mask.to(dtype=torch.bool))
 
-        if local_cond is not None:
+        if local_cond is not None and not self.state_as_dit_token:
             if (
                 local_cond.ndim != 3
                 or local_cond.shape[0] != global_cond.shape[0]
@@ -554,7 +568,7 @@ class ObservationDrivenMemoryRetriever(nn.Module):
                         device=local_cond.device,
                     )
                 mask_groups.append(local_cond_mask.to(dtype=torch.bool))
-        elif local_cond_mask is not None:
+        elif local_cond is None and local_cond_mask is not None:
             raise ValueError("local_cond_mask was provided without local_cond")
 
         observation_tokens = torch.cat(observation_groups, dim=1)
@@ -575,6 +589,8 @@ class ObservationDrivenMemoryRetriever(nn.Module):
             history_log_gate = self._compute_slot_log_gate(
                 query, history_latents, history_mask, None, record_data_dict,
                 history_shadow_mask, history_shadow_steps,
+                state_tokens=local_cond if self.state_as_dit_token else None,
+                state_mask=local_cond_mask if self.state_as_dit_token else None,
             )
             retrieved_history = self.history_cross_attn(
                 x=self.history_norm(query),
@@ -693,12 +709,18 @@ class MemoryTransformer(ConditionalTransformer):
         patch_merge: bool = False,
         patch_merge_size: int = 1,
         patch_merge_patch_token_num: int = 0,
+        state_as_dit_token: bool = False,
         **kwargs,
     ):
         # Old image-only checkpoints may still contain these retired settings.
         kwargs.pop("include_action_history", None)
         kwargs.pop("history_action_num_per_chunk", None)
         kwargs["name"] = "memory_transformer"
+
+        if not isinstance(state_as_dit_token, bool):
+            raise ValueError("state_as_dit_token must be boolean")
+        if state_as_dit_token and (compact_multiview_slot or state_conditioned_history_slot):
+            raise ValueError("state_as_dit_token requires plain image history slots")
 
         if not isinstance(patch_merge, bool):
             raise ValueError("patch_merge must be boolean")
@@ -729,6 +751,8 @@ class MemoryTransformer(ConditionalTransformer):
         super().__init__(**kwargs)
 
         self.patch_merge = patch_merge
+        # Missing in older checkpoints: retain their state-to-image route.
+        self.state_as_dit_token = state_as_dit_token
         self.binary_gating: bool = binary_gating
         self.skip_history_attn: bool = skip_history_attn
         self.memory_retrieval_mode = memory_retrieval_mode
@@ -793,6 +817,7 @@ class MemoryTransformer(ConditionalTransformer):
             slot_gate_hidden_dim=slot_gate_hidden_dim,
             slot_gate_bias_init=slot_gate_bias_init,
             shadow_gate_scale=shadow_gate_scale,
+            state_as_dit_token=state_as_dit_token,
         )
 
         self.blocks: nn.ModuleList = nn.ModuleList(
@@ -802,6 +827,7 @@ class MemoryTransformer(ConditionalTransformer):
                     head_num=self.head_num,
                     input_token_num=1
                     + self.action_token_num
+                    + (self.local_cond_token_num if state_as_dit_token else 0)
                     + (1 if add_memory_gate_token else 0),
                     add_additional_self_attn=add_additional_self_attn,
                 )
@@ -1236,7 +1262,7 @@ class MemoryTransformer(ConditionalTransformer):
     def _project_current_inputs(
         self, data_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """Keep current image/proprioception in the retrieval branch only."""
+        """Project tokens and route state to DiT or the legacy retrieval path."""
 
         local_cond_mask = data_dict.get("local_cond_mask")
         if self.patch_merge and "global_cond_mask" in data_dict:
@@ -1256,9 +1282,10 @@ class MemoryTransformer(ConditionalTransformer):
                     f"{x.shape[1]}"
                 )
             input_dict["local_cond"] = x[:, 1 : 1 + local_token_num]
-            input_dict["x"] = torch.cat(
-                [x[:, :1], x[:, 1 + local_token_num :]], dim=1
-            )
+            if not self.state_as_dit_token:
+                input_dict["x"] = torch.cat(
+                    [x[:, :1], x[:, 1 + local_token_num :]], dim=1
+                )
             if local_cond_mask is not None:
                 input_dict["local_cond_mask"] = local_cond_mask
 

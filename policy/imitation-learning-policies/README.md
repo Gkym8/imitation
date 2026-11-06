@@ -184,6 +184,21 @@ blend reduces to the current tokens. This fusion gate is distinct from the
 per-slot, per-head gate inside history attention, and both receive gradients
 from the action and future-prediction losses.
 
+New training uses `workspace.model.denoising_network_partial.state_as_dit_token: true`.
+The DiT input keeps `[diffusion step, state, actions]`: with one state token,
+16 action tokens and width 512 it has shape `[B, 18, 512]`. Every DiT layer
+updates the full sequence; the action head reads only the final 16 tokens.
+Current image tokens directly query the historical image slots, without first
+reading state. The slot-gate MLP separately receives normalized summaries of
+the historical slot, current image and current state (`3*512 -> 128 -> heads`
+at the default sizes). State therefore affects the history gates and the DiT
+actions without modifying the image query through state attention. The future
+predictor consumes the retrieved/fused image tokens, including the gated history.
+Current/history fusion, patch merging and Shadow decay retain their behavior.
+The state-to-image attention and feed-forward modules are absent in this mode.
+Older checkpoints without this setting retain the original state-to-image
+route and parameter layout; loading their saved configs still uses that route.
+
 Fusion parameters are saved and loaded as `perception_gate.proj.weight` and
 `perception_gate.proj.bias` under the memory retriever. Checkpoint loading is
 strict: checkpoints trained with the fusion layer removed do not contain these
