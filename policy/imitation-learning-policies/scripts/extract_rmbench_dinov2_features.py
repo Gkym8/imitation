@@ -47,6 +47,7 @@ if str(POLICY_ROOT) not in sys.path:
 
 from imitation_learning.common.dataclasses import DataMeta
 from imitation_learning.datasets.transforms import BaseTransforms
+from imitation_learning.models.encoders.image_encoders import load_pretrained_dinov2
 
 
 CAMERA_NAMES = ("head_camera", "left_camera", "right_camera")
@@ -144,11 +145,9 @@ class DinoV2FeatureExtractor:
         device: torch.device,
         feature_kind: str,
     ) -> None:
-        from transformers import AutoModel
-
         self.device = device
         self.input_size = input_size
-        self.model = AutoModel.from_pretrained(model_name)
+        self.model = load_pretrained_dinov2(model_name)
         self.model.requires_grad_(False)
         self.model.eval()
         self.model.to(device=device, dtype=torch.float32)

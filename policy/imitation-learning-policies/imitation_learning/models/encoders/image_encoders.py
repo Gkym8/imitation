@@ -10,6 +10,27 @@ from torch import nn
 from imitation_learning.common.dataclasses import DataMeta, construct_data_meta
 
 
+# Pin the DINO used by existing RMBench caches and checkpoints.
+DINOV2_PRETRAINED_REVISIONS = {
+    "facebook/dinov2-with-registers-base": "a1d738ccfa7ae170945f210395d99dde8adb1805",
+}
+
+
+def load_pretrained_dinov2(model_name: str) -> nn.Module:
+    """Use the fixed local snapshot first; download only on a cache miss."""
+    from transformers import AutoModel
+
+    kwargs = {}
+    revision = DINOV2_PRETRAINED_REVISIONS.get(model_name)
+    if revision is not None:
+        kwargs["revision"] = revision
+    try:
+        return AutoModel.from_pretrained(model_name, local_files_only=True, **kwargs)
+    except OSError:
+        # First-time use still downloads normally, with TLS verification on.
+        return AutoModel.from_pretrained(model_name, **kwargs)
+
+
 class BaseImageEncoder(nn.Module):
     def __init__(
         self,
@@ -546,9 +567,7 @@ class SharedModelManager(nn.Module):
 
                     model: nn.Module = SiglipVisionModel.from_pretrained(model_name)
                 elif "dinov2" in model_name.lower():
-                    from transformers import AutoModel
-
-                    model = AutoModel.from_pretrained(model_name)
+                    model = load_pretrained_dinov2(model_name)
                 else:
                     raise ValueError(f"Model {model_name} is not supported")
 
