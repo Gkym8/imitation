@@ -25,8 +25,8 @@ workspace:
     image_keys: [head_camera]
     # true: preserve the existing offline cached-feature training path.
     # false: load raw images and backpropagate through the current/history DINO.
-    use_cached_image_features: true
-    cached_image_feature_kind: ${cond:${eval:'${oc.select:visual_encoder.patch_merge,false} or ${oc.select:visual_encoder.state_query_merge,false}'},patches,auto}
+    use_cached_image_features: false
+    cached_image_feature_kind: ${cond:${oc.select:visual_encoder.state_query_merge,false},patches,${cond:${oc.select:visual_encoder.patch_merge,false},patches,auto}}
     cached_image_feature_dim: 768
     cached_image_feature_patch_token_num: 256
     cached_image_feature_model_name: ${visual_encoder.model_name}

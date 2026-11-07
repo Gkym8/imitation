@@ -289,6 +289,27 @@ class StateQueryMergePolicyTest(unittest.TestCase):
         for k, v in policy.compute_loss(self.helper.make_batch()).items():
             torch.testing.assert_close(v, expected[k], rtol=0, atol=0)
 
+    def test_training_workspace_resolves_embedded_saved_yaml(self):
+        # train_policy embeds the unresolved YAML in workspace before Hydra
+        # resolves it. YAML may wrap a quoted eval argument onto a second line;
+        # exercise that complete startup path, not only model instantiation.
+        for cached in (False, True):
+            for mlp, state_query in ((False, False), (True, False), (False, True)):
+                for mode in ('pooled', 'tokens'):
+                    with self.subTest(cached=cached, mlp=mlp, state_query=state_query, mode=mode):
+                        cfg = self.helper.make_config(mode=mode, cached=cached, merge_size=8)
+                        cfg.visual_encoder.patch_merge = mlp
+                        cfg.visual_encoder.state_query_merge = state_query
+                        cfg.run_name = 'workspace-config-roundtrip'
+                        cfg.project_name = cfg.logger_project_name = 'rmbench'
+                        cfg.train_server_name = 'localhost'
+                        cfg.workspace.cfg_str_unresolved = OmegaConf.to_yaml(cfg, resolve=False)
+                        OmegaConf.resolve(cfg)
+                        expected_size = 1 if mlp or state_query else 8
+                        self.assertEqual(cfg.workspace.model.global_cond_encoder.image_encoder_partial.spatial_merge_size, expected_size)
+                        self.assertEqual(cfg.workspace.model.history_img_feature_encoder.image_encoder_partial.spatial_merge_size, expected_size)
+                        self.assertEqual(cfg.workspace.train_dataset.cached_image_feature_kind, 'patches' if mlp or state_query else 'auto')
+
     def test_checkpoint_roundtrip_and_conflicting_flags(self):
         cfg = self.config(size=8)
         policy = self.helper.instantiate_policy(cfg)

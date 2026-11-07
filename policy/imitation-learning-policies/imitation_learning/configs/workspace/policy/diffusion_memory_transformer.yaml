@@ -13,12 +13,12 @@ use_cached_image_features: ${workspace.train_dataset.use_cached_image_features}
 skip_memory: false
 global_cond_encoder:
   image_encoder_partial:
-    spatial_merge_size: ${cond:${eval:'${oc.select:visual_encoder.patch_merge,false} or ${oc.select:visual_encoder.state_query_merge,false}'},1,${visual_encoder.spatial_merge_size}}
+    spatial_merge_size: ${cond:${oc.select:visual_encoder.state_query_merge,false},1,${cond:${oc.select:visual_encoder.patch_merge,false},1,${visual_encoder.spatial_merge_size}}}
 
 history_img_feature_encoder:
   image_encoder_partial:
     feature_aggregation: patches
-    spatial_merge_size: ${cond:${eval:'${oc.select:visual_encoder.patch_merge,false} or ${oc.select:visual_encoder.state_query_merge,false}'},1,${visual_encoder.spatial_merge_size}}
+    spatial_merge_size: ${cond:${oc.select:visual_encoder.state_query_merge,false},1,${cond:${oc.select:visual_encoder.patch_merge,false},1,${visual_encoder.spatial_merge_size}}}
     frozen: ${visual_encoder.frozen}
   name: history_img_feature_encoder
   data_entry_names: ${workspace.train_dataset.image_keys}
