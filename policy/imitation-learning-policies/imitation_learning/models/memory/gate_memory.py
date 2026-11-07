@@ -12,6 +12,7 @@ class MemorySlot:
     raw_features: torch.Tensor | None = None
     state: Literal["active", "shadow"] = "active"
     expire_at: int | None = None
+    raw_state: dict[str, torch.Tensor] | None = None
 
 
 class GateMemoryBank:
@@ -68,6 +69,7 @@ class GateMemoryBank:
         frame_index: int,
         gate_scores: torch.Tensor,
         raw_features: torch.Tensor | None = None,
+        raw_state: dict[str, torch.Tensor] | None = None,
     ) -> int | None:
         """Finish one valid read, expire Shadows, demote, and append.
 
@@ -114,7 +116,9 @@ class GateMemoryBank:
                 selected.expire_at = self.next_anchor_index + self.shadow_horizon
             else:
                 self.slots = [slot for slot in self.slots if slot is not selected]
-        self.slots.append(MemorySlot(self.next_slot_id, int(frame_index), latent, raw_features))
+        self.slots.append(MemorySlot(
+            self.next_slot_id, int(frame_index), latent, raw_features, raw_state=raw_state,
+        ))
         self.next_slot_id += 1
         self.next_anchor_index += 1
         return evicted_id
@@ -124,11 +128,23 @@ class GateMemoryBank:
             slot.latent = slot.latent.detach()
             if slot.raw_features is not None:
                 slot.raw_features = slot.raw_features.detach()
+            if slot.raw_state is not None:
+                slot.raw_state = {name: value.detach() for name, value in slot.raw_state.items()}
 
-    def reproject(self, projector: Callable[[torch.Tensor], torch.Tensor]):
+    def reproject(self, projector: Callable[..., torch.Tensor]):
         """Rebuild historical latents using the current chunk's parameters."""
         if self.slots and all(slot.raw_features is not None for slot in self.slots):
-            projected = projector(torch.stack([slot.raw_features for slot in self.slots]))
+            raw_features = torch.stack([slot.raw_features for slot in self.slots])
+            if any(slot.raw_state is not None for slot in self.slots):
+                if not all(slot.raw_state is not None for slot in self.slots):
+                    raise ValueError("state-conditioned history is missing an image's own state")
+                raw_state = {
+                    name: torch.stack([slot.raw_state[name] for slot in self.slots])
+                    for name in self.slots[0].raw_state
+                }
+                projected = projector(raw_features, raw_state)
+            else:
+                projected = projector(raw_features)
             for slot, latent in zip(self.slots, projected):
                 slot.latent = latent
 

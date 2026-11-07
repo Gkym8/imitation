@@ -266,8 +266,8 @@ class ConditionalTransformer(BaseDenoisingNetwork):
         if "noisy_traj_mask" in data_dict:
             x[data_dict["noisy_traj_mask"] == 0] = self.mask_token.type_as(x)
 
-        gc = self.global_cond_projector(
-            global_cond
+        gc = self._project_global_cond(
+            global_cond, local_cond, data_dict.get("local_cond_mask")
         )  # (batch, global_cond_token_num, hidden_dim)
 
         if local_cond is not None:
@@ -304,6 +304,9 @@ class ConditionalTransformer(BaseDenoisingNetwork):
             input_dict["global_cond_mask"] = data_dict["global_cond_mask"]
 
         return input_dict
+
+    def _project_global_cond(self, global_cond, local_cond=None, local_cond_mask=None):
+        return self.global_cond_projector(global_cond)
 
     def _run_blocks(self, input_dict: dict[str, torch.Tensor]):
         for i, block in enumerate(self.blocks):

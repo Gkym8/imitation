@@ -11,8 +11,9 @@ visual_encoder:
   pretrained: true
   frozen: true
   individual_forward: false
-  spatial_merge_size: 4 
+  spatial_merge_size: 8
   patch_merge: false
+  state_query_merge: true
 
 workspace:
   train_dataset: 
@@ -25,7 +26,7 @@ workspace:
     # true: preserve the existing offline cached-feature training path.
     # false: load raw images and backpropagate through the current/history DINO.
     use_cached_image_features: true
-    cached_image_feature_kind: ${cond:${visual_encoder.patch_merge},patches,auto}
+    cached_image_feature_kind: ${cond:${eval:'${oc.select:visual_encoder.patch_merge,false} or ${oc.select:visual_encoder.state_query_merge,false}'},patches,auto}
     cached_image_feature_dim: 768
     cached_image_feature_patch_token_num: 256
     cached_image_feature_model_name: ${visual_encoder.model_name}

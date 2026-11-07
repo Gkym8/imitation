@@ -144,6 +144,36 @@ latents. The frozen future CLS/patch targets retain their existing behavior.
 The new merger requires training a new model; disabling the flag, or loading
 an old checkpoint without it, retains the original weights and computation.
 
+Alternatively, use state-modulated learned queries to pool each local region:
+
+```yaml
+visual_encoder:
+  spatial_merge_size: 4
+  patch_merge: false
+  state_query_merge: true
+```
+
+The two learned merging modes are mutually exclusive; both default to false.
+With `state_query_merge`, current and history encoders keep all 256 DINO patch
+tokens per view until one shared trainable pooling module. Each local `m x m`
+region has one learned query, modulated by the frame's proprioception:
+`q_t,g = (1 + gamma(state_t)) * Q_g + beta(state_t)`. The final modulation
+layer starts at zero, so initial queries equal `Q_g`. Cross-attention uses only
+that region's image patches as keys/values, without adding the query back to
+the output. Views are handled independently; `m=4/8` produces `16/4` tokens
+per view at the DiT hidden width.
+
+These pooled current-image tokens query history and are also the current-image
+conditioning tokens read by every DiT layer. Historical slots use their own
+frame's state. Training banks retain detached full patches and normalized raw
+proprioception, and re-encode the retained states and re-pool the images with
+the latest parameters at every streaming chunk boundary, including Shadows.
+Inference stores only the resulting image tokens. Frozen DINO and existing
+full-patch caches remain usable; future CLS/patch targets retain their previous
+definition. The option is saved in checkpoints and requires training a matching
+new model. Missing/false flags preserve the original module and checkpoint
+layout.
+
 Current images, history images, and future supervision share one frozen DINO
 backbone in both cached and online modes. Online DINO forwards follow the
 caller's autocast: BF16 mixed precision during training and FP32 during the
