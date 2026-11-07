@@ -2,6 +2,7 @@ import copy
 
 import torch
 import torch.nn as nn
+from torch.nn.modules.batchnorm import _BatchNorm
 
 
 class EMAModel(nn.Module):
@@ -49,11 +50,11 @@ class EMAModel(nn.Module):
             for param, ema_param in zip(
                 module.parameters(recurse=False), ema_module.parameters(recurse=False)
             ):
-                if param.requires_grad:
-                    ema_param.mul_(decay).add_(param, alpha=1 - decay)
+                if isinstance(param, _BatchNorm):
+                    ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
+                elif isinstance(param, nn.Parameter):
+                    ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
                 else:
-                    # Frozen backbones must stay bitwise equal to the training
-                    # model, including when resuming an older EMA checkpoint.
-                    ema_param.copy_(param)
+                    ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
 
         self.optimization_step.add_(1)
