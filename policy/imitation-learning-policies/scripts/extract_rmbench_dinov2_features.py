@@ -18,8 +18,14 @@ and the 256 current/history patch tokens without another backbone forward.
 Preprocessing intentionally mirrors the RMBench training path: uint8 HWC
 images are converted to float32 CHW in [0, 1], resized with Kornia's
 ``Resize(..., antialias=True)``, normalized with ImageNet mean/std, and passed
-through the configured DINOv2 backbone.  For models with register tokens, the
-features exactly match ``SharedDinoV2ImageEncoder``.
+through the configured DINOv2 backbone. Token selection mirrors
+``SharedDinoV2ImageEncoder``, including removal of register tokens.
+
+``workspace.train_dataset.cached_image_feature_dtype`` in ``--config`` selects
+FP32 computation or BF16 autocast for the backbone. Preprocessing and model
+weights stay FP32, matching the online mixed-precision path. Arrays are always
+stored as float32 for NumPy/Zarr compatibility; metadata separately records the
+extraction precision. Casting BF16 values to float32 does not restore precision.
 
 Incomplete writes use a separate ``__incomplete`` array. Re-running the
 script resumes that array from its last completed batch; training therefore
@@ -38,6 +44,7 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 import zarr
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
 
@@ -46,6 +53,10 @@ if str(POLICY_ROOT) not in sys.path:
     sys.path.insert(0, str(POLICY_ROOT))
 
 from imitation_learning.common.dataclasses import DataMeta
+from imitation_learning.common.feature_cache import (
+    cached_feature_compute_dtype,
+    normalize_cached_image_feature_dtype,
+)
 from imitation_learning.datasets.transforms import BaseTransforms
 from imitation_learning.models.encoders.image_encoders import load_pretrained_dinov2
 
@@ -53,9 +64,10 @@ from imitation_learning.models.encoders.image_encoders import load_pretrained_di
 CAMERA_NAMES = ("head_camera", "left_camera", "right_camera")
 DEFAULT_MODEL_NAME = "facebook/dinov2-with-registers-base"
 DEFAULT_INPUT_SIZE = 224
+DEFAULT_CONFIG = POLICY_ROOT / "imitation_learning/configs/task/rmbench.yaml"
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-FEATURE_DTYPE = np.dtype(np.float32)
+FEATURE_STORAGE_DTYPE = np.dtype(np.float32)
 CLS_FEATURE_SUFFIX = "_feature"
 PATCH_FEATURE_SUFFIX = "_patch_feature"
 INCOMPLETE_SUFFIX = "__incomplete"
@@ -104,6 +116,7 @@ def _model_metadata(
     model_name: str,
     input_size: int,
     feature_kind: str,
+    feature_dtype: str = "float32",
 ) -> dict[str, Any]:
     config = model.config
     model_type = str(getattr(config, "model_type", ""))
@@ -130,7 +143,8 @@ def _model_metadata(
         "image_std": list(IMAGENET_STD),
         "feature_kind": feature_kind,
         "feature_dim": feature_dim,
-        "feature_dtype": FEATURE_DTYPE.name,
+        "feature_dtype": FEATURE_STORAGE_DTYPE.name,
+        "feature_compute_dtype": normalize_cached_image_feature_dtype(feature_dtype),
         "num_register_tokens": int(getattr(config, "num_register_tokens", 0)),
         "patch_size": patch_size,
         "patch_token_num": (input_size // patch_size) ** 2,
@@ -144,9 +158,12 @@ class DinoV2FeatureExtractor:
         input_size: int,
         device: torch.device,
         feature_kind: str,
+        feature_dtype: str = "float32",
     ) -> None:
         self.device = device
         self.input_size = input_size
+        self.feature_dtype = normalize_cached_image_feature_dtype(feature_dtype)
+        self.compute_dtype = getattr(torch, self.feature_dtype)
         self.model = load_pretrained_dinov2(model_name)
         self.model.requires_grad_(False)
         self.model.eval()
@@ -155,7 +172,7 @@ class DinoV2FeatureExtractor:
             raise ValueError(f"Unsupported feature kind: {feature_kind!r}")
         self.feature_kind = feature_kind
         self.metadata = _model_metadata(
-            self.model, model_name, input_size, feature_kind
+            self.model, model_name, input_size, feature_kind, self.feature_dtype
         )
         self.feature_dim = int(self.metadata["feature_dim"])
         resize_meta = DataMeta(
@@ -204,7 +221,12 @@ class DinoV2FeatureExtractor:
         tensor = tensor.div_(255.0)
         tensor = self.transforms.apply({"image": tensor})["image"]
         tensor = (tensor - self.mean) / self.std
-        output = self.model(pixel_values=tensor).last_hidden_state
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=self.compute_dtype,
+            enabled=self.compute_dtype != torch.float32,
+        ):
+            output = self.model(pixel_values=tensor).last_hidden_state
         expected_token_num = (
             1
             + int(self.metadata["num_register_tokens"])
@@ -238,18 +260,24 @@ class DinoV2FeatureExtractor:
         return features.float().cpu().numpy()
 
 
+def _metadata_value(attrs: Any, key: str) -> Any:
+    if key == "feature_compute_dtype":
+        return cached_feature_compute_dtype(attrs)
+    return attrs.get(key)
+
+
 def _metadata_matches(attrs: Any, expected: dict[str, Any]) -> bool:
     for key, expected_value in expected.items():
-        if attrs.get(key) != expected_value:
+        if _metadata_value(attrs, key) != expected_value:
             return False
     return True
 
 
 def _describe_mismatch(attrs: Any, expected: dict[str, Any]) -> str:
     differences = {
-        key: {"found": attrs.get(key), "expected": value}
+        key: {"found": _metadata_value(attrs, key), "expected": value}
         for key, value in expected.items()
-        if attrs.get(key) != value
+        if _metadata_value(attrs, key) != value
     }
     return json.dumps(differences, ensure_ascii=False, sort_keys=True)
 
@@ -273,7 +301,7 @@ def _prepare_incomplete_array(
         final_array = episode[final_name]
         final_valid = (
             final_array.shape == expected_shape
-            and np.dtype(final_array.dtype) == FEATURE_DTYPE
+            and np.dtype(final_array.dtype) == FEATURE_STORAGE_DTYPE
             and bool(final_array.attrs.get("complete", False))
             and _metadata_matches(final_array.attrs, metadata)
         )
@@ -294,7 +322,7 @@ def _prepare_incomplete_array(
         incomplete = episode[incomplete_name]
         valid = (
             incomplete.shape == expected_shape
-            and np.dtype(incomplete.dtype) == FEATURE_DTYPE
+            and np.dtype(incomplete.dtype) == FEATURE_STORAGE_DTYPE
             and _metadata_matches(incomplete.attrs, metadata)
         )
         if not valid:
@@ -316,7 +344,7 @@ def _prepare_incomplete_array(
         incomplete_name,
         shape=expected_shape,
         chunks=(min(feature_chunk_length, episode_length), *feature_shape),
-        dtype=FEATURE_DTYPE,
+        dtype=FEATURE_STORAGE_DTYPE,
         compressor=compressor,
         overwrite=False,
     )
@@ -354,6 +382,7 @@ def extract_dataset(
     device: torch.device,
     overwrite: bool,
     feature_kind: str,
+    feature_dtype: str = "float32",
 ) -> None:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -366,7 +395,7 @@ def extract_dataset(
     episode_names = _episode_names(root)
     cameras = tuple(cameras)
     extractor = DinoV2FeatureExtractor(
-        model_name, input_size, device, feature_kind
+        model_name, input_size, device, feature_kind, feature_dtype
     )
     if feature_kind == "cls":
         feature_shape = (extractor.feature_dim,)
@@ -388,6 +417,7 @@ def extract_dataset(
         f"Model: {model_name}\n"
         f"Device: {device}\n"
         f"Feature kind: {feature_kind}\n"
+        f"DINO compute dtype: {extractor.feature_dtype}\n"
         f"Output: float32 {list(feature_shape)}",
         flush=True,
     )
@@ -455,7 +485,7 @@ def extract_dataset(
     print("Feature extraction complete.", flush=True)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Add float32 DINOv2 CLS or CLS+patch features to an existing "
@@ -463,6 +493,21 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("dataset_path", type=Path)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help=(
+            "Read workspace.train_dataset.cached_image_feature_dtype from this "
+            "YAML (default: imitation_learning/configs/task/rmbench.yaml)."
+        ),
+    )
+    parser.add_argument(
+        "--cached-image-feature-dtype",
+        type=normalize_cached_image_feature_dtype,
+        default=None,
+        help="Override the configured DINO compute dtype: float32/fp32 or bfloat16/bf16.",
+    )
     parser.add_argument(
         "--cameras",
         type=_parse_cameras,
@@ -492,7 +537,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Recompute complete or incomplete feature arrays.",
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.cached_image_feature_dtype is None:
+        config = OmegaConf.load(args.config.expanduser())
+        args.cached_image_feature_dtype = normalize_cached_image_feature_dtype(
+            OmegaConf.select(
+                config, "workspace.train_dataset.cached_image_feature_dtype",
+                default="float32",
+            )
+        )
+    return args
 
 
 def main() -> None:
@@ -507,6 +561,7 @@ def main() -> None:
         device=_resolve_device(args.device),
         overwrite=args.overwrite,
         feature_kind=args.feature_kind,
+        feature_dtype=args.cached_image_feature_dtype,
     )
 
 

@@ -31,6 +31,8 @@ workspace:
     cached_image_feature_patch_token_num: 256
     cached_image_feature_model_name: ${visual_encoder.model_name}
     cached_image_feature_input_size: ${visual_encoder.input_size}
+    # DINO extraction compute dtype: float32/fp32 or bfloat16/bf16.
+    # Arrays stay float32; extraction precision is checked when loading caches.
     cached_image_feature_dtype: float32
     dataloader_cfg:
       batch_size: 8

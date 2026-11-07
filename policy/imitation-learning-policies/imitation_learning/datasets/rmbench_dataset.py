@@ -9,6 +9,10 @@ import numpy as np
 import zarr
 from omegaconf import OmegaConf
 
+from imitation_learning.common.feature_cache import (
+    cached_feature_compute_dtype,
+    normalize_cached_image_feature_dtype,
+)
 from imitation_learning.datasets.mujoco_dataset import (
     MujocoMultiTrajDataset,
     MujocoSingleTrajDataset,
@@ -145,12 +149,8 @@ def _validate_cached_feature_store(
     feature_kind: str,
     patch_token_num: int,
 ) -> None:
-    expected_dtype = np.dtype(feature_dtype)
-    if expected_dtype != np.dtype(np.float32):
-        raise ValueError(
-            "Only float32 RMBench feature caches are supported, got "
-            f"{expected_dtype}"
-        )
+    expected_compute_dtype = normalize_cached_image_feature_dtype(feature_dtype)
+    expected_dtype = np.dtype(np.float32)
 
     resolved_feature_kind = _resolve_cached_feature_kind(
         feature_kind, image_keys
@@ -173,13 +173,16 @@ def _validate_cached_feature_store(
         "feature_kind": resolved_feature_kind,
         "feature_dim": feature_dim,
         "feature_dtype": expected_dtype.name,
+        "feature_compute_dtype": expected_compute_dtype,
     }
     if resolved_feature_kind == "patches":
         expected_metadata["patch_token_num"] = patch_token_num
+    actual_metadata = dict(cache_metadata)
+    actual_metadata["feature_compute_dtype"] = cached_feature_compute_dtype(cache_metadata)
     mismatches = {
-        key: (cache_metadata.get(key), expected)
+        key: (actual_metadata.get(key), expected)
         for key, expected in expected_metadata.items()
-        if cache_metadata.get(key) != expected
+        if actual_metadata.get(key) != expected
     }
     cached_cameras = cache_metadata.get("camera_names", [])
     if not isinstance(cached_cameras, (list, tuple)) or not set(
@@ -231,6 +234,13 @@ def _validate_cached_feature_store(
                 raise RuntimeError(
                     f"{episode_name}/{feature_name} has dtype "
                     f"{features.dtype}, expected {expected_dtype}"
+                )
+            actual_compute_dtype = cached_feature_compute_dtype(features.attrs)
+            if actual_compute_dtype != expected_compute_dtype:
+                raise RuntimeError(
+                    f"{episode_name}/{feature_name} has compute dtype "
+                    f"{actual_compute_dtype}, expected {expected_compute_dtype}. "
+                    "Re-extract the cache with the configured precision."
                 )
             if not bool(features.attrs.get("complete", False)):
                 raise RuntimeError(
