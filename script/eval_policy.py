@@ -123,6 +123,8 @@ def main(usr_args):
 
     save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
     save_dir.mkdir(parents=True, exist_ok=True)
+    # Share the actual run directory with policy-side CSV recording.
+    usr_args["resolved_eval_output_dir"] = str(save_dir.resolve())
 
     log_file = save_dir / "eval_log.txt"
     args["log_file"] = str(log_file)
