@@ -22,8 +22,8 @@ class GateMemoryBankTest(unittest.TestCase):
     def test_eviction_respects_protection_and_keeps_features_aligned(self):
         bank = GateMemoryBank(5, keep_first=True, keep_recent=2)
         self.fill(bank)
-        # The first and most recent slots have the lowest gates, but both are
-        # protected. Slot 2 is the minimum among the eligible slots.
+        # The first and newest two existing slots are protected. Slot 2 is
+        # the minimum among the eligible slots.
         removed = bank.append(torch.full((2, 3), 5.0), 50, torch.tensor([0.01, 0.8, 0.2, 0.4, 0.001]))
         self.assertEqual(removed, 2)
         self.assertEqual([slot.slot_id for slot in bank.slots], [0, 1, 3, 4, 5])
@@ -42,10 +42,12 @@ class GateMemoryBankTest(unittest.TestCase):
         self.assertEqual([slot.slot_id for slot in bank.slots], [1, 2, 4])
 
     def test_invalid_protection_is_rejected_without_overriding_it(self):
-        with self.assertRaisesRegex(ValueError, "eviction candidate"):
-            GateMemoryBank(3, keep_first=True, keep_recent=3)
+        for capacity, keep_first, keep_recent in ((3, True, 2), (3, True, 3), (3, False, 3), (8, True, 7), (8, False, 8)):
+            with self.subTest(capacity=capacity, keep_first=keep_first, keep_recent=keep_recent):
+                with self.assertRaisesRegex(ValueError, "eviction candidate"):
+                    GateMemoryBank(capacity, keep_first=keep_first, keep_recent=keep_recent)
 
-    def test_keep_recent_two_includes_incoming_slot_with_and_without_shadow(self):
+    def test_keep_recent_two_protects_existing_six_and_seven_with_and_without_shadow(self):
         for horizon in (0, 4):
             with self.subTest(shadow_horizon=horizon):
                 bank = GateMemoryBank(8, keep_first=True, keep_recent=2, shadow_horizon=horizon)
@@ -54,35 +56,45 @@ class GateMemoryBankTest(unittest.TestCase):
                     torch.full((2, 3), 8.0), 80,
                     torch.tensor([0.0, 0.8, 0.7, 0.6, 0.5, 0.4, 0.01, 0.0]),
                 )
-                # Slot 7 is protected despite its lower gate. Slot 6 is not:
-                # the two recent slots after insertion are 7 and 8.
-                self.assertEqual(removed, 6)
+                # Existing slots 6 and 7 are protected despite their lower
+                # gates. Incoming 8 always enters, so it does not consume K.
+                self.assertEqual(removed, 5)
                 self.assertEqual(
                     [s.slot_id for s in bank.slots if s.state == "active"],
-                    [0, 1, 2, 3, 4, 5, 7, 8],
+                    [0, 1, 2, 3, 4, 6, 7, 8],
                 )
                 scores = torch.tensor([
-                    0.0 if s.slot_id in (0, 6, 8) else 0.01 if s.slot_id == 7 else 0.5
+                    0.0 if s.slot_id in (0, 5, 7, 8) else 0.01 if s.slot_id == 6 else 0.5
                     for s in bank.slots
                 ])
-                # Next insertion protects 8 and 9, so 7 can now be demoted.
-                self.assertEqual(bank.append(torch.full((2, 3), 9.0), 90, scores), 7)
+                # Next insertion protects existing 7 and 8. Slot 6 is now
+                # eligible; a Shadow with a smaller gate is not a candidate.
+                self.assertEqual(bank.append(torch.full((2, 3), 9.0), 90, scores), 6)
                 self.assertEqual(
                     [s.slot_id for s in bank.slots if s.state == "active"],
-                    [0, 1, 2, 3, 4, 5, 8, 9],
+                    [0, 1, 2, 3, 4, 7, 8, 9],
                 )
                 self.assertEqual(
                     [s.slot_id for s in bank.slots if s.state == "shadow"],
-                    [6, 7] if horizon else [],
+                    [5, 6] if horizon else [],
                 )
 
-    def test_recent_protection_boundary_counts_incoming_slot(self):
-        for keep_first, keep_recent, evicted in ((True, 2, 1), (False, 3, 0)):
+    def test_recent_protection_boundary_counts_existing_slots_only(self):
+        for capacity, keep_first, keep_recent, evicted in ((4, True, 2, 1), (3, False, 2, 0)):
             with self.subTest(keep_first=keep_first, keep_recent=keep_recent):
-                bank = GateMemoryBank(3, keep_first=keep_first, keep_recent=keep_recent)
+                bank = GateMemoryBank(capacity, keep_first=keep_first, keep_recent=keep_recent)
                 self.fill(bank)
-                self.assertEqual(bank.append(torch.ones(2, 3), 30, torch.zeros(3)), evicted)
-                self.assertEqual(bank.active_count, 3)
+                self.assertEqual(bank.append(torch.ones(2, 3), 10 * capacity, torch.zeros(capacity)), evicted)
+                self.assertEqual(bank.active_count, capacity)
+
+    def test_zero_one_two_and_three_recent_slots_are_protected(self):
+        for keep_recent, evicted in ((0, 7), (1, 6), (2, 5), (3, 4)):
+            with self.subTest(keep_recent=keep_recent):
+                bank = GateMemoryBank(8, keep_first=True, keep_recent=keep_recent)
+                self.fill(bank)
+                scores = torch.tensor([0.0, 0.9, 0.8, 0.7, 0.04, 0.03, 0.02, 0.01])
+                self.assertEqual(bank.append(torch.ones(2, 3), 80, scores), evicted)
+                self.assertIn(8, [slot.slot_id for slot in bank.slots])
 
     def test_detached_features_reproject_with_current_parameters(self):
         bank = GateMemoryBank(2, keep_first=False, keep_recent=0)

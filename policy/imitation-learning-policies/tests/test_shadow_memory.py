@@ -65,8 +65,8 @@ class ShadowMemoryBankTest(unittest.TestCase):
         for _ in range(4):
             self.append(bank)
         self.assertEqual(self.append(bank, torch.tensor([0.0, 0.1, 0.9, 0.0])), 1)
-        # Slot 1 is already Shadow. Slot 0 and newest Active slot 4 remain
-        # protected, even though all three have lower scores than slot 2.
+        # Slot 1 is already Shadow. Slot 0 and newest Active slots 3 and 4
+        # remain protected, so only Active slot 2 is eligible.
         self.assertEqual(self.append(bank, torch.tensor([0.0, 0.0, 0.2, 0.8, 0.0])), 2)
         self.assertEqual([s.slot_id for s in bank.slots if s.state == "shadow"], [1, 2])
         self.assertEqual(bank.active_count, 4)

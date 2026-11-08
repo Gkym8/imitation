@@ -239,13 +239,16 @@ Training and inference share one chronological memory bank with `active` and
 `shadow` slot states. After reading history, a full Active bank demotes the
 eligible Active slot with the lowest mean raw gate over heads, then inserts
 the current observation as Active. Ties demote the oldest eligible slot.
-The original first slot and the newest two Active slots after insertion are
-protected by default. `keep_recent` includes the incoming slot, so before
-insertion only the newest `max(keep_recent - 1, 0)` existing Active slots are
-protected. For a full bank containing slots 0 through 7 and an incoming slot 8,
-`keep_recent: 2` protects 7 and 8; slot 6 is an eviction candidate. The incoming
-slot is written only after the current read, in both training and inference.
-Protection must leave at least one existing eviction candidate.
+The original first slot and the newest two existing Active slots are protected
+by default. `keep_recent` counts only history already retained before insertion;
+the incoming slot always enters afterwards and is not included in that count.
+For a full bank containing slots 0 through 7 and an incoming slot 8,
+`keep_recent: 2` protects 6 and 7 (plus slot 0 when `keep_first: true`). Slot 8
+is written only after the current read and eviction decision, in both training
+and inference. On the following insertion, the newest existing Active slots
+are 7 and 8. Shadow slots do not count toward recent Active protection.
+Protection must leave at least one existing eviction candidate:
+`int(keep_first) + keep_recent < max_history_len`.
 
 ```yaml
 workspace:

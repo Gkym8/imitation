@@ -21,8 +21,8 @@ class GateMemoryBank:
     A full Active bank demotes an existing slot before inserting the new one.
     Shadows remain readable for the next ``shadow_horizon`` valid anchors.
     The original first slot and the newest Active slots can be protected.
-    ``keep_recent`` counts the incoming slot: protect max(K-1, 0) existing
-    Active predecessors before demotion, then insert the new slot.
+    ``keep_recent`` protects the newest K existing Active slots before
+    demotion. The incoming slot is inserted afterwards and is not counted.
     Scores are transient outputs of the current read, never persistent weights.
     """
 
@@ -36,7 +36,7 @@ class GateMemoryBank:
             raise ValueError("keep_first must be boolean")
         if isinstance(keep_recent, bool) or not isinstance(keep_recent, int) or keep_recent < 0:
             raise ValueError("keep_recent must be a non-negative integer")
-        if int(keep_first) + max(keep_recent - 1, 0) >= capacity:
+        if int(keep_first) + keep_recent >= capacity:
             raise ValueError("memory protection must leave at least one eviction candidate")
         if isinstance(shadow_horizon, bool) or not isinstance(shadow_horizon, int) or shadow_horizon < 0:
             raise ValueError("shadow_horizon must be a non-negative integer")
@@ -85,10 +85,9 @@ class GateMemoryBank:
             if not torch.isfinite(gate_scores).all():
                 raise ValueError("eviction gate scores must be finite")
             active_indices = [i for i, slot in enumerate(self.slots) if slot.state == "active"]
-            # The incoming slot is always inserted after this read and counts
-            # toward keep_recent. K=2 protects the newest existing Active slot
-            # plus the incoming slot, rather than two old slots plus the new one.
-            existing_recent_count = max(self.keep_recent - 1, 0)
+            # Protect existing history only: for slots 0..7 and incoming 8,
+            # K=2 protects 6 and 7. Slot 8 enters after this eviction decision.
+            existing_recent_count = self.keep_recent
             protected_recent = (
                 set(active_indices[-existing_recent_count:])
                 if existing_recent_count else set()
