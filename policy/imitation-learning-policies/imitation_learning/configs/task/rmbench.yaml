@@ -11,13 +11,13 @@ visual_encoder:
   pretrained: true
   frozen: true
   individual_forward: false
-  spatial_merge_size: 8
+  spatial_merge_size: [8,4]
   patch_merge: false
   state_query_merge: true
 
 workspace:
   train_dataset: 
-    name: rmbench
+    name: rmbench 
     robot_num: 2
     repeat_dataset_num: 1
     starting_percentile_max: 1.0

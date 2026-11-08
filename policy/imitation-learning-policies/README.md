@@ -125,6 +125,26 @@ cache for either mode; raw-image training and online inference use the same
 encoder settings. The mode is saved in checkpoints. Existing checkpoints
 without this setting retain their original pooling and target shapes.
 
+`spatial_merge_size` accepts an integer (square regions, as before) or
+`[height, width]` in DINO patch units. For a `16 x 16` patch grid,
+`[4, 8]` produces a `4 x 2` output grid and `[8, 4]` produces a `2 x 4`
+output grid: both give 8 tokens per view. Both dimensions must divide 16.
+This applies to spatial averaging, MLP merging and state-query merging,
+including cached features and online images. In future `tokens` mode, targets
+use the same rectangular average regions; pooled CLS targets stay unchanged.
+For example, to use 8 state-query tokens per view:
+
+```yaml
+visual_encoder:
+  spatial_merge_size: [4, 8]
+  patch_merge: false
+  state_query_merge: true
+```
+
+Existing integer configurations and checkpoint layouts are preserved. Changing
+the token grid changes token-dependent parameters, so train a model with the
+selected grid instead of editing the config of an existing checkpoint.
+
 Select learnable current/history patch merging in the same task YAML:
 
 ```yaml
@@ -155,7 +175,7 @@ visual_encoder:
 
 The two learned merging modes are mutually exclusive; both default to false.
 With `state_query_merge`, current and history encoders keep all 256 DINO patch
-tokens per view until one shared trainable pooling module. Each local `m x m`
+tokens per view until one shared trainable pooling module. Each local spatial
 region has one learned query, modulated by the frame's proprioception:
 `q_t,g = (1 + gamma(state_t)) * Q_g + beta(state_t)`. The final modulation
 layer starts at zero, so initial queries equal `Q_g`. Cross-attention uses only

@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from timm.models.vision_transformer import RmsNorm
 
+from imitation_learning.models.common.spatial_merge import SpatialMergeSize, spatial_merge_shape
 from imitation_learning.models.denoising_networks.modules import CrossAttention
 
 
@@ -19,18 +20,19 @@ class StateQueryPatchMerger(nn.Module):
 
     def __init__(
         self, input_dim: int, hidden_dim: int, patch_token_num: int,
-        merge_size: int, head_num: int,
+        merge_size: SpatialMergeSize, head_num: int,
     ):
         super().__init__()
         for name, value in (
             ("input_dim", input_dim), ("hidden_dim", hidden_dim),
-            ("patch_token_num", patch_token_num), ("merge_size", merge_size),
+            ("patch_token_num", patch_token_num),
             ("head_num", head_num),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         grid = isqrt(patch_token_num)
-        if grid * grid != patch_token_num or grid % merge_size:
+        merge_height, merge_width = spatial_merge_shape(merge_size, "merge_size")
+        if grid * grid != patch_token_num or grid % merge_height or grid % merge_width:
             raise ValueError("state_query_merge requires a square patch grid divisible by merge_size")
         if hidden_dim % head_num:
             raise ValueError("state_query_merge hidden_dim must be divisible by head_num")
@@ -38,8 +40,10 @@ class StateQueryPatchMerger(nn.Module):
         self.hidden_dim = hidden_dim
         self.patch_token_num = patch_token_num
         self.grid = grid
-        self.merge_size = merge_size
-        self.output_token_num = patch_token_num // merge_size**2
+        self.merge_size = merge_size if isinstance(merge_size, int) else (merge_height, merge_width)
+        self.merge_height, self.merge_width = merge_height, merge_width
+        self.merge_area = merge_height * merge_width
+        self.output_token_num = patch_token_num // self.merge_area
         self.query_tokens = nn.Parameter(torch.empty(self.output_token_num, hidden_dim))
         nn.init.normal_(self.query_tokens, std=0.02)
         self.state_modulation = nn.Sequential(
@@ -61,14 +65,14 @@ class StateQueryPatchMerger(nn.Module):
         if token_num <= 0 or token_num % self.patch_token_num:
             raise ValueError("state_query_merge input must contain complete per-view patch grids")
         views = token_num // self.patch_token_num
-        side = self.grid // self.merge_size
+        rows, columns = self.grid // self.merge_height, self.grid // self.merge_width
         grouped = patches.reshape(
-            *patches.shape[:-2], views, side, self.merge_size,
-            side, self.merge_size, dim,
+            *patches.shape[:-2], views, rows, self.merge_height,
+            columns, self.merge_width, dim,
         ).transpose(-4, -3)
         return grouped.reshape(
             *patches.shape[:-2], views * self.output_token_num,
-            self.merge_size**2, dim,
+            self.merge_area, dim,
         )
 
     def merge_mask(self, mask: torch.Tensor) -> torch.Tensor:
@@ -103,6 +107,6 @@ class StateQueryPatchMerger(nn.Module):
         queries = (1 + gamma[..., None, :]) * queries + beta[..., None, :]
         output = self.attention(
             queries.reshape(-1, 1, self.hidden_dim),
-            regions.reshape(-1, self.merge_size**2, self.hidden_dim),
+            regions.reshape(-1, self.merge_area, self.hidden_dim),
         )
         return output.reshape(*patches.shape[:-2], region_num, self.hidden_dim)

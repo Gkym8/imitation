@@ -8,6 +8,7 @@ from omegaconf import DictConfig
 from torch import nn
 
 from imitation_learning.common.dataclasses import DataMeta, construct_data_meta
+from imitation_learning.models.common.spatial_merge import SpatialMergeSize, spatial_merge_shape
 
 
 # Pin the DINO used by existing RMBench caches and checkpoints.
@@ -876,7 +877,7 @@ class SharedDinoV2ImageEncoder(BaseImageEncoder):
         apply_image_norm: bool,
         resize_size: int | tuple[int, int] | list[int] = 224,
         individual_forward: bool = False,
-        spatial_merge_size: int = 1,
+        spatial_merge_size: SpatialMergeSize = 1,
         shared_model_key: str | None = None,
         **kwargs,
     ):
@@ -890,13 +891,11 @@ class SharedDinoV2ImageEncoder(BaseImageEncoder):
         self.feature_aggregation = feature_aggregation
         self.apply_image_norm = apply_image_norm
         self.individual_forward = individual_forward
-        if (
-            isinstance(spatial_merge_size, bool)
-            or not isinstance(spatial_merge_size, int)
-            or spatial_merge_size <= 0
-        ):
-            raise ValueError("spatial_merge_size must be a positive integer")
-        self.spatial_merge_size = spatial_merge_size
+        merge_height, merge_width = spatial_merge_shape(spatial_merge_size)
+        self.spatial_merge_size = (
+            spatial_merge_size if isinstance(spatial_merge_size, int) else (merge_height, merge_width)
+        )
+        self.merge_height, self.merge_width = merge_height, merge_width
         self.shared_model_key = shared_model_key or self.model_name
 
         if isinstance(resize_size, int):
@@ -944,13 +943,13 @@ class SharedDinoV2ImageEncoder(BaseImageEncoder):
                 "DINOv2 spatial patch grid must be square for spatial merging, "
                 f"got {self.patch_token_num} patches"
             )
-        if patch_grid % self.spatial_merge_size != 0:
+        if patch_grid % merge_height or patch_grid % merge_width:
             raise ValueError(
                 "spatial_merge_size must divide the DINOv2 patch grid, got "
                 f"grid={patch_grid}, spatial_merge_size={self.spatial_merge_size}"
             )
         self.token_num = (
-            self.patch_token_num // self.spatial_merge_size**2
+            self.patch_token_num // (merge_height * merge_width)
             if feature_aggregation == "patches"
             else 1
         )
@@ -1000,12 +999,12 @@ class SharedDinoV2ImageEncoder(BaseImageEncoder):
         return raw_tokens[:, :1, :]
 
     def merge_spatial_patches(self, patches: torch.Tensor) -> torch.Tensor:
-        """Average each spatial ``size x size`` patch block.
+        """Average each spatial ``merge_height x merge_width`` patch block.
 
         The cached RMBench features retain the original 256 spatial tokens, so
         this helper is also used by ``MultiTokenEncoder`` when it reads a
         cache.  The feature width stays unchanged while the token count is
-        reduced by ``spatial_merge_size**2``.
+        reduced by the local region's patch area.
         """
 
         if patches.shape[-2] != self.patch_token_num:
@@ -1013,22 +1012,22 @@ class SharedDinoV2ImageEncoder(BaseImageEncoder):
                 "DINOv2 patch tensor has an unexpected token count: expected "
                 f"{self.patch_token_num}, got {patches.shape[-2]}"
             )
-        size = self.spatial_merge_size
-        if size == 1:
+        merge_height, merge_width = self.merge_height, self.merge_width
+        if merge_height == merge_width == 1:
             return patches
         grid = int(sqrt(self.patch_token_num))
         patches = patches.reshape(
             *patches.shape[:-2],
-            grid // size,
-            size,
-            grid // size,
-            size,
+            grid // merge_height,
+            merge_height,
+            grid // merge_width,
+            merge_width,
             patches.shape[-1],
         )
         patches = patches.mean(dim=(-4, -2))
         return patches.reshape(
             *patches.shape[:-3],
-            (grid // size) ** 2,
+            (grid // merge_height) * (grid // merge_width),
             patches.shape[-1],
         )
 

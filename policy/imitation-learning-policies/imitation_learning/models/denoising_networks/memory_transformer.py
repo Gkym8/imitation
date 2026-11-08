@@ -8,6 +8,7 @@ from timm.models.vision_transformer import Attention, Mlp, RmsNorm
 
 from imitation_learning.models.common.modules import Projector
 from imitation_learning.models.common.patch_merger import SpatialPatchMerger
+from imitation_learning.models.common.spatial_merge import SpatialMergeSize, spatial_merge_shape
 from imitation_learning.models.common.state_query_merger import StateQueryPatchMerger
 from imitation_learning.models.common.slot_gate import ObservationConditionedSlotGate
 from imitation_learning.models.common.pos_embeddings import (
@@ -708,7 +709,7 @@ class MemoryTransformer(ConditionalTransformer):
         slot_gate_hidden_dim: int = 128,
         slot_gate_bias_init: float = 0.0,
         patch_merge: bool = False,
-        patch_merge_size: int = 1,
+        patch_merge_size: SpatialMergeSize = 1,
         patch_merge_patch_token_num: int = 0,
         state_as_dit_token: bool = False,
         state_query_merge: bool = False,
@@ -735,16 +736,12 @@ class MemoryTransformer(ConditionalTransformer):
         if patch_merge or state_query_merge:
             if compact_multiview_slot or state_conditioned_history_slot:
                 raise ValueError("patch_merge requires plain perception patch slots")
-            if (
-                isinstance(patch_merge_size, bool)
-                or not isinstance(patch_merge_size, int)
-                or patch_merge_size <= 0
-                or patch_merge_patch_token_num <= 0
-            ):
+            merge_height, merge_width = spatial_merge_shape(patch_merge_size, "patch_merge_size")
+            if patch_merge_patch_token_num <= 0:
                 raise ValueError("patch_merge requires positive merge size and DINO patch count")
             if kwargs["global_cond_dim"] != history_img_features_dim:
                 raise ValueError("patch_merge requires matching current/history feature widths")
-            factor = patch_merge_size**2
+            factor = merge_height * merge_width
             for token_num in (kwargs["global_cond_token_num"], history_img_features_token_num):
                 if token_num <= 0 or token_num % patch_merge_patch_token_num:
                     raise ValueError("patch_merge requires complete current/history DINO patch grids")
