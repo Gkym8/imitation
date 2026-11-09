@@ -4,6 +4,7 @@
 # policy_name: ???
 # task_name: ???
 # task_yaml_name: ??? # Optional; defaults to task_name.
+# task_yaml_fallback: ??? # train.sh uses rmbench; task YAML overrides its defaults.
 
 # project_name: ???
 # logger_project_name: ???

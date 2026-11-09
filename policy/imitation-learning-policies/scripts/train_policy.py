@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf, ListConfig
 
-from imitation_learning.utils.config_utils import compose_hydra_config
+from imitation_learning.utils.config_utils import compose_training_config
 from robot_utils.config_utils import register_resolvers
 from robot_utils.torch_utils import torch_load, is_main_process
 from imitation_learning.workspaces.base_workspace import BaseWorkspace
@@ -25,18 +25,7 @@ def main(cfg: DictConfig):
     np.set_printoptions(precision=4, suppress=True, threshold=np.inf)
     base_ckpt = None
     
-    # Most experiments use the same name for the task and its task YAML. An
-    # adapter such as RMBench can share one generic YAML across many concrete
-    # benchmark tasks while preserving the concrete task name in logging and
-    # output-directory interpolations.
-    task_yaml_name = cfg.get("task_yaml_name", cfg["task_name"])
-    base_cfg = compose_hydra_config(task_yaml_name, cfg["policy_name"])
-    OmegaConf.set_struct(base_cfg, False)
-    base_cfg["task_yaml_name"] = task_yaml_name
-    OmegaConf.set_struct(base_cfg, True)
-
-    # Apply overrides
-    cfg = cast(DictConfig, OmegaConf.merge(base_cfg, cfg))  # Apply overrides
+    cfg = compose_training_config(cfg)
 
     if (
         "base_ckpt_path" in cfg

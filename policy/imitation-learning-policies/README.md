@@ -98,6 +98,38 @@ For regular training, the config overriding order is (from lowest to highest):
 
 ### Simulation
 
+RMBench training with `train.sh` first looks for
+`imitation_learning/configs/task/<TASK_NAME>.yaml`. Settings in that file override
+`task/rmbench.yaml`; every setting omitted by the task file keeps the RMBench
+default. If the task file does not exist, all settings come from `rmbench.yaml`.
+The task file can contain only the differences. Like the existing Mikasa task
+files, it can declare inheritance with `defaults`; the RMBench launcher also
+supplies these defaults when that block is omitted. For example,
+`task/rearrange_blocks.yaml`:
+
+```yaml
+defaults:
+  - rmbench
+  - _self_
+
+visual_encoder:
+  spatial_merge_size: [4, 8]
+
+workspace:
+  model:
+    denoising_network_partial:
+      shadow_gate_scale: 0.1
+  trainer:
+    num_epochs: 401
+```
+
+Launch commands stay the same. The second `train.sh` argument (for example,
+`demo_clean`) still selects the demonstration dataset configuration. Command-line
+overrides retain the highest priority. Training prints the selected task YAML
+and saves the merged settings and YAML name in the checkpoint. Missing files
+fall back; syntax errors or broken defaults in an existing file are reported.
+Explicit `+task_yaml_name=...` in direct Python launches still selects that file.
+
 For RMBench, select future prediction in
 `imitation_learning/configs/task/rmbench.yaml`:
 
