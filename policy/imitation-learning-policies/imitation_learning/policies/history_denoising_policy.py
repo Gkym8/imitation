@@ -831,7 +831,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             frame = self.next_frame_index_dict.get(episode, 0)
             bank.append(
                 current_latents[i].detach(), frame, gate_scores[i],
-                raw_features=(None if network.patch_merge or network.state_query_merge else raw_features[i].detach()),
+                raw_features=(None if network.patch_merge or network.state_query_merge or network.learned_query_merge else raw_features[i].detach()),
             )
             self.next_frame_index_dict[episode] = frame + self.execution_chunk_length
         return self.action_decoder(data_dict["noisy_action"])

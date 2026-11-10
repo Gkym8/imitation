@@ -161,17 +161,35 @@ without this setting retain their original pooling and target shapes.
 `[height, width]` in DINO patch units. For a `16 x 16` patch grid,
 `[4, 8]` produces a `4 x 2` output grid and `[8, 4]` produces a `2 x 4`
 output grid: both give 8 tokens per view. Both dimensions must divide 16.
-This applies to spatial averaging, MLP merging and state-query merging,
+This applies to spatial averaging, MLP merging and both query pooling modes,
 including cached features and online images. In future `tokens` mode, targets
 use the same rectangular average regions; pooled CLS targets stay unchanged.
-For example, to use 8 state-query tokens per view:
+The RMBench default uses 8 learned-query MAP tokens per view:
 
 ```yaml
 visual_encoder:
-  spatial_merge_size: [4, 8]
+  spatial_merge_size: [8, 4]
   patch_merge: false
-  state_query_merge: true
+  state_query_merge: false
+  learned_query_merge: true
 ```
+
+Each region has one learned query shared across views and time, with no
+robot-state modulation. The existing image LayerNorm/linear adapter maps DINO
+features to the policy width; the region then uses the SigLIP MAP structure:
+`h = MultiheadAttention(Q, X_region, X_region)` and
+`output = h + MLP(LayerNorm(h))`. The MLP expands to four times the width and
+uses GELU with the tanh approximation. The raw query is not added back, and
+Q/K do not have the additional RMSNorm used by the older SQM implementation.
+For `[8, 4]`, each query reads only its own 32 patches. Current/history images
+share the pooling module; streaming training retains detached full patches
+and re-pools them at chunk boundaries. Online banks retain pooled tokens.
+Future CLS/patch targets are independent of this trainable pooling head.
+
+The three learned merging modes are mutually exclusive. Disable all three
+flags to use regional averaging. New learned-query pooling needs a new
+training run; checkpoints without `learned_query_merge` retain their original
+mean/MLP/SQM modules and state-dict layouts.
 
 Existing integer configurations and checkpoint layouts are preserved. Changing
 the token grid changes token-dependent parameters, so train a model with the
@@ -182,7 +200,9 @@ Select learnable current/history patch merging in the same task YAML:
 ```yaml
 visual_encoder:
   spatial_merge_size: 8
-  patch_merge: true  # false (default): retain spatial averaging
+  learned_query_merge: false
+  state_query_merge: false
+  patch_merge: true
 ```
 
 With `patch_merge: true`, frozen DINO features keep all 256 patches until
@@ -201,11 +221,11 @@ Alternatively, use state-modulated learned queries to pool each local region:
 ```yaml
 visual_encoder:
   spatial_merge_size: 4
+  learned_query_merge: false
   patch_merge: false
   state_query_merge: true
 ```
 
-The two learned merging modes are mutually exclusive; both default to false.
 With `state_query_merge`, current and history encoders keep all 256 DINO patch
 tokens per view until one shared trainable pooling module. Each local spatial
 region has one learned query, modulated by the frame's proprioception:
