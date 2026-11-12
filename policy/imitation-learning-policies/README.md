@@ -161,38 +161,64 @@ without this setting retain their original pooling and target shapes.
 `[height, width]` in DINO patch units. For a `16 x 16` patch grid,
 `[4, 8]` produces a `4 x 2` output grid and `[8, 4]` produces a `2 x 4`
 output grid: both give 8 tokens per view. Both dimensions must divide 16.
-This applies to spatial averaging, MLP merging and both query pooling modes,
+This applies to spatial averaging, MLP merging and state-query regional pooling,
 including cached features and online images. In future `tokens` mode, targets
 use the same rectangular average regions; pooled CLS targets stay unchanged.
 The RMBench default uses 8 learned-query MAP tokens per view:
 
 ```yaml
 visual_encoder:
-  spatial_merge_size: [8, 4]
+  spatial_merge_size: [4, 8]
   patch_merge: false
   state_query_merge: false
-  learned_query_merge: true
+  learned_query_merge: 8
 ```
 
-Each region has one learned query shared across views and time, with no
-robot-state modulation. The existing image LayerNorm/linear adapter maps DINO
-features to the policy width; the region then uses the SigLIP MAP structure:
-`h = MultiheadAttention(Q, X_region, X_region)` and
+`learned_query_merge` is the number of global learned queries per view: `8`
+maps all 256 DINO patches to 8 tokens; `16` maps them to 16 tokens. Every query
+reads the full image, and cameras are processed independently. Query parameters
+are shared across views and time. The initial learned queries have no
+robot-state modulation.
+`spatial_merge_size` does not control these current/history token counts; it
+continues to control spatial averaging, regional mergers and future patch
+targets. The existing image LayerNorm/linear adapter maps DINO features to the
+policy width; pooling then uses the SigLIP MAP structure:
+`h = MultiheadAttention(Q, X_view, X_view)` and
 `output = h + MLP(LayerNorm(h))`. The MLP expands to four times the width and
 uses GELU with the tanh approximation. The raw query is not added back, and
 Q/K do not have the additional RMSNorm used by the older SQM implementation.
-For `[8, 4]`, each query reads only its own 32 patches. Current/history images
-share the pooling module; streaming training retains detached full patches
-and re-pools them at chunk boundaries. Online banks retain pooled tokens.
+For positive integer `learned_query_merge`, the MAP result `R` then reads the
+same frame's projected robot-state tokens `S`, using the supplied equation:
+`F = LayerNorm(softmax((R W_Q)(S W_K)^T / sqrt(hidden_dim)) (S W_V) + R)`.
+This is a single attention matrix with bias-free Q/K/V projections, followed
+by the visual residual and LayerNorm; it has no extra output projection or MLP.
+It is always enabled in numeric learned-query mode and adds no configuration.
+The output remains N visual tokens per view. All views read the same frame's
+state, while their image MAP pooling remains independent. With the current
+single `agent_pos` state token, the state softmax is 1: every visual token
+receives the same state value before its own visual residual and LayerNorm.
+Masked state tokens are excluded; entirely masked states contribute zero.
+Current/history images share this entire module. Streaming training retains
+detached full patches and each frame's normalized raw state, then re-encodes
+that state and re-pools the image at chunk boundaries. Online banks retain the
+resulting fused tokens.
 Future CLS/patch targets are independent of this trainable pooling head.
 
-The three learned merging modes are mutually exclusive. Disable all three
-flags to use regional averaging. New learned-query pooling needs a new
-training run; checkpoints without `learned_query_merge` retain their original
-mean/MLP/SQM modules and state-dict layouts.
+The three learned merging modes are mutually exclusive. Set
+`learned_query_merge: 0`, `patch_merge: false` and `state_query_merge: false`
+to use regional averaging (`false` remains accepted for compatibility).
+Old saved `learned_query_merge: true` configurations retain their original
+one-query-per-region computation and checkpoint layout. Positive integers
+select global MAP plus the state read, including integer `1`, which is distinct
+from boolean `true`. Numeric checkpoints trained before the state read lack
+its parameters and require a new training run; they are not silently loaded
+with randomly initialized state-read weights.
+Checkpoints without `learned_query_merge` retain their original mean/MLP/SQM
+modules. Switching from regional to global MAP requires a new training run;
+editing an old checkpoint's config changes its behavior even if shapes match.
 
-Existing integer configurations and checkpoint layouts are preserved. Changing
-the token grid changes token-dependent parameters, so train a model with the
+Existing integer `spatial_merge_size` configurations retain their meaning.
+Changing the token grid changes token-dependent parameters, so train a model with the
 selected grid instead of editing the config of an existing checkpoint.
 
 Select learnable current/history patch merging in the same task YAML:
@@ -200,7 +226,7 @@ Select learnable current/history patch merging in the same task YAML:
 ```yaml
 visual_encoder:
   spatial_merge_size: 8
-  learned_query_merge: false
+  learned_query_merge: 0
   state_query_merge: false
   patch_merge: true
 ```
@@ -221,7 +247,7 @@ Alternatively, use state-modulated learned queries to pool each local region:
 ```yaml
 visual_encoder:
   spatial_merge_size: 4
-  learned_query_merge: false
+  learned_query_merge: 0
   patch_merge: false
   state_query_merge: true
 ```

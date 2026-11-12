@@ -14,7 +14,7 @@ visual_encoder:
   spatial_merge_size: [4,8]
   patch_merge: false
   state_query_merge: false
-  learned_query_merge: false
+  learned_query_merge: 8  # global MAP queries per view; 0 disables learned pooling
 
 workspace:
   train_dataset: 

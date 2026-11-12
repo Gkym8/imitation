@@ -166,7 +166,7 @@ class LearnedQueryMergePolicyTest(unittest.TestCase):
                                     for slot in policy.online_memory_banks[0].slots))
                 del policy
 
-    def test_current_and_history_share_state_independent_pooling(self):
+    def test_current_and_history_share_pooling_and_frame_state(self):
         cfg = self.config(cached=False)
         policy = self.helper.instantiate_policy(cfg)
         batch = self.batch(cfg)
@@ -178,12 +178,17 @@ class LearnedQueryMergePolicyTest(unittest.TestCase):
         states = torch.randn(1, 3, 1, 8)
         current = network._project_global_cond(raw, states)
         changed_state = network._project_global_cond(raw, states + 10)
-        history = network.project_history_image_features(cached)
-        torch.testing.assert_close(current, changed_state, rtol=0, atol=0)
+        history = network.project_history_image_features(cached, states)
+        if network.image_merge_requires_state:
+            self.assertGreater(float((current - changed_state).abs().max()), 1e-5)
+            with self.assertRaisesRegex(ValueError, 'own state'):
+                network.project_history_image_features(cached)
+        else:
+            torch.testing.assert_close(current, changed_state, rtol=0, atol=0)
         torch.testing.assert_close(current, history, rtol=0, atol=0)
         self.assertFalse(any('state_modulation' in k or 'history_img_features_projector.' in k for k in policy.state_dict()))
 
-    def test_streaming_reprojects_retained_patches_and_shadows_without_states(self):
+    def test_streaming_reprojects_retained_patches_shadows_and_frame_states(self):
         cfg = self.config()
         cfg.workspace.model.denoising_network_partial.max_history_len = 3
         cfg.workspace.model.denoising_network_partial.shadow_horizon = 2
@@ -200,14 +205,19 @@ class LearnedQueryMergePolicyTest(unittest.TestCase):
             self.assertTrue(any(slot.state == 'shadow' for slot in bank.slots))
             for slot in bank.slots:
                 self.assertEqual(slot.raw_features.shape, (256, 8))
-                self.assertIsNone(slot.raw_state)
+                if policy.denoising_network.image_merge_requires_state:
+                    torch.testing.assert_close(slot.raw_state['agent_pos'], batch['agent_pos'][0, slot.frame_index // 10], rtol=0, atol=0)
+                    self.assertFalse(slot.raw_state['agent_pos'].requires_grad)
+                else:
+                    self.assertIsNone(slot.raw_state)
                 self.assertFalse(slot.raw_features.requires_grad)
             policy.zero_grad(set_to_none=True)
             if start == 0:
                 before = bank.slots[0].latent.clone()
                 with torch.no_grad():
-                    policy.denoising_network.global_cond_projector.mlp[2].bias.add_(0.25)
-                bank.reproject(policy.denoising_network.project_history_image_features)
+                    policy.denoising_network.global_cond_projector.mlp[2].bias[0].add_(0.25)
+                bank.reproject(policy._reproject_state_query_history if policy.denoising_network.image_merge_requires_state
+                               else policy.denoising_network.project_history_image_features)
                 self.assertGreater(float((bank.slots[0].latent - before).abs().max()), 0)
                 sum(slot.latent.square().mean() for slot in bank.slots).backward()
                 self.assertGreater(float(policy.denoising_network.global_cond_projector.query_tokens.grad.abs().sum()), 0)
@@ -218,12 +228,13 @@ class LearnedQueryMergePolicyTest(unittest.TestCase):
         cfg = self.config()
         policy = self.helper.instantiate_policy(cfg)
         images = torch.randn(2, 256, 8)
-        expected = policy.denoising_network.project_history_image_features(images).detach()
+        states = torch.randn(2, 1, 8)
+        expected = policy.denoising_network.project_history_image_features(images, states).detach()
         state = {k:v.detach().clone() for k,v in policy.state_dict().items()}
         del policy
         restored = self.helper.instantiate_policy(cfg)
         restored.load_state_dict(state, strict=True)
-        torch.testing.assert_close(restored.denoising_network.project_history_image_features(images), expected, rtol=0, atol=0)
+        torch.testing.assert_close(restored.denoising_network.project_history_image_features(images, states), expected, rtol=0, atol=0)
         del restored
         for mode in ('mean', 'patch', 'state_query'):
             cfg = self.helper.make_config(merge_size=8)

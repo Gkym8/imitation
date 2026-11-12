@@ -6,7 +6,7 @@ workspace:
   train_dataset:
     image_keys: [head_camera]
     dataloader_cfg:
-      batch_size: 16
+      batch_size: 8
   model:
     denoising_network_partial:
       max_history_len: 8
@@ -14,4 +14,4 @@ workspace:
   trainer:
     num_epochs: 301
     checkpoint_every: 50
-    future_prediction_loss_weight: 0.05
+    future_prediction_loss_weight: 0

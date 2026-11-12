@@ -738,7 +738,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
     def _reproject_state_query_history(self, raw_features, raw_state):
         # Re-encode the retained frame's normalized proprioception with the
-        # latest state encoder as well as the latest query modulation weights.
+        # latest state encoder and state-dependent image merger weights.
         state_features = self.local_cond_encoder(raw_state)
         return self.denoising_network.project_history_image_features(
             raw_features, state_features, raw_state.get("_state_query_mask"),
@@ -772,8 +772,8 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         retrieval_inputs = network.prepare_single_memory_retrieval(data_dict)
         current_latents = self._current_slot_latents(
             raw_features, retrieval_inputs,
-            data_dict.get("local_cond") if network.state_query_merge else None,
-            data_dict.get("local_cond_mask") if network.state_query_merge else None,
+            data_dict.get("local_cond") if network.image_merge_requires_state else None,
+            data_dict.get("local_cond_mask") if network.image_merge_requires_state else None,
         )
         retrieval_inputs.update(self._pack_history(banks, current_latents))
         if self.memory_gate is not None:
@@ -851,7 +851,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         if can_reproject:
             for bank in banks:
                 bank.reproject(
-                    self._reproject_state_query_history if network.state_query_merge
+                    self._reproject_state_query_history if network.image_merge_requires_state
                     else network.project_history_image_features
                 )
         for anchor in range(supervised):
@@ -942,7 +942,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         data_dict["_streaming_training"] = True
         projected = self.denoising_network.prepare_parallel_forward(data_dict)
         raw_state = None
-        if self.denoising_network.state_query_merge:
+        if self.denoising_network.image_merge_requires_state:
             raw_state = {name: batch[name] for name in self.local_cond_encoder.data_entry_names}
             if "local_cond_mask" in data_dict:
                 raw_state["_state_query_mask"] = data_dict["local_cond_mask"]

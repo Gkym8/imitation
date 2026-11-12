@@ -102,6 +102,7 @@ workspace:
     def test_false_zero_and_list_values_replace_defaults(self):
         self.task('''visual_encoder:
   state_query_merge: false
+  learned_query_merge: 0
 workspace:
   train_dataset:
     image_keys: [left_camera, right_camera]
@@ -111,6 +112,7 @@ workspace:
 ''')
         cfg = compose_training_config(self.launch())
         self.assertFalse(cfg.visual_encoder.state_query_merge)
+        self.assertEqual(cfg.visual_encoder.learned_query_merge, 0)
         self.assertEqual(cfg.workspace.model.denoising_network_partial.shadow_horizon, 0)
         self.assertEqual(list(cfg.workspace.train_dataset.image_keys), ['left_camera', 'right_camera'])
         self.assertEqual(cfg.workspace.model.global_cond_encoder.image_encoder_partial.spatial_merge_size,
