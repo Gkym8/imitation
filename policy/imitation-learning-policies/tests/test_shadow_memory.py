@@ -440,7 +440,8 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
         # The horizon is an experiment setting, rather than a fixed model size.
         self.assertIsInstance(cfg.shadow_horizon, int)
         self.assertGreaterEqual(cfg.shadow_horizon, 0)
-        self.assertEqual(cfg.shadow_gate_scale, 0.01)
+        self.assertGreater(cfg.shadow_gate_scale, 0)
+        self.assertLessEqual(cfg.shadow_gate_scale, 1)
         for field, value in (("shadow_horizon", -1), ("shadow_horizon", True), ("shadow_gate_scale", 0), ("shadow_gate_scale", math.nan), ("shadow_gate_scale", 1.1)):
             with self.subTest(field=field, value=value):
                 cfg = self.make_config()

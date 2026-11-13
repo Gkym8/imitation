@@ -223,6 +223,22 @@ $$
 - **Soft Memory Retrieval**：控制某条历史记忆在不同 Attention Head 中被读取的程度；
 - **Hard Eviction Decision**：汇总多个 Head 的重要性评分，决定哪条历史记忆优先退出 Active Bank。
 
+### 5.1.1 基于相邻历史帧冗余的综合重要性
+
+在 Gate 汇总分数的基础上，进一步考虑 Active Memory Bank 中相邻历史帧之间的信息冗余。对于按时间顺序排列的第 i 条历史记忆，定义其加权冗余度为：
+
+$$R_i=0.5\left(sim(f_i,f_{i-1})G_{i-1}+sim(f_i,f_{i+1})G_{i+1}\right)$$
+
+其中，$f_i$ 表示第 i 条历史帧的视觉特征，$sim(f_i,f_j)$ 表示两条历史帧特征之间的相似度，$G_i$ 为第 5.1 节定义的多头 Gate 汇总分数。该冗余度仅在 Active Memory Bank 内计算，用相邻历史帧的相似程度及其 Gate 分数衡量当前帧的信息是否已被邻近记忆覆盖。对于位于 Bank 首尾的帧，仅使用实际存在的相邻帧，并按实际邻居数量取平均。
+
+结合自身 Gate 重要性与加权冗余度，定义历史帧的综合重要性：
+
+$$ \boxed{I_i^{total}=G_i+\alpha(1-R_i)}. $$
+
+其中，$\alpha$ 控制冗余度对记忆保留的影响。综合重要性越高，表示该历史帧越值得保留；当需要淘汰记忆时，在允许淘汰的 Active Slots 中选择综合重要性最低的历史帧：
+
+$$ i^*=\arg\min_{i\in\mathcal M_t^{\text{active}}}I_i^{total}. $$
+
 ### 5.2 Shadow Memory 与低权重读取
 
 传统的 Hard Eviction 在选中某条历史记忆后立即删除，使这条记忆无法再参与之后的 Policy Learning 和 Future Prediction。

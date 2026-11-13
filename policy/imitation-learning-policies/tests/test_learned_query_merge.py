@@ -131,7 +131,6 @@ class LearnedQueryMergePolicyTest(unittest.TestCase):
                 network = policy.denoising_network
                 count = views * per_view
                 self.assertTrue(network.learned_query_merge)
-                self.assertFalse(network.state_query_merge)
                 self.assertEqual(policy.global_cond_encoder.token_num, 256 * views)
                 self.assertEqual(network.global_cond_token_num, count)
                 self.assertEqual(network.history_img_features_token_num, count)
@@ -178,13 +177,8 @@ class LearnedQueryMergePolicyTest(unittest.TestCase):
         states = torch.randn(1, 3, 1, 8)
         current = network._project_global_cond(raw, states)
         changed_state = network._project_global_cond(raw, states + 10)
-        history = network.project_history_image_features(cached, states)
-        if network.image_merge_requires_state:
-            self.assertGreater(float((current - changed_state).abs().max()), 1e-5)
-            with self.assertRaisesRegex(ValueError, 'own state'):
-                network.project_history_image_features(cached)
-        else:
-            torch.testing.assert_close(current, changed_state, rtol=0, atol=0)
+        history = network.project_history_image_features(cached)
+        torch.testing.assert_close(current, changed_state, rtol=0, atol=0)
         torch.testing.assert_close(current, history, rtol=0, atol=0)
         self.assertFalse(any('state_modulation' in k or 'history_img_features_projector.' in k for k in policy.state_dict()))
 
@@ -205,61 +199,39 @@ class LearnedQueryMergePolicyTest(unittest.TestCase):
             self.assertTrue(any(slot.state == 'shadow' for slot in bank.slots))
             for slot in bank.slots:
                 self.assertEqual(slot.raw_features.shape, (256, 8))
-                if policy.denoising_network.image_merge_requires_state:
-                    torch.testing.assert_close(slot.raw_state['agent_pos'], batch['agent_pos'][0, slot.frame_index // 10], rtol=0, atol=0)
-                    self.assertFalse(slot.raw_state['agent_pos'].requires_grad)
-                else:
-                    self.assertIsNone(slot.raw_state)
+                self.assertIsNone(slot.raw_state)
                 self.assertFalse(slot.raw_features.requires_grad)
             policy.zero_grad(set_to_none=True)
             if start == 0:
                 before = bank.slots[0].latent.clone()
                 with torch.no_grad():
                     policy.denoising_network.global_cond_projector.mlp[2].bias[0].add_(0.25)
-                bank.reproject(policy._reproject_state_query_history if policy.denoising_network.image_merge_requires_state
-                               else policy.denoising_network.project_history_image_features)
+                bank.reproject(policy.denoising_network.project_history_image_features)
                 self.assertGreater(float((bank.slots[0].latent - before).abs().max()), 0)
                 sum(slot.latent.square().mean() for slot in bank.slots).backward()
                 self.assertGreater(float(policy.denoising_network.global_cond_projector.query_tokens.grad.abs().sum()), 0)
                 bank.detach()
                 policy.zero_grad(set_to_none=True)
 
-    def test_checkpoint_roundtrip_and_old_modes_without_flag(self):
+    def test_checkpoint_roundtrip(self):
         cfg = self.config()
         policy = self.helper.instantiate_policy(cfg)
-        images = torch.randn(2, 256, 8)
-        states = torch.randn(2, 1, 8)
-        expected = policy.denoising_network.project_history_image_features(images, states).detach()
-        state = {k:v.detach().clone() for k,v in policy.state_dict().items()}
+        state = copy.deepcopy(policy.state_dict())
+        batch = self.batch(cfg)
+        torch.manual_seed(1234)
+        expected = policy.compute_loss(batch)
         del policy
         restored = self.helper.instantiate_policy(cfg)
         restored.load_state_dict(state, strict=True)
-        torch.testing.assert_close(restored.denoising_network.project_history_image_features(images, states), expected, rtol=0, atol=0)
-        del restored
-        for mode in ('mean', 'patch', 'state_query'):
-            cfg = self.helper.make_config(merge_size=8)
-            cfg.visual_encoder.patch_merge = mode == 'patch'
-            cfg.visual_encoder.state_query_merge = mode == 'state_query'
-            policy = self.helper.instantiate_policy(cfg)
-            state = {k:v.detach().clone() for k,v in policy.state_dict().items()}
-            del policy
-            legacy = copy.deepcopy(cfg)
-            with open_dict(legacy.visual_encoder):
-                del legacy.visual_encoder.learned_query_merge
-            with open_dict(legacy.workspace.model.denoising_network_partial):
-                del legacy.workspace.model.denoising_network_partial.learned_query_merge
-            restored = self.helper.instantiate_policy(legacy)
-            self.assertFalse(restored.denoising_network.learned_query_merge)
-            restored.load_state_dict(state, strict=True)
-            for key, value in restored.state_dict().items():
-                torch.testing.assert_close(value, state[key], rtol=0, atol=0)
-            del restored
+        torch.manual_seed(1234)
+        for name, value in restored.compute_loss(batch).items():
+            torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
 
-    def test_merger_flags_are_mutually_exclusive(self):
-        for other in ('patch_merge', 'state_query_merge'):
+    def test_rejects_integer_query_counts(self):
+        for value in (0, 1, 16):
             cfg = self.config()
-            cfg.visual_encoder[other] = True
-            with self.assertRaisesRegex(Exception, 'mutually exclusive'):
+            cfg.visual_encoder.learned_query_merge = value
+            with self.assertRaisesRegex(Exception, 'must be boolean'):
                 self.helper.instantiate_policy(cfg)
 
 

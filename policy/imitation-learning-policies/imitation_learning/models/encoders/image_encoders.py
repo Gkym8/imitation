@@ -879,6 +879,7 @@ class SharedDinoV2ImageEncoder(BaseImageEncoder):
         individual_forward: bool = False,
         spatial_merge_size: SpatialMergeSize = 1,
         shared_model_key: str | None = None,
+        cls_token: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -888,6 +889,9 @@ class SharedDinoV2ImageEncoder(BaseImageEncoder):
                 "DINOv2 feature_aggregation must be 'patches', 'map', or "
                 f"'cls', got {feature_aggregation!r}"
             )
+        if not isinstance(cls_token, bool):
+            raise ValueError("cls_token must be boolean")
+        self.cls_token = cls_token
         self.feature_aggregation = feature_aggregation
         self.apply_image_norm = apply_image_norm
         self.individual_forward = individual_forward
@@ -949,7 +953,7 @@ class SharedDinoV2ImageEncoder(BaseImageEncoder):
                 f"grid={patch_grid}, spatial_merge_size={self.spatial_merge_size}"
             )
         self.token_num = (
-            self.patch_token_num // (merge_height * merge_width)
+            self.patch_token_num // (merge_height * merge_width) + int(cls_token)
             if feature_aggregation == "patches"
             else 1
         )
@@ -995,7 +999,10 @@ class SharedDinoV2ImageEncoder(BaseImageEncoder):
             )
         if self.feature_aggregation == "patches":
             patches = raw_tokens[:, 1 + self.num_register_tokens :, :]
-            return self.merge_spatial_patches(patches)
+            patches = self.merge_spatial_patches(patches)
+            if self.cls_token:
+                patches = torch.cat([patches, raw_tokens[:, :1, :]], dim=-2)
+            return patches
         return raw_tokens[:, :1, :]
 
     def merge_spatial_patches(self, patches: torch.Tensor) -> torch.Tensor:

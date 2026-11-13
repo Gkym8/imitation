@@ -25,7 +25,7 @@ class StateDiTTokensTest(unittest.TestCase):
 
     def config(self, mode='pooled', merge=False):
         cfg = self.helper.make_config(mode, cached=True, merge_size=8)
-        cfg.visual_encoder.patch_merge = merge
+        cfg.visual_encoder.learned_query_merge = merge
         network = cfg.workspace.model.denoising_network_partial
         network.state_as_dit_token = True
         network.max_history_len = 4

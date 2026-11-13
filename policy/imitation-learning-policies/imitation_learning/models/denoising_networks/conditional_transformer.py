@@ -86,6 +86,8 @@ class ConditionalTransformer(BaseDenoisingNetwork):
         hidden_dim: int,
         projector_type: str,
         global_cond_pos_emb_type: str="2d",
+        global_cond_grid_shape: tuple[int, int] | None = None,
+        global_cond_cls_token: bool = False,
         **kwargs,
     ):
         if "name" not in kwargs:
@@ -99,6 +101,8 @@ class ConditionalTransformer(BaseDenoisingNetwork):
 
         assert global_cond_pos_emb_type in ["1d", "2d"], f"global_cond_pos_emb_type must be 1d or 2d, but got {global_cond_pos_emb_type}"
         self.global_cond_pos_emb_type: str = global_cond_pos_emb_type
+        self.global_cond_grid_shape = global_cond_grid_shape
+        self.global_cond_cls_token = global_cond_cls_token
 
         self.mask_token: nn.Parameter = nn.Parameter(
             torch.randn(1, 1, hidden_dim) * 0.02
@@ -172,7 +176,22 @@ class ConditionalTransformer(BaseDenoisingNetwork):
             torch.from_numpy(input_pos_embedding).unsqueeze(0)
         )
 
-        if self.global_cond_pos_emb_type == "2d":
+        if self.global_cond_pos_emb_type == "2d" and self.global_cond_cls_token:
+            # Spatial positions belong to local image tokens, not the appended
+            # global CLS. Each view keeps [spatial grid, zero-position CLS].
+            if self.global_cond_grid_shape is None:
+                raise ValueError("CLS image positions require a spatial grid shape")
+            height, width = self.global_cond_grid_shape
+            per_view = height * width + 1
+            if self.global_cond_token_num % per_view:
+                raise ValueError("Image token count must match per-view spatial grid plus CLS")
+            views = self.global_cond_token_num // per_view
+            patches = get_nd_sincos_pos_embed_from_grid(
+                grid_sizes=(views, height, width), embed_dim=self.hidden_dim,
+            ).reshape(views, height * width, self.hidden_dim)
+            cls = np.zeros((views, 1, self.hidden_dim), dtype=patches.dtype)
+            global_cond_pos_embedding = np.concatenate([patches, cls], axis=1)
+        elif self.global_cond_pos_emb_type == "2d":
             for i in range(1, 10):  
                 image_size = np.sqrt(self.global_cond_token_num // i)
                 print(f"image_size: {image_size}")

@@ -52,10 +52,9 @@ class FuturePredictionModeTest(unittest.TestCase):
         with hydra.initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
             cfg = compose_hydra_config("rmbench", "diffusion_memory_transformer")
         cfg.device = "cpu"
+        cfg.visual_encoder.frozen = True
         cfg.visual_encoder.spatial_merge_size = merge_size
         # Tests choose merger modes explicitly, independently of task defaults.
-        cfg.visual_encoder.patch_merge = False
-        cfg.visual_encoder.state_query_merge = False
         cfg.visual_encoder.learned_query_merge = False
         cfg.workspace.train_dataset.use_cached_image_features = cached
         model = cfg.workspace.model

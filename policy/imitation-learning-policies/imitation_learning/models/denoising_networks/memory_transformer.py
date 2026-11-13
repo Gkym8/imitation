@@ -7,9 +7,7 @@ import torch.nn as nn
 from timm.models.vision_transformer import Attention, Mlp, RmsNorm
 
 from imitation_learning.models.common.modules import Projector
-from imitation_learning.models.common.patch_merger import SpatialPatchMerger
 from imitation_learning.models.common.spatial_merge import SpatialMergeSize, spatial_merge_shape
-from imitation_learning.models.common.state_query_merger import StateQueryPatchMerger
 from imitation_learning.models.common.learned_query_merger import LearnedQueryPatchMerger
 from imitation_learning.models.common.slot_gate import ObservationConditionedSlotGate
 from imitation_learning.models.common.pos_embeddings import (
@@ -211,7 +209,7 @@ class ObservationDrivenMemoryRetriever(nn.Module):
                 head_num=head_num,
                 hidden_dim=slot_gate_hidden_dim,
                 bias_init=slot_gate_bias_init,
-                use_state_condition=state_as_dit_token,
+                use_state_condition=self.state_as_dit_token,
             )
             if use_conditioned_slot_gate
             else None
@@ -266,7 +264,7 @@ class ObservationDrivenMemoryRetriever(nn.Module):
         # perception-module parameters.  These modules exist only when the new
         # retrieval mode is explicitly selected by configuration.
         if retrieval_mode == "perception_patches":
-            if not state_as_dit_token:
+            if not self.state_as_dit_token:
                 self.state_condition_norm = RmsNorm(hidden_dim, eps=1e-6)
                 self.state_condition_attn = CrossAttention(
                     dim=hidden_dim,
@@ -709,12 +707,11 @@ class MemoryTransformer(ConditionalTransformer):
         use_conditioned_slot_gate: bool = False,
         slot_gate_hidden_dim: int = 128,
         slot_gate_bias_init: float = 0.0,
-        patch_merge: bool = False,
-        patch_merge_size: SpatialMergeSize = 1,
-        patch_merge_patch_token_num: int = 0,
+        spatial_merge_size: SpatialMergeSize = 1,
+        image_patch_token_num: int = 0,
         state_as_dit_token: bool = False,
-        state_query_merge: bool = False,
-        learned_query_merge: int | bool = 0,
+        learned_query_merge: bool = False,
+        cls_token: bool = False,
         **kwargs,
     ):
         # Old image-only checkpoints may still contain these retired settings.
@@ -727,61 +724,43 @@ class MemoryTransformer(ConditionalTransformer):
         if state_as_dit_token and (compact_multiview_slot or state_conditioned_history_slot):
             raise ValueError("state_as_dit_token requires plain image history slots")
 
-        if not isinstance(patch_merge, bool):
-            raise ValueError("patch_merge must be boolean")
-        if not isinstance(state_query_merge, bool):
-            raise ValueError("state_query_merge must be boolean")
-        if patch_merge and state_query_merge:
-            raise ValueError("patch_merge and state_query_merge are mutually exclusive")
-        # Boolean True is the regional MAP mode saved by older checkpoints;
-        # positive integers are the new number of global queries per view.
-        if isinstance(learned_query_merge, bool):
-            global_query_num = 0
-        elif isinstance(learned_query_merge, int) and learned_query_merge >= 0:
-            global_query_num = learned_query_merge
-        else:
-            raise ValueError("learned_query_merge must be a non-negative integer (or legacy boolean)")
-        if learned_query_merge and (patch_merge or state_query_merge):
-            raise ValueError("learned_query_merge, patch_merge and state_query_merge are mutually exclusive")
-        if state_query_merge and kwargs.get("local_cond_token_num", 0) <= 0:
-            raise ValueError("state_query_merge requires robot state tokens")
-        if global_query_num and kwargs.get("local_cond_token_num", 0) <= 0:
-            raise ValueError("learned_query_merge requires robot state tokens")
-        if patch_merge or state_query_merge or learned_query_merge:
+        if not isinstance(cls_token, bool):
+            raise ValueError("cls_token must be boolean")
+        if not isinstance(learned_query_merge, bool):
+            raise ValueError("learned_query_merge must be boolean")
+        if learned_query_merge:
             if compact_multiview_slot or state_conditioned_history_slot:
-                raise ValueError("patch_merge requires plain perception patch slots")
-            if patch_merge_patch_token_num <= 0:
-                raise ValueError("patch_merge requires positive merge size and DINO patch count")
+                raise ValueError("learned_query_merge requires plain perception patch slots")
+            if image_patch_token_num <= 0:
+                raise ValueError("learned_query_merge requires a positive image patch count")
             if kwargs["global_cond_dim"] != history_img_features_dim:
-                raise ValueError("patch_merge requires matching current/history feature widths")
+                raise ValueError("learned_query_merge requires matching current/history feature widths")
+            height, width = spatial_merge_shape(spatial_merge_size)
+            grid = math.isqrt(image_patch_token_num)
+            if grid * grid != image_patch_token_num or grid % height or grid % width:
+                raise ValueError("spatial_merge_size must divide the image patch grid")
+            input_per_view = image_patch_token_num + int(cls_token)
+            output_per_view = image_patch_token_num // (height * width) + int(cls_token)
             for token_num in (kwargs["global_cond_token_num"], history_img_features_token_num):
-                if token_num <= 0 or token_num % patch_merge_patch_token_num:
-                    raise ValueError("patch_merge requires complete current/history DINO patch grids")
-            if global_query_num:
-                kwargs["global_cond_token_num"] = (
-                    kwargs["global_cond_token_num"] // patch_merge_patch_token_num * global_query_num
-                )
-                history_img_features_token_num = (
-                    history_img_features_token_num // patch_merge_patch_token_num * global_query_num
-                )
-            else:
-                merge_height, merge_width = spatial_merge_shape(patch_merge_size, "patch_merge_size")
-                factor = merge_height * merge_width
-                for token_num in (kwargs["global_cond_token_num"], history_img_features_token_num):
-                    if token_num % factor:
-                        raise ValueError("patch_merge_size must divide the DINO patch grid")
-                kwargs["global_cond_token_num"] //= factor
-                history_img_features_token_num //= factor
+                if token_num <= 0 or token_num % input_per_view:
+                    raise ValueError("learned_query_merge requires complete per-view patch grids")
+            kwargs["global_cond_token_num"] = kwargs["global_cond_token_num"] // input_per_view * output_per_view
+            history_img_features_token_num = history_img_features_token_num // input_per_view * output_per_view
+
+        if cls_token:
+            height, width = spatial_merge_shape(spatial_merge_size)
+            grid = math.isqrt(image_patch_token_num)
+            if grid * grid != image_patch_token_num or not grid or grid % height or grid % width:
+                raise ValueError("CLS image tokens require a valid spatial patch grid")
+            kwargs["global_cond_grid_shape"] = (grid // height, grid // width)
+            kwargs["global_cond_cls_token"] = True
 
         if compact_multiview_slot:
             kwargs["global_cond_pos_emb_type"] = "none"
 
         super().__init__(**kwargs)
 
-        self.patch_merge = patch_merge
-        self.state_query_merge = state_query_merge
         self.learned_query_merge = learned_query_merge
-        self.image_merge_requires_state = state_query_merge or bool(global_query_num)
         # Missing in older checkpoints: retain their state-to-image route.
         self.state_as_dit_token = state_as_dit_token
         self.binary_gating: bool = binary_gating
@@ -909,21 +888,7 @@ class MemoryTransformer(ConditionalTransformer):
             if learned_query_merge:
                 self.global_cond_projector = LearnedQueryPatchMerger(
                     self.global_cond_dim, self.hidden_dim,
-                    patch_merge_patch_token_num, patch_merge_size, self.head_num,
-                    num_queries=global_query_num or None,
-                )
-            elif state_query_merge:
-                self.global_cond_projector = StateQueryPatchMerger(
-                    self.global_cond_dim, self.hidden_dim,
-                    patch_merge_patch_token_num, patch_merge_size, self.head_num,
-                )
-            elif patch_merge:
-                # Register one merger under the current-image projector. All
-                # history projection calls reuse it without a second alias in
-                # the state dict or a second set of trainable parameters.
-                self.global_cond_projector = SpatialPatchMerger(
-                    self.global_cond_dim, self.hidden_dim,
-                    patch_merge_patch_token_num, patch_merge_size,
+                    image_patch_token_num, spatial_merge_size, self.head_num, cls_token=cls_token,
                 )
             elif compact_multiview_slot or state_conditioned_history_slot:
                 if (
@@ -972,27 +937,12 @@ class MemoryTransformer(ConditionalTransformer):
             self.memory_gate_tokens = None
 
     def _project_global_cond(self, global_cond, local_cond=None, local_cond_mask=None):
-        if self.state_query_merge or self.learned_query_merge:
-            return self.project_history_image_features(global_cond, local_cond, local_cond_mask)
+        if self.learned_query_merge:
+            return self.project_history_image_features(global_cond)
         return super()._project_global_cond(global_cond, local_cond, local_cond_mask)
 
-    def project_history_image_features(
-        self, features: torch.Tensor, state_features: torch.Tensor | None = None,
-        state_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if self.image_merge_requires_state:
-            if state_features is None:
-                raise ValueError("image merging requires each image's own state")
-            if state_mask is not None:
-                if state_mask.shape != state_features.shape[:-1]:
-                    raise ValueError("image merging state_mask must match state tokens")
-                state_features = state_features.masked_fill(~state_mask.bool()[..., None], 0)
-            return self.global_cond_projector(
-                features, self.local_cond_projector(state_features), state_mask,
-            )
+    def project_history_image_features(self, features: torch.Tensor) -> torch.Tensor:
         if self.learned_query_merge:
-            return self.global_cond_projector(features)
-        if self.patch_merge:
             return self.global_cond_projector(features)
         if self.history_img_features_projector is None:
             raise ValueError("history image features require an image projector")
@@ -1266,8 +1216,6 @@ class MemoryTransformer(ConditionalTransformer):
             "_precomputed_memory_record_data", None
         )
         history_latents: torch.Tensor | None = None
-        history_state_features = data_dict.pop("history_state_features", None)
-        history_state_mask = data_dict.pop("history_state_mask", None)
         history_mask = data_dict.pop("history_mask", None)
         history_shadow_mask = data_dict.pop("history_shadow_mask", None)
         history_shadow_steps = data_dict.pop("history_shadow_steps", None)
@@ -1279,7 +1227,7 @@ class MemoryTransformer(ConditionalTransformer):
             if history_len > self.max_history_storage_len:
                 raise ValueError("history_len exceeds Active plus Shadow storage capacity")
             history_latents = self.project_history_image_features(
-                history_img_features, history_state_features, history_state_mask,
+                history_img_features,
             )
             if history_len == 0:
                 positioned_history_latents = history_latents
@@ -1331,7 +1279,7 @@ class MemoryTransformer(ConditionalTransformer):
         """Project tokens and route state to DiT or the legacy retrieval path."""
 
         local_cond_mask = data_dict.get("local_cond_mask")
-        if (self.patch_merge or self.state_query_merge or self.learned_query_merge) and "global_cond_mask" in data_dict:
+        if self.learned_query_merge and "global_cond_mask" in data_dict:
             data_dict = dict(data_dict)
             data_dict["global_cond_mask"] = self.global_cond_projector.merge_mask(
                 data_dict["global_cond_mask"]
@@ -1422,14 +1370,12 @@ class MemoryTransformer(ConditionalTransformer):
         history_latents: torch.Tensor | None = None
 
         if (
-            (self.patch_merge or self.state_query_merge or self.learned_query_merge or self.history_img_features_projector is not None)
+            (self.learned_query_merge or self.history_img_features_projector is not None)
             and not self.compact_multiview_slot
             and not self.state_conditioned_history_slot
         ):
             projected_history_img_features_latent = self.project_history_image_features(
                 data_dict["history_img_features"],
-                data_dict.get("local_cond") if self.image_merge_requires_state else None,
-                data_dict.get("local_cond_mask") if self.image_merge_requires_state else None,
             )  # (batch, traj_num, traj_length, hidden_dim)
             history_latents = projected_history_img_features_latent
 

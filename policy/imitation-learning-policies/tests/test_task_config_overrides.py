@@ -90,7 +90,7 @@ workspace:
         self.assertEqual(cfg.dataset_type, 'rmbench')
         self.assertEqual(list(cfg.visual_encoder.spatial_merge_size), [4, 8])
         self.assertEqual(cfg.visual_encoder.model_name, baseline.visual_encoder.model_name)
-        self.assertEqual(cfg.visual_encoder.state_query_merge, baseline.visual_encoder.state_query_merge)
+        self.assertEqual(cfg.visual_encoder.learned_query_merge, baseline.visual_encoder.learned_query_merge)
         self.assertEqual(cfg.workspace.trainer.num_epochs, 401)
         self.assertEqual(cfg.workspace.trainer.optimizer_partial.lr, 0.0002)
         self.assertEqual(cfg.workspace.trainer.optimizer_partial.betas,
@@ -101,8 +101,7 @@ workspace:
 
     def test_false_zero_and_list_values_replace_defaults(self):
         self.task('''visual_encoder:
-  state_query_merge: false
-  learned_query_merge: 0
+  learned_query_merge: false
 workspace:
   train_dataset:
     image_keys: [left_camera, right_camera]
@@ -111,8 +110,7 @@ workspace:
       shadow_horizon: 0
 ''')
         cfg = compose_training_config(self.launch())
-        self.assertFalse(cfg.visual_encoder.state_query_merge)
-        self.assertEqual(cfg.visual_encoder.learned_query_merge, 0)
+        self.assertIs(cfg.visual_encoder.learned_query_merge, False)
         self.assertEqual(cfg.workspace.model.denoising_network_partial.shadow_horizon, 0)
         self.assertEqual(list(cfg.workspace.train_dataset.image_keys), ['left_camera', 'right_camera'])
         self.assertEqual(cfg.workspace.model.global_cond_encoder.image_encoder_partial.spatial_merge_size,
@@ -144,8 +142,9 @@ workspace:
         self.assertEqual(restored.task_yaml_name, 'rearrange_blocks')
         self.assertEqual(restored.task_name, 'rearrange_blocks')
         self.assertEqual(list(restored.visual_encoder.spatial_merge_size), [8, 4])
-        self.assertEqual(restored.workspace.model.denoising_network_partial.patch_merge_size, [8, 4])
-        self.assertEqual(restored.workspace.model.global_cond_encoder.image_encoder_partial.spatial_merge_size, 1)
+        self.assertEqual(restored.workspace.model.denoising_network_partial.spatial_merge_size, [8, 4])
+        self.assertEqual(restored.workspace.model.global_cond_encoder.image_encoder_partial.spatial_merge_size,
+                         1 if restored.visual_encoder.learned_query_merge else [8, 4])
         self.assertEqual(restored.workspace.model.future_img_feature_encoder.image_encoder_partial.spatial_merge_size, [8, 4])
 
     def test_training_entry_point_saves_and_passes_merged_config(self):
@@ -186,7 +185,8 @@ workspace:
         cfg = compose_training_config(self.launch())
         self.assertEqual(cfg.dataset_type, 'rmbench')
         self.assertEqual(cfg.workspace.trainer.num_epochs, 401)
-        self.assertTrue(cfg.visual_encoder.frozen)
+        baseline = compose_hydra_config('rmbench', POLICY)
+        self.assertEqual(cfg.visual_encoder.frozen, baseline.visual_encoder.frozen)
 
     def test_explicit_task_yaml_selection_is_preserved(self):
         self.task('workspace:\n  trainer:\n    num_epochs: 401\n')

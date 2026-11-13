@@ -9,12 +9,11 @@ visual_encoder:
   input_size: 224
   apply_image_norm: true
   pretrained: true
-  frozen: true
+  frozen: false
   individual_forward: false
-  spatial_merge_size: [4,8]
-  patch_merge: false
-  state_query_merge: false
-  learned_query_merge: 8  # global MAP queries per view; 0 disables learned pooling
+  spatial_merge_size: 8
+  learned_query_merge: true  # true: local MAP; false: local mean pooling
+  cls_token: false  # append DINO CLS after each image's pooled/query tokens
 
 workspace:
   train_dataset: 
@@ -27,7 +26,7 @@ workspace:
     # true: preserve the existing offline cached-feature training path.
     # false: load raw images and backpropagate through the current/history DINO.
     use_cached_image_features: false
-    cached_image_feature_kind: ${cond:${oc.select:visual_encoder.learned_query_merge,false},patches,${cond:${oc.select:visual_encoder.state_query_merge,false},patches,${cond:${oc.select:visual_encoder.patch_merge,false},patches,auto}}}
+    cached_image_feature_kind: ${cond:${oc.select:visual_encoder.learned_query_merge,false},patches,auto}
     cached_image_feature_dim: 768
     cached_image_feature_patch_token_num: 256
     cached_image_feature_model_name: ${visual_encoder.model_name}
@@ -49,6 +48,7 @@ workspace:
     future_prediction_mode: pooled
     denoising_network_partial:
       use_conditioned_slot_gate: true
+      state_as_dit_token: true  # DiT: diffusion timestep + robot state + 16 actions
       hidden_dim: 512
       max_history_len: 8
 

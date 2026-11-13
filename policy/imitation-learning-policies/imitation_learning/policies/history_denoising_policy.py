@@ -12,6 +12,7 @@ from imitation_learning.models.denoising_networks.memory_transformer import Memo
 from imitation_learning.models.encoders.multi_token_encoder import MultiTokenEncoder
 from imitation_learning.models.future_prediction.future_feature_predictor import FutureFeaturePredictor
 from imitation_learning.models.memory.gate_memory import GateMemoryBank, gate_selectivity_penalty
+from imitation_learning.models.memory.redundancy_eviction import RedundancyGateMemoryBank
 from imitation_learning.policies.base_denoising_policy import BaseDenoisingPolicy
 from robot_utils.data_utils import dict_apply
 from robot_utils.torch_utils import aggregate_batch, split_batch
@@ -67,7 +68,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 kwargs["denoising_network_partial"],
                 history_img_features_dim=history_img_feature_encoder.feature_dim,
                 history_img_features_token_num=history_img_feature_encoder.token_num,
-                patch_merge_patch_token_num=(
+                image_patch_token_num=(
                     next(iter(patch_counts)) if len(patch_counts) == 1 else 0
                 ),
             )
@@ -193,10 +194,12 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             raise ValueError("Gate memory requires ordered anchors, not trajectory subsampling")
         self.max_training_traj_num = max_training_traj_num
         eviction = dict(memory_eviction or {})
-        if set(eviction).difference({"keep_first", "keep_recent"}):
-            raise ValueError("memory_eviction only accepts keep_first and keep_recent")
+        if set(eviction).difference({"keep_first", "keep_recent", "redundancy_alpha"}):
+            raise ValueError("memory_eviction only accepts keep_first, keep_recent and redundancy_alpha")
         self.keep_first_memory = eviction.get("keep_first", True)
         self.keep_recent_memory = eviction.get("keep_recent", 2)
+        # Missing in old checkpoints: preserve their original Gate-only eviction.
+        self.eviction_redundancy_alpha = eviction.get("redundancy_alpha", 0.0)
         if not skip_memory:
             self._new_memory_bank()  # Validate capacity and protection together.
         if not 0 <= gate_selectivity_min_std <= 0.5:
@@ -661,11 +664,12 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
 
     def _new_memory_bank(self) -> GateMemoryBank:
-        return GateMemoryBank(
+        return RedundancyGateMemoryBank(
             self.denoising_network.max_history_len,
             keep_first=self.keep_first_memory,
             keep_recent=self.keep_recent_memory,
             shadow_horizon=self.denoising_network.shadow_horizon,
+            redundancy_alpha=self.eviction_redundancy_alpha,
         )
 
     def _pack_history(
@@ -725,7 +729,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             entries.append("slot_gate_training_log_gates")
         return {name: [] for name in entries}
 
-    def _current_slot_latents(self, raw_features, retrieval_inputs, state_features=None, state_mask=None):
+    def _current_slot_latents(self, raw_features, retrieval_inputs):
         network = self.denoising_network
         if network.compact_multiview_slot or network.state_conditioned_history_slot:
             return network.project_state_conditioned_slot_features(
@@ -734,15 +738,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 global_cond_mask=retrieval_inputs.get("global_cond_mask"),
                 local_cond_mask=retrieval_inputs.get("local_cond_mask"),
             )
-        return network.project_history_image_features(raw_features, state_features, state_mask)
-
-    def _reproject_state_query_history(self, raw_features, raw_state):
-        # Re-encode the retained frame's normalized proprioception with the
-        # latest state encoder and state-dependent image merger weights.
-        state_features = self.local_cond_encoder(raw_state)
-        return self.denoising_network.project_history_image_features(
-            raw_features, state_features, raw_state.get("_state_query_mask"),
-        )
+        return network.project_history_image_features(raw_features)
 
     def _current_gate_scores(self, banks):
         gates = self.denoising_network.memory_retriever.latest_slot_gates
@@ -772,8 +768,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         retrieval_inputs = network.prepare_single_memory_retrieval(data_dict)
         current_latents = self._current_slot_latents(
             raw_features, retrieval_inputs,
-            data_dict.get("local_cond") if network.image_merge_requires_state else None,
-            data_dict.get("local_cond_mask") if network.image_merge_requires_state else None,
         )
         retrieval_inputs.update(self._pack_history(banks, current_latents))
         if self.memory_gate is not None:
@@ -831,14 +825,13 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             frame = self.next_frame_index_dict.get(episode, 0)
             bank.append(
                 current_latents[i].detach(), frame, gate_scores[i],
-                raw_features=(None if network.patch_merge or network.state_query_merge or network.learned_query_merge else raw_features[i].detach()),
+                raw_features=(None if network.learned_query_merge else raw_features[i].detach()),
             )
             self.next_frame_index_dict[episode] = frame + self.execution_chunk_length
         return self.action_decoder(data_dict["noisy_action"])
 
     def _build_gate_training_memories(
         self, projected, raw_features, valid_mask, frame_indices, supervised, banks,
-        raw_state=None,
     ):
         network = self.denoising_network
         all_latents = projected["all_history_latents"]
@@ -851,8 +844,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         if can_reproject:
             for bank in banks:
                 bank.reproject(
-                    self._reproject_state_query_history if network.image_merge_requires_state
-                    else network.project_history_image_features
+                    network.project_history_image_features
                 )
         for anchor in range(supervised):
             flat_indices = offsets + anchor
@@ -876,10 +868,6 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     bank.append(
                         all_latents[i, anchor], int(frame_indices[i, anchor]), scores[i],
                         raw_features=raw_features[i, anchor] if can_reproject else None,
-                        raw_state=(
-                            {name: value[i, anchor] for name, value in raw_state.items()}
-                            if raw_state is not None else None
-                        ),
                     )
         records.pop("slot_gate_training_log_gates")
         memories = torch.stack(memories, dim=1)
@@ -941,15 +929,9 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 raise RuntimeError("missing or misaligned streaming memory banks")
         data_dict["_streaming_training"] = True
         projected = self.denoising_network.prepare_parallel_forward(data_dict)
-        raw_state = None
-        if self.denoising_network.image_merge_requires_state:
-            raw_state = {name: batch[name] for name in self.local_cond_encoder.data_entry_names}
-            if "local_cond_mask" in data_dict:
-                raw_state["_state_query_mask"] = data_dict["local_cond_mask"]
         decision_memory, gate_loss = self._build_gate_training_memories(
             projected, data_dict["history_img_features"], valid,
             frames[:, :, 0], supervised, banks,
-            raw_state=raw_state,
         )
         projected = self._slice_streaming_projected_input(
             projected, batch_size=batch_size, input_traj_num=input_length,

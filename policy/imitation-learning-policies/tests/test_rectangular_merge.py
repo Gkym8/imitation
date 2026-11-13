@@ -5,9 +5,8 @@ import unittest
 from omegaconf import OmegaConf
 import torch
 
-from imitation_learning.models.common.patch_merger import SpatialPatchMerger
+from imitation_learning.models.common.learned_query_merger import LearnedQueryPatchMerger
 from imitation_learning.models.common.spatial_merge import spatial_merge_shape
-from imitation_learning.models.common.state_query_merger import StateQueryPatchMerger
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
 import test_future_prediction_mode as fixture
 
@@ -27,9 +26,9 @@ class RectangularMergeGeometryTest(unittest.TestCase):
             ([2, 1], [[0, 4], [1, 5], [2, 6], [3, 7], [8, 12], [9, 13], [10, 14], [11, 15]]),
         ):
             expected = torch.tensor(indices + [[i + 16 for i in row] for row in indices]).unsqueeze(0)
-            for cls in (SpatialPatchMerger, StateQueryPatchMerger):
+            for cls in (LearnedQueryPatchMerger,):
                 with self.subTest(shape=shape, cls=cls.__name__):
-                    args = (1, 8, 16, shape) + ((2,) if cls is StateQueryPatchMerger else ())
+                    args = (1, 8, 16, shape) + (2,)
                     merger = cls(*args)
                     raw = torch.arange(32).reshape(1, 32, 1)
                     torch.testing.assert_close(merger._group(raw).reshape(1, 16, 2), expected)
@@ -39,9 +38,9 @@ class RectangularMergeGeometryTest(unittest.TestCase):
                     torch.testing.assert_close(merger.merge_mask(mask), expected_mask)
 
     def test_square_integer_and_pair_keep_identical_weights_outputs_and_gradients(self):
-        for cls in (SpatialPatchMerger, StateQueryPatchMerger):
+        for cls in (LearnedQueryPatchMerger,):
             with self.subTest(cls=cls.__name__):
-                tail = (4,) if cls is StateQueryPatchMerger else ()
+                tail = (4,)
                 torch.manual_seed(10)
                 integer = cls(8, 32, 256, 4, *tail)
                 torch.manual_seed(10)
@@ -51,7 +50,7 @@ class RectangularMergeGeometryTest(unittest.TestCase):
                     torch.testing.assert_close(square_pair.state_dict()[name], value, rtol=0, atol=0)
                 x = torch.randn(2, 512, 8)
                 state = torch.randn(2, 1, 32)
-                args = (state,) if cls is StateQueryPatchMerger else ()
+                args = ()
                 first, second = integer(x, *args), square_pair(x, *args)
                 torch.testing.assert_close(first, second, rtol=0, atol=0)
                 first.square().sum().backward()
@@ -61,9 +60,9 @@ class RectangularMergeGeometryTest(unittest.TestCase):
 
     def test_both_sides_must_divide_grid_not_just_the_area(self):
         for shape in ([2, 32], [3, 8], [8, 3]):
-            for cls in (SpatialPatchMerger, StateQueryPatchMerger):
+            for cls in (LearnedQueryPatchMerger,):
                 with self.subTest(shape=shape, cls=cls.__name__), self.assertRaisesRegex(ValueError, 'divisible'):
-                    args = (8, 32, 256, shape) + ((4,) if cls is StateQueryPatchMerger else ())
+                    args = (8, 32, 256, shape) + ((4,))
                     cls(*args)
 
 
@@ -79,10 +78,9 @@ class RectangularMergePolicyTest(unittest.TestCase):
         gc.collect()
         SharedModelManager.reset()
 
-    def config(self, merging='state', shape=(4, 8), cached=True, mode='pooled', views=1):
+    def config(self, merging='learned', shape=(4, 8), cached=True, mode='pooled', views=1):
         cfg = self.helper.make_config(mode, cached, merge_size=list(shape))
-        cfg.visual_encoder.patch_merge = merging == 'mlp'
-        cfg.visual_encoder.state_query_merge = merging == 'state'
+        cfg.visual_encoder.learned_query_merge = merging == 'learned'
         cfg.workspace.train_dataset.image_keys = ['head_camera', 'left_camera', 'right_camera'][:views]
         # Rectangular pooling consumes full patch caches for every view.
         cfg.workspace.train_dataset.cached_image_feature_kind = 'patches'
@@ -122,12 +120,8 @@ class RectangularMergePolicyTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(total))
         total.backward()
         self.assertTrue(all(torch.isfinite(p.grad).all() for p in policy.parameters() if p.grad is not None))
-        if merging == 'state':
-            self.assertEqual(network.global_cond_projector.query_tokens.shape, (8, 32))
-            self.assertGreater(float(network.global_cond_projector.state_modulation[-1].weight.grad.abs().sum()), 0)
-        elif merging == 'mlp':
-            self.assertEqual(network.global_cond_projector.mlp[0].in_features, 32 * 8)
-            self.assertGreater(float(network.global_cond_projector.mlp[0].weight.grad.abs().sum()), 0)
+        if merging == 'learned':
+            self.assertGreater(float(network.global_cond_projector.query_tokens.grad.abs().sum()), 0)
         for backbone in policy.shared_model_manager.vit_models.values():
             self.assertTrue(all(p.grad is None for p in backbone.parameters()))
         policy.eval()
@@ -144,10 +138,10 @@ class RectangularMergePolicyTest(unittest.TestCase):
         cases = (
             ('mean', (4, 8), True, 'tokens', 1),
             ('mean', (8, 4), False, 'pooled', 3),
-            ('mlp', (4, 8), True, 'tokens', 3),
-            ('mlp', (8, 4), False, 'pooled', 1),
-            ('state', (4, 8), True, 'pooled', 3),
-            ('state', (8, 4), False, 'tokens', 1),
+            ('learned', (4, 8), True, 'tokens', 3),
+            ('learned', (8, 4), False, 'pooled', 1),
+            ('learned', (4, 8), True, 'pooled', 3),
+            ('learned', (8, 4), False, 'tokens', 1),
         )
         for case in cases:
             with self.subTest(case=case):
@@ -172,7 +166,7 @@ class RectangularMergePolicyTest(unittest.TestCase):
                 del policy
 
     def test_streaming_and_online_rectangular_history_and_shadows_agree(self):
-        for merging in ('mlp', 'state'):
+        for merging in ('mean', 'learned'):
             with self.subTest(merging=merging):
                 self.check_streaming_case(merging)
 
@@ -190,9 +184,9 @@ class RectangularMergePolicyTest(unittest.TestCase):
             (losses['action'] + 0.05 * losses['future_prediction']).backward()
             for slot in policy._streaming_training_state[0].slots:
                 self.assertEqual(slot.latent.shape, (24, 32))
-                self.assertEqual(slot.raw_features.shape, (3 * 256, 8))
+                self.assertEqual(slot.raw_features.shape, (3 * (256 if merging == 'learned' else 8), 8))
                 self.assertFalse(slot.latent.requires_grad)
-                self.assertEqual(slot.raw_state is not None, merging == 'state')
+                self.assertIsNone(slot.raw_state)
             policy.zero_grad(set_to_none=True)
         expected = [(s.slot_id, s.state, s.expire_at) for s in policy._streaming_training_state[0].slots]
         policy.eval()
@@ -204,7 +198,7 @@ class RectangularMergePolicyTest(unittest.TestCase):
         self.assertEqual([(s.slot_id, s.state, s.expire_at) for s in policy.online_memory_banks[0].slots], expected)
 
     def test_rectangular_config_checkpoint_roundtrip_and_full_workspace_resolution(self):
-        for merging in ('mean', 'mlp', 'state'):
+        for merging in ('mean', 'learned'):
             with self.subTest(merging=merging):
                 self.check_roundtrip_case(merging)
 

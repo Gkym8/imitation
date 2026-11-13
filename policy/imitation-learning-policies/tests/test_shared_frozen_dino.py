@@ -116,10 +116,10 @@ class SharedFrozenDinoPolicyTest(unittest.TestCase):
 
     def test_current_history_and_future_share_one_forward_for_both_mergers(self):
         helper = fixture.FuturePredictionModeTest()
-        for patch_merge in (False, True):
-            with self.subTest(patch_merge=patch_merge):
+        for learned_query_merge in (False, True):
+            with self.subTest(learned_query_merge=learned_query_merge):
                 cfg = helper.make_config('pooled', cached=False, merge_size=8)
-                cfg.visual_encoder.patch_merge = patch_merge
+                cfg.visual_encoder.learned_query_merge = learned_query_merge
                 policy = helper.instantiate_policy(cfg)
                 manager = policy.shared_model_manager
                 self.assertEqual(list(manager.vit_models), [fixture.MODEL_NAME])
@@ -133,7 +133,7 @@ class SharedFrozenDinoPolicyTest(unittest.TestCase):
                 handle.remove()
                 self.assertEqual(len(calls), 1)
                 (losses['action'] + 0.05 * losses['future_prediction']).backward()
-                if patch_merge:
+                if learned_query_merge:
                     self.assertGreater(float(policy.denoising_network.global_cond_projector.mlp[0].weight.grad.abs().sum()), 0)
                 self.assertTrue(all(p.grad is None for p in manager.vit_models[fixture.MODEL_NAME].parameters()))
                 del policy
