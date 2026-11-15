@@ -7,55 +7,34 @@ from torch import nn
 from imitation_learning.models.ema_model import EMAModel
 
 
-class SmallPolicy(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.backbone = nn.Linear(2, 2, bias=False)
-        self.head = nn.Linear(2, 1, bias=False)
+class LegacyEMATest(unittest.TestCase):
+    def test_frozen_and_trainable_parameters_both_use_original_ema_formula(self):
+        model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1))
+        model[0].requires_grad_(False)
+        ema = EMAModel(model, inv_gamma=1.0, power=0.67, min_value=0.0, max_value=0.9999)
         with torch.no_grad():
-            self.backbone.weight.copy_(torch.tensor([[0.1, -3.1415927], [1.4142135, 0.33333334]]))
-            self.head.weight.fill_(2.0)
-        self.backbone.requires_grad_(False)
+            for parameter in model.parameters():
+                parameter.add_(0.25)
+        for decay in (0.0, 0.5, 0.999):
+            previous = [p.detach().clone() for p in ema.averaged_model.parameters()]
+            with patch.object(ema, '_get_decay', return_value=decay):
+                ema.step(model)
+            for old, source, actual in zip(previous, model.parameters(), ema.averaged_model.parameters()):
+                expected = old.mul_(decay).add_(source, alpha=1 - decay)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(int(ema.optimization_step), 3)
+        self.assertTrue(all(not p.requires_grad for p in ema.averaged_model.parameters()))
 
-
-class FrozenParameterEMATest(unittest.TestCase):
-    def make_ema(self, model):
-        return EMAModel(model, inv_gamma=1.0, power=0.67, min_value=0.0, max_value=0.9999)
-
-    def test_frozen_weights_remain_bitwise_equal_after_many_steps(self):
-        model = SmallPolicy()
-        ema = self.make_ema(model)
-        original = model.backbone.weight.detach().clone()
-        for _ in range(4096):
-            ema.step(model)
-        self.assertTrue(torch.equal(model.backbone.weight, original))
-        self.assertTrue(torch.equal(ema.averaged_model.backbone.weight, original))
-
-    def test_trainable_weights_keep_averaging_and_newly_frozen_weights_sync(self):
-        model = SmallPolicy()
-        ema = self.make_ema(model)
-        with patch.object(ema, '_get_decay', return_value=0.5), torch.no_grad():
-            model.head.weight.fill_(4.0)
-            ema.step(model)
-            self.assertTrue(torch.equal(ema.averaged_model.head.weight, torch.full_like(model.head.weight, 3.0)))
-            model.head.weight.fill_(8.0)
-            ema.step(model)
-            self.assertTrue(torch.equal(ema.averaged_model.head.weight, torch.full_like(model.head.weight, 5.5)))
-            model.head.requires_grad_(False)
-            model.head.weight.fill_(10.0)
-            ema.step(model)
-            self.assertTrue(torch.equal(ema.averaged_model.head.weight, model.head.weight))
-
-    def test_existing_frozen_ema_drift_is_replaced_by_source_weights(self):
-        model = SmallPolicy()
-        ema = self.make_ema(model)
-        # Reproduce a previously saved EMA copy differing from the frozen
-        # training backbone. A later EMA step must also repair resumed copies.
+    def test_frozen_saved_offset_is_averaged_rather_than_replaced(self):
+        model = nn.Linear(2, 2, bias=False).requires_grad_(False)
+        ema = EMAModel(model, inv_gamma=1.0, power=0.67, min_value=0.0, max_value=0.9999)
         with torch.no_grad():
-            ema.averaged_model.backbone.weight.add_(0.25)
+            ema.averaged_model.weight.add_(0.25)
+        expected = ema.averaged_model.weight.detach().clone().mul_(0.5).add_(model.weight, alpha=0.5)
         with patch.object(ema, '_get_decay', return_value=0.5):
             ema.step(model)
-        self.assertTrue(torch.equal(ema.averaged_model.backbone.weight, model.backbone.weight))
+        torch.testing.assert_close(ema.averaged_model.weight, expected, rtol=0, atol=0)
+        self.assertFalse(torch.equal(ema.averaged_model.weight, model.weight))
 
 
 if __name__ == '__main__':

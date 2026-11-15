@@ -5,7 +5,8 @@ import unittest
 from omegaconf import OmegaConf
 import torch
 
-from imitation_learning.models.common.learned_query_merger import LearnedQueryPatchMerger
+from imitation_learning.models.common.state_query_merger import StateQueryPatchMerger
+from imitation_learning.models.common.pos_embeddings import get_nd_sincos_pos_embed_from_grid
 from imitation_learning.models.common.spatial_merge import spatial_merge_shape
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
 import test_future_prediction_mode as fixture
@@ -26,7 +27,7 @@ class RectangularMergeGeometryTest(unittest.TestCase):
             ([2, 1], [[0, 4], [1, 5], [2, 6], [3, 7], [8, 12], [9, 13], [10, 14], [11, 15]]),
         ):
             expected = torch.tensor(indices + [[i + 16 for i in row] for row in indices]).unsqueeze(0)
-            for cls in (LearnedQueryPatchMerger,):
+            for cls in (StateQueryPatchMerger,):
                 with self.subTest(shape=shape, cls=cls.__name__):
                     args = (1, 8, 16, shape) + (2,)
                     merger = cls(*args)
@@ -38,7 +39,7 @@ class RectangularMergeGeometryTest(unittest.TestCase):
                     torch.testing.assert_close(merger.merge_mask(mask), expected_mask)
 
     def test_square_integer_and_pair_keep_identical_weights_outputs_and_gradients(self):
-        for cls in (LearnedQueryPatchMerger,):
+        for cls in (StateQueryPatchMerger,):
             with self.subTest(cls=cls.__name__):
                 tail = (4,)
                 torch.manual_seed(10)
@@ -50,7 +51,7 @@ class RectangularMergeGeometryTest(unittest.TestCase):
                     torch.testing.assert_close(square_pair.state_dict()[name], value, rtol=0, atol=0)
                 x = torch.randn(2, 512, 8)
                 state = torch.randn(2, 1, 32)
-                args = ()
+                args = (state,)
                 first, second = integer(x, *args), square_pair(x, *args)
                 torch.testing.assert_close(first, second, rtol=0, atol=0)
                 first.square().sum().backward()
@@ -60,7 +61,7 @@ class RectangularMergeGeometryTest(unittest.TestCase):
 
     def test_both_sides_must_divide_grid_not_just_the_area(self):
         for shape in ([2, 32], [3, 8], [8, 3]):
-            for cls in (LearnedQueryPatchMerger,):
+            for cls in (StateQueryPatchMerger,):
                 with self.subTest(shape=shape, cls=cls.__name__), self.assertRaisesRegex(ValueError, 'divisible'):
                     args = (8, 32, 256, shape) + ((4,))
                     cls(*args)
@@ -80,7 +81,7 @@ class RectangularMergePolicyTest(unittest.TestCase):
 
     def config(self, merging='learned', shape=(4, 8), cached=True, mode='pooled', views=1):
         cfg = self.helper.make_config(mode, cached, merge_size=list(shape))
-        cfg.visual_encoder.learned_query_merge = merging == 'learned'
+        cfg.visual_encoder.state_query_merge = merging == 'learned'
         cfg.workspace.train_dataset.image_keys = ['head_camera', 'left_camera', 'right_camera'][:views]
         # Rectangular pooling consumes full patch caches for every view.
         cfg.workspace.train_dataset.cached_image_feature_kind = 'patches'
@@ -102,6 +103,12 @@ class RectangularMergePolicyTest(unittest.TestCase):
         batch = self.batch(cfg)
         self.assertEqual(network.global_cond_token_num, 8 * views)
         self.assertEqual(network.history_img_features_token_num, 8 * views)
+        grid = (16 // shape[0], 16 // shape[1])
+        self.assertEqual(tuple(network.global_cond_grid_shape), grid)
+        expected_positions = torch.from_numpy(get_nd_sincos_pos_embed_from_grid(
+            network.hidden_dim, (views, *grid),
+        )).to(network.global_cond_pos_embedding).reshape_as(network.global_cond_pos_embedding)
+        torch.testing.assert_close(network.global_cond_pos_embedding, expected_positions, rtol=0, atol=0)
         self.assertEqual(policy.global_cond_encoder.token_num, (8 if merging == 'mean' else 256) * views)
         self.assertEqual(policy.future_img_feature_encoder.token_num, (8 if mode == 'tokens' else 1) * views)
         if mode == 'tokens':
@@ -186,7 +193,7 @@ class RectangularMergePolicyTest(unittest.TestCase):
                 self.assertEqual(slot.latent.shape, (24, 32))
                 self.assertEqual(slot.raw_features.shape, (3 * (256 if merging == 'learned' else 8), 8))
                 self.assertFalse(slot.latent.requires_grad)
-                self.assertIsNone(slot.raw_state)
+                torch.testing.assert_close(slot.raw_state["agent_pos"], batch["agent_pos"][0, slot.frame_index // 10], rtol=0, atol=0)
             policy.zero_grad(set_to_none=True)
         expected = [(s.slot_id, s.state, s.expire_at) for s in policy._streaming_training_state[0].slots]
         policy.eval()

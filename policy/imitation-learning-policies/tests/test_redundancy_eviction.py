@@ -168,7 +168,10 @@ class RedundancyPolicyTest(unittest.TestCase):
     def test_config_default_and_old_checkpoint_without_field(self):
         cfg = self.fixture.make_config()
         policy = self.fixture.instantiate_policy(cfg).eval()
-        self.assertEqual(policy._new_memory_bank().redundancy_alpha, .1)
+        self.assertEqual(
+            policy._new_memory_bank().redundancy_alpha,
+            cfg.workspace.model.memory_eviction.redundancy_alpha,
+        )
         state = policy.state_dict()
         del policy
         del cfg.workspace.model.memory_eviction.redundancy_alpha

@@ -60,6 +60,19 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             execution_chunk_length = legacy_chunk_length
 
         if history_img_feature_encoder is not None:
+            current_encoders = list(
+                kwargs["global_cond_encoder"].encoder_dict.values()
+            )
+            image_geometry = {}
+            if current_encoders and all(
+                getattr(encoder, "feature_aggregation", None) == "patches"
+                and hasattr(encoder, "spatial_grid_shape")
+                for encoder in current_encoders
+            ):
+                grids = {encoder.spatial_grid_shape for encoder in current_encoders}
+                if len(grids) != 1:
+                    raise ValueError("Current image encoders must use matching spatial grids")
+                image_geometry["global_cond_grid_shape"] = next(iter(grids))
             patch_counts = {
                 getattr(encoder, "patch_token_num", 0)
                 for encoder in history_img_feature_encoder.encoder_dict.values()
@@ -71,6 +84,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 image_patch_token_num=(
                     next(iter(patch_counts)) if len(patch_counts) == 1 else 0
                 ),
+                **image_geometry,
             )
 
         super().__init__(**kwargs)
@@ -729,7 +743,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             entries.append("slot_gate_training_log_gates")
         return {name: [] for name in entries}
 
-    def _current_slot_latents(self, raw_features, retrieval_inputs):
+    def _current_slot_latents(self, raw_features, retrieval_inputs, state_features=None, state_mask=None):
         network = self.denoising_network
         if network.compact_multiview_slot or network.state_conditioned_history_slot:
             return network.project_state_conditioned_slot_features(
@@ -738,7 +752,15 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 global_cond_mask=retrieval_inputs.get("global_cond_mask"),
                 local_cond_mask=retrieval_inputs.get("local_cond_mask"),
             )
-        return network.project_history_image_features(raw_features)
+        return network.project_history_image_features(raw_features, state_features, state_mask)
+
+    def _reproject_state_conditioned_history(self, raw_features, raw_state):
+        # Re-encode each retained frame's own normalized state using the
+        # current state encoder, then rebuild its SQM or pooled memory tokens.
+        state_features = self.local_cond_encoder(raw_state)
+        return self.denoising_network.project_history_image_features(
+            raw_features, state_features, raw_state.get("_image_state_mask"),
+        )
 
     def _current_gate_scores(self, banks):
         gates = self.denoising_network.memory_retriever.latest_slot_gates
@@ -768,6 +790,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         retrieval_inputs = network.prepare_single_memory_retrieval(data_dict)
         current_latents = self._current_slot_latents(
             raw_features, retrieval_inputs,
+            data_dict.get("local_cond"), data_dict.get("local_cond_mask"),
         )
         retrieval_inputs.update(self._pack_history(banks, current_latents))
         if self.memory_gate is not None:
@@ -825,13 +848,16 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             frame = self.next_frame_index_dict.get(episode, 0)
             bank.append(
                 current_latents[i].detach(), frame, gate_scores[i],
-                raw_features=(None if network.learned_query_merge else raw_features[i].detach()),
+                raw_features=(
+                    None if network.image_merge_requires_state or network.compact_multiview_slot
+                    or network.state_conditioned_history_slot else raw_features[i].detach()
+                ),
             )
             self.next_frame_index_dict[episode] = frame + self.execution_chunk_length
         return self.action_decoder(data_dict["noisy_action"])
 
     def _build_gate_training_memories(
-        self, projected, raw_features, valid_mask, frame_indices, supervised, banks,
+        self, projected, raw_features, valid_mask, frame_indices, supervised, banks, raw_state=None,
     ):
         network = self.denoising_network
         all_latents = projected["all_history_latents"]
@@ -844,7 +870,8 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         if can_reproject:
             for bank in banks:
                 bank.reproject(
-                    network.project_history_image_features
+                    self._reproject_state_conditioned_history if network.image_merge_requires_state
+                    else network.project_history_image_features
                 )
         for anchor in range(supervised):
             flat_indices = offsets + anchor
@@ -868,6 +895,10 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     bank.append(
                         all_latents[i, anchor], int(frame_indices[i, anchor]), scores[i],
                         raw_features=raw_features[i, anchor] if can_reproject else None,
+                        raw_state=(
+                            {name: value[i, anchor] for name, value in raw_state.items()}
+                            if raw_state is not None and can_reproject else None
+                        ),
                     )
         records.pop("slot_gate_training_log_gates")
         memories = torch.stack(memories, dim=1)
@@ -929,9 +960,14 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                 raise RuntimeError("missing or misaligned streaming memory banks")
         data_dict["_streaming_training"] = True
         projected = self.denoising_network.prepare_parallel_forward(data_dict)
+        raw_state = None
+        if self.denoising_network.image_merge_requires_state:
+            raw_state = {name: batch[name] for name in self.local_cond_encoder.data_entry_names}
+            if "local_cond_mask" in data_dict:
+                raw_state["_image_state_mask"] = data_dict["local_cond_mask"]
         decision_memory, gate_loss = self._build_gate_training_memories(
             projected, data_dict["history_img_features"], valid,
-            frames[:, :, 0], supervised, banks,
+            frames[:, :, 0], supervised, banks, raw_state=raw_state,
         )
         projected = self._slice_streaming_projected_input(
             projected, batch_size=batch_size, input_traj_num=input_length,

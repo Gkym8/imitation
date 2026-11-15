@@ -122,8 +122,6 @@ class MultiTokenEncoder(BaseEncoder):
                             f"{feature_key} must contain [CLS, patches] with "
                             f"tail shape {expected_tail}, got {cached.shape}"
                         )
-                    # Keep each image's CLS separate from spatial pooling.
-                    cls = cached[..., :1, :]
                     cached = cached[..., 1:, :]
                     merge_patches = getattr(
                         encoder, "merge_spatial_patches", None
@@ -136,8 +134,6 @@ class MultiTokenEncoder(BaseEncoder):
                             f"tokens but the encoder expects {encoder.token_num}; "
                             "configure a compatible cache or encoder merge"
                         )
-                    if getattr(encoder, "cls_token", False):
-                        cached = torch.cat([cached, cls], dim=-2)
                     cached = einops.rearrange(
                         cached,
                         "... traj_len token_num feature_dim -> "

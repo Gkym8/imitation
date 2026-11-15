@@ -14,4 +14,4 @@ workspace:
   trainer:
     num_epochs: 301
     checkpoint_every: 50
-    future_prediction_loss_weight: 0
+    future_prediction_loss_weight: 0.05

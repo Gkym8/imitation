@@ -13,21 +13,18 @@ use_cached_image_features: ${workspace.train_dataset.use_cached_image_features}
 skip_memory: false
 global_cond_encoder:
   image_encoder_partial:
-    cls_token: ${oc.select:visual_encoder.cls_token,false}
-    spatial_merge_size: ${cond:${oc.select:visual_encoder.learned_query_merge,false},1,${visual_encoder.spatial_merge_size}}
+    spatial_merge_size: ${cond:${oc.select:visual_encoder.state_query_merge,false},1,${visual_encoder.spatial_merge_size}}
 
 history_img_feature_encoder:
   image_encoder_partial:
     feature_aggregation: patches
-    cls_token: ${oc.select:visual_encoder.cls_token,false}
-    spatial_merge_size: ${cond:${oc.select:visual_encoder.learned_query_merge,false},1,${visual_encoder.spatial_merge_size}}
+    spatial_merge_size: ${cond:${oc.select:visual_encoder.state_query_merge,false},1,${visual_encoder.spatial_merge_size}}
     frozen: ${visual_encoder.frozen}
   name: history_img_feature_encoder
   data_entry_names: ${workspace.train_dataset.image_keys}
 
 denoising_network_partial:
-  learned_query_merge: ${oc.select:visual_encoder.learned_query_merge,false}
-  cls_token: ${oc.select:visual_encoder.cls_token,false}
+  state_query_merge: ${oc.select:visual_encoder.state_query_merge,false}
   spatial_merge_size: ${visual_encoder.spatial_merge_size}
 
 future_img_feature_encoder:
@@ -48,6 +45,6 @@ execution_chunk_length: 10
 memory_eviction:
   keep_first: true
   keep_recent: 2
-  redundancy_alpha: 0.1
+  redundancy_alpha: 0.4
 
 gate_selectivity_min_std: 0.1

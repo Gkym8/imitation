@@ -14,7 +14,7 @@ freeze_non_history_modules: false
 history_attention_type: token_wise
 memory_retrieval_mode: perception_patches
 perception_retrieval_layers: 2
-# State joins diffusion-step/action tokens in DiT; image directly queries history.
+# State joins diffusion-step/action tokens in DiT; fused image tokens query history.
 state_as_dit_token: true
 use_conditioned_slot_gate: true
 slot_gate_hidden_dim: 128

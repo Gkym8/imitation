@@ -25,7 +25,7 @@ class StateDiTTokensTest(unittest.TestCase):
 
     def config(self, mode='pooled', merge=False):
         cfg = self.helper.make_config(mode, cached=True, merge_size=8)
-        cfg.visual_encoder.learned_query_merge = merge
+        cfg.visual_encoder.state_query_merge = merge
         network = cfg.workspace.model.denoising_network_partial
         network.state_as_dit_token = True
         network.max_history_len = 4
@@ -41,7 +41,7 @@ class StateDiTTokensTest(unittest.TestCase):
         cfg.workspace.model.denoising_network_partial.state_as_dit_token = False
         policy = self.helper.instantiate_policy(cfg)
         state = policy.state_dict()
-        self.assertTrue(any('state_condition_attn' in name for name in state))
+        self.assertTrue(any('image_state_fusion.' in name for name in state))
         del policy
         with open_dict(cfg.workspace.model.denoising_network_partial):
             del cfg.workspace.model.denoising_network_partial['state_as_dit_token']

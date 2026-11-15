@@ -423,6 +423,7 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
             "noisy_action": torch.randn(1, 16, 14), "step": torch.zeros(1, dtype=torch.long),
             "global_cond": torch.randn(1, 16, 8), "local_cond": torch.randn(1, 1, 8),
             "history_img_features": torch.randn(1, 7, 16, 8),
+            "history_local_cond": torch.randn(1, 7, 1, 8),
             "history_mask": torch.ones(1, 7, dtype=torch.bool),
             "history_shadow_mask": torch.tensor([[False] * 4 + [True] * 3]),
             "history_shadow_steps": torch.tensor([[0] * 4 + [1, 2, 3]]),

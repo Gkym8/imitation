@@ -168,42 +168,43 @@ same rectangular average regions; pooled CLS targets stay unchanged.
 ```yaml
 visual_encoder:
   spatial_merge_size: [4, 8]
-  learned_query_merge: true
+  state_query_merge: false
 ```
 
-`learned_query_merge` is strictly boolean. With `true`, every spatial region
-has one learned query that reads only its own patches. For a 16 x 16 patch
-grid, size 8 produces a 2 x 2 output grid (4 tokens); [4, 8] produces a 4 x 2
-output grid (8 tokens). Each spatial position has its own query parameters,
-shared across cameras and time; cameras never attend to each other.
-After the image LayerNorm/linear adapter, each region uses SigLIP-style MAP:
-`h = MultiheadAttention(Q_region, X_region, X_region)` followed by
-`h + MLP(LayerNorm(h))`. There is no query residual or robot-state fusion
-inside this module. The MLP expands the width fourfold and uses tanh GELU.
-Current and history images share this pooling head. Streaming training
-retains detached patches and re-pools them at chunk boundaries; online banks
-store the resulting image tokens.
-
-`visual_encoder.cls_token: true` appends each image's DINO CLS token after
-its local tokens, for both mean pooling and learned-query MAP. The default is
-false. At merge size 4, each view has 16 local tokens plus one CLS token.
-CLS is excluded from local pooling/attention and uses the image-width adapter;
-current/history images and cached/raw paths share the same per-view ordering
-`[local tokens, CLS]`. Future prediction targets retain their existing shapes.
+`state_query_merge` is strictly boolean. With `true`, the historical SQM
+implementation (commit `e5e60af`) reads one independent spatial region per
+learned query. Each frame's own robot state modulates the regional query:
+`q = (1 + gamma(state)) * Q_region + beta(state)`. Keys and values contain
+only that region's image patches. Attention uses Q/K RMS normalization,
+without a query residual or a later state-fusion layer. The modulation's
+last linear layer starts at zero, so state modulation is learned gradually.
+Current and history images share this query head.
 
 With `false`, each region uses uniform mean pooling in the image encoder.
-`spatial_merge_size` controls the same regional output grid in both modes.
-The removed `patch_merge` and `state_query_merge` options are no longer used.
-Integer query-count configurations and global/state-fused MAP checkpoints
-must be retrained with the new boolean configuration and regional token grid.
-Future target encoders remain independent of the learned pooling head.
+After projection to policy width, both current and historical image tokens
+read their own frame's state using the residual fusion from `f682be8`:
+`LN(image + softmax(Q(image) @ K(state).T / sqrt(D)) @ V(state))`.
+With one state token, this is `LN(image + V(state))` per image token.
+This fusion happens before history storage and is not repeated during
+retrieval. `spatial_merge_size` selects the same regional grid in both modes.
+The separate DiT state-token setting remains independent of these routes.
+
+Streaming training retains each frame's detached image features and raw
+normalized robot state, then re-encodes that saved state and rebuilds the
+memory tokens with current parameters at chunk boundaries. Online inference
+stores the fused tokens at observation time. Future targets remain visual.
+`learned_query_merge`, `patch_merge`, and the optional image CLS append are
+removed; pure learned-MAP checkpoints require their original architecture.
+
+EMA uses the original averaging formula for every parameter, including
+frozen DINO weights; frozen parameters are no longer copied from the source.
 
 Current images, history images, and future supervision share one frozen DINO
 backbone in both cached and online modes. Online DINO forwards follow the
 caller's autocast: BF16 mixed precision during training and FP32 during the
 default RMBench evaluation. It stays frozen and in eval mode during policy
-training. Frozen parameters are copied exactly into the EMA model rather
-than averaged. The patch merger, DiT, and future predictor retain the
+training. All parameters, including frozen DINO parameters, use the original
+EMA averaging rule. The patch merger, DiT, and future predictor retain the
 trainer's mixed precision and their gradients. Existing
 FP32 feature caches remain usable. Legacy checkpoints containing a second
 `future_target_dinov2` backbone are folded into the shared model when their
@@ -239,24 +240,15 @@ per-slot, per-head gate inside history attention, and both receive gradients
 from the action and future-prediction losses.
 
 RMBench task defaults use
-`workspace.model.denoising_network_partial.state_as_dit_token: false`.
-The DiT input is `[diffusion step, actions]`: with 16 action tokens and width
-512 it has shape `[B, 17, 512]` in every layer. The action head still reads
-only the final 16 tokens. Numeric learned-query MAP already reads each image's
-own state before history retrieval, so this route does not add the older
-state-to-image attention/FFN again. State encoding and the slot-gate MLP's
-separate current-state summary remain active (`3*512 -> 128 -> heads`).
-The state-position entry is retained in the position table for this unchanged
-Gate input, then removed from the main sequence before any DiT block.
-Current/history image token counts, their state reads, fusion and Shadow
-behavior are unchanged by removing the independent DiT state token.
-
-The existing `state_as_dit_token: true` setting retains the 18-token
-`[diffusion step, state, actions]` route, including for saved numeric MAP
-checkpoints. Non-numeric pooling modes with this setting absent/false retain
-their original state-to-image route and parameter layout. Saved checkpoint
-configuration determines which route is used; editing the task defaults does
-not alter the token count of a checkpoint loaded with its saved configuration.
+`workspace.model.denoising_network_partial.state_as_dit_token: true`.
+The DiT input is `[diffusion step, state, actions]`: with 16 action tokens
+and width 512 it has shape `[B, 18, 512]` in every layer. The action head
+reads only the final 16 tokens. Setting this option to false removes the
+independent state token from DiT (17 total tokens). Image/state fusion still
+happens inside SQM or after mean pooling and is not repeated by the retriever.
+When the DiT state token is enabled, the slot gate also receives a separate
+current-state summary (`3*512 -> 128 -> heads`). Checkpoint configurations
+select their own DiT token route; changing task defaults does not rewrite them.
 
 Fusion parameters are saved and loaded as `perception_gate.proj.weight` and
 `perception_gate.proj.bias` under the memory retriever. Checkpoint loading is
