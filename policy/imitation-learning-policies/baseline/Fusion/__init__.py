@@ -1,0 +1,1 @@
+"""Adjacent-slot fusion baseline."""

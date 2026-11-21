@@ -41,6 +41,8 @@ class RedundancyGateMemoryBank(GateMemoryBank):
             raise ValueError("redundancy_alpha must be a finite non-negative number")
         self.redundancy_alpha = float(redundancy_alpha)
         self._similarity_cache: dict[tuple[int, int], torch.Tensor] = {}
+        # Pre-append Active scores, in the order of the query's Active slots.
+        self.latest_eviction_score_terms: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def _active_pairs(self):
         active = [slot for slot in self.slots if slot.state == "active"]
@@ -90,20 +92,30 @@ class RedundancyGateMemoryBank(GateMemoryBank):
         # With first/recent protection every eligible slot has two neighbors.
         # Actual-neighbor averaging also supports configs that unprotect ends.
         redundancy /= neighbor_count.clamp_min(1)
-        scores[active_indices] = gates + self.redundancy_alpha * (1 - redundancy)
+        one_minus_redundancy = 1 - redundancy
+        scores[active_indices] = gates + self.redundancy_alpha * one_minus_redundancy
+        self.latest_eviction_score_terms = (one_minus_redundancy, scores[active_indices])
         return scores
 
     def append(
         self, latent: torch.Tensor, frame_index: int, gate_scores: torch.Tensor,
         raw_features: torch.Tensor | None = None,
         raw_state: dict[str, torch.Tensor] | None = None,
+        *, record_eviction_scores: bool = False,
     ) -> int | None:
         # Do not decorate append with no_grad: the stored latent must retain
         # its task-loss gradient path inside the current training chunk.
-        if self.active_count == self.capacity and self.redundancy_alpha > 0:
-            gate_scores = self._eviction_scores(gate_scores)
+        # Online diagnostics also score a partial bank or alpha=0, without
+        # changing whether/how the underlying bank makes an eviction decision.
+        self.latest_eviction_score_terms = None
+        needs_eviction_scores = self.redundancy_alpha > 0 and self.active_count == self.capacity
+        if needs_eviction_scores or record_eviction_scores:
+            combined_scores = self._eviction_scores(gate_scores)
+            if needs_eviction_scores:
+                gate_scores = combined_scores
         evicted_id = super().append(latent, frame_index, gate_scores, raw_features, raw_state)
-        self._prune_similarity_cache()
+        if self._similarity_cache:
+            self._prune_similarity_cache()
         return evicted_id
 
     def reproject(self, projector: Callable[..., torch.Tensor]):

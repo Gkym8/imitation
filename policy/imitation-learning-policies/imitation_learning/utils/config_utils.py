@@ -127,6 +127,15 @@ def compose_training_config(cfg: DictConfig) -> DictConfig:
     OmegaConf.set_struct(base_cfg, True)
     merged = cast(DictConfig, OmegaConf.merge(base_cfg, cfg))
     merged["task_yaml_name"] = selected
+    memory_bank_type = OmegaConf.select(merged, "workspace.model.memory_bank_type")
+    if memory_bank_type == "fusion":
+        from baseline.Fusion.config import configure_fusion
+
+        configure_fusion(merged)
+    elif memory_bank_type == "memoact":
+        from baseline.MemoAct.config import configure_memoact
+
+        configure_memoact(merged)
     description = f"task/{selected}.yaml"
     if fallback is not None and selected != fallback:
         description += f" (overrides task/{fallback}.yaml)"

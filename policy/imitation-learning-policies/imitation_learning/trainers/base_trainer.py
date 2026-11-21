@@ -376,6 +376,9 @@ class BaseTrainer:
 
         if lr_scheduler_state_dict is not None:
             self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
+            # LambdaLR initialization can reset optimizer LRs to warmup step 0.
+            for group, learning_rate in zip(self.optimizer.param_groups, self.lr_scheduler.get_last_lr()):
+                group["lr"] = learning_rate
 
     def run(self):
         assert (
@@ -683,6 +686,7 @@ class BaseTrainer:
             {
                 "model_state_dict": to_cpu(model_trained_state_dict),
                 "ema_model_state_dict": to_cpu(ema_model_trained_state_dict),
+                "ema_optimization_step": int(ema_model.optimization_step.item()),
                 "optimizer_state_dict": to_cpu(self.optimizer.state_dict()),
                 "lr_scheduler_state_dict": to_cpu(self.lr_scheduler.state_dict()),
             }

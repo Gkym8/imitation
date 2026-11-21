@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import sys
 from collections import deque
 from pathlib import Path
@@ -36,10 +37,8 @@ if not OmegaConf.has_resolver("eval"):
 class RMBenchMemoryPolicy:
     """Load an imitation-learning checkpoint and expose RMBench methods.
 
-    Prediction horizon and executed chunk length are recovered from the model
-    configuration stored in the checkpoint. Evaluation changes only the target
-    device; all model and memory settings remain exactly as they were saved by
-    training.
+    Prediction horizon, executed chunk length and memory settings are recovered
+    from the model configuration stored in the checkpoint.
     """
 
     def __init__(
@@ -69,6 +68,9 @@ class RMBenchMemoryPolicy:
             raise TypeError("Checkpoint configuration must be a DictConfig")
         OmegaConf.set_struct(cfg, False)
         cfg.workspace.model.device = str(self.device)
+        self.checkpoint_redundancy_alpha = float(OmegaConf.select(
+            cfg, "workspace.model.memory_eviction.redundancy_alpha", default=0.0,
+        ))
         self.cfg = remove_keys_from_config(cfg)
 
         policy = hydra.utils.instantiate(self.cfg.workspace.model)
@@ -82,7 +84,9 @@ class RMBenchMemoryPolicy:
         self._memory_attention_record_key = (
             "history_cross_attention_slot_weights"
         )
-        if eval_output_dir is not None:
+        memory_bank_type = getattr(policy, "memory_bank_type", "gate")
+        record_slot_gates = eval_output_dir is not None and memory_bank_type == "gate"
+        if record_slot_gates:
             record_entries = list(self.policy.denoising_network.record_data_entries)
             if self._memory_attention_record_key not in record_entries:
                 record_entries.append(self._memory_attention_record_key)
@@ -146,20 +150,52 @@ class RMBenchMemoryPolicy:
         )
         self.slot_gate_record_path = (
             self.eval_output_dir / "memory_slot_gates.csv"
-            if self.eval_output_dir is not None
+            if record_slot_gates
             else None
         )
         self._eval_episode_index = -1
         self._initialize_slot_gate_recording()
+        if memory_bank_type == "fusion":
+            capacity = policy.denoising_network.max_history_len
+            memory_config = {"memory_bank_type": "fusion", "capacity": capacity}
+            memory_description = f"memory_bank_type=fusion, capacity={capacity}, "
+        elif memory_bank_type == "memoact":
+            short_term = policy.memoact_short_term_capacity
+            long_term = policy.memoact_long_term_capacity
+            memory_config = {
+                "memory_bank_type": "memoact",
+                "short_term_capacity": short_term,
+                "long_term_capacity": long_term,
+            }
+            memory_description = (
+                f"memory_bank_type=memoact, short_term_capacity={short_term}, "
+                f"long_term_capacity={long_term}, "
+            )
+        else:
+            memory_config = {
+                "checkpoint_redundancy_alpha": self.checkpoint_redundancy_alpha,
+            }
+            memory_description = (
+                f"keep_first={self.policy.keep_first_memory}, "
+                f"keep_recent={self.policy.keep_recent_memory}, "
+                f"checkpoint_redundancy_alpha={self.checkpoint_redundancy_alpha}, "
+                f"shadow_horizon={self.policy.denoising_network.shadow_horizon}, "
+                f"shadow_gate_scale={self.policy.denoising_network.memory_retriever.shadow_gate_scale}, "
+            )
+        if self.eval_output_dir is not None:
+            (self.eval_output_dir / "eval_memory_config.json").write_text(
+                json.dumps({
+                    "checkpoint_path": self.checkpoint_path,
+                    **memory_config,
+                }, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
         print(
             f"Loaded checkpoint {self.checkpoint_path}: "
             f"prediction_horizon={self.prediction_horizon}, "
             f"execution_chunk_length={self.execution_chunk_length}, "
-            f"keep_first={self.policy.keep_first_memory}, "
-            f"keep_recent={self.policy.keep_recent_memory}, "
-            f"shadow_horizon={self.policy.denoising_network.shadow_horizon}, "
-            f"shadow_gate_scale={self.policy.denoising_network.memory_retriever.shadow_gate_scale}, "
+            f"{memory_description}"
             "config_source=checkpoint, "
             f"image_keys={self.image_keys}, "
             f"input_keys={list(self.input_lengths)}"
@@ -174,6 +210,7 @@ class RMBenchMemoryPolicy:
             "gate_mean",
             *[f"gate_head_{i}" for i in range(self._gate_head_num)],
             "attention_mean",
+            "one_minus_redundancy", "eviction_score",
         ]
         self.slot_gate_record_path.parent.mkdir(parents=True, exist_ok=True)
         with self.slot_gate_record_path.open(
@@ -225,8 +262,10 @@ class RMBenchMemoryPolicy:
         ids = tuple(snapshot["slot_ids"])
         gates = tuple(snapshot["slot_gates"])
         states = tuple(snapshot["slot_states"])
+        novelty = tuple(snapshot["slot_one_minus_redundancy"])
+        eviction_scores = tuple(snapshot["slot_eviction_scores"])
         anchor = int(snapshot["query_anchor_index"])
-        if not (len(ids) == len(gates) == len(states)):
+        if not (len(ids) == len(gates) == len(states) == len(novelty) == len(eviction_scores)):
             raise RuntimeError("Recorded slot metadata is not aligned")
         if any(len(heads) != self._gate_head_num for heads in gates):
             raise RuntimeError("Recorded gate head count does not match checkpoint")
@@ -234,6 +273,14 @@ class RMBenchMemoryPolicy:
             raise RuntimeError("Recorded gates contain non-finite values")
         if any(state not in {"active", "shadow"} for state in states):
             raise RuntimeError("Recorded slot state is invalid")
+        for state, novelty_score, eviction_score in zip(states, novelty, eviction_scores):
+            if state == "shadow":
+                if novelty_score is not None or eviction_score is not None:
+                    raise RuntimeError("Shadow slots must not have eviction scores")
+            elif novelty_score is None or eviction_score is None or not np.isfinite(
+                [novelty_score, eviction_score]
+            ).all():
+                raise RuntimeError("Active slots must have finite eviction scores")
         if self._eval_episode_index < 0:
             self._eval_episode_index = 0
         attention = self._latest_slot_attention(len(ids))
@@ -253,6 +300,12 @@ class RMBenchMemoryPolicy:
                 "slot_state": state,
                 "gate_mean": format(sum(heads) / len(heads), ".9g"),
                 "attention_mean": format(attention[position], ".9g"),
+                "one_minus_redundancy": (
+                    "" if novelty[position] is None else format(novelty[position], ".9g")
+                ),
+                "eviction_score": (
+                    "" if eviction_scores[position] is None else format(eviction_scores[position], ".9g")
+                ),
             })
             row.update({f"gate_head_{i}": format(value, ".9g") for i, value in enumerate(heads)})
             rows.append(row)
@@ -348,6 +401,15 @@ class RMBenchMemoryPolicy:
             .numpy()
             .astype(np.float32, copy=False)
         )
+
+    def get_action_for_execution(self, obs: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "actions": self.get_action(obs),
+            "record_execution": getattr(self.policy, "action_history", False),
+        }
+
+    def record_executed_actions(self, executed_steps: int) -> None:
+        self.policy.record_executed_actions(0, executed_steps)
 
     def _reset_runtime_state(self) -> None:
         self.policy.reset()

@@ -68,18 +68,24 @@ def _get_actions(model, obs):
     """Support both in-process evaluation and RMBench's model-server proxy."""
 
     if hasattr(model, "call"):
-        return model.call(func_name="get_action", obs=obs)
-    return model.get_action(obs)
+        return model.call(func_name="get_action_for_execution", obs=obs)
+    if hasattr(model, "get_action_for_execution"):
+        return model.get_action_for_execution(obs)
+    return {"actions": model.get_action(obs), "record_execution": False}
 
 
 def eval(TASK_ENV, model, observation):
     obs = encode_obs(observation)
-    actions = np.asarray(_get_actions(model, obs), dtype=np.float32)
+    result = _get_actions(model, obs)
+    actions = np.asarray(result["actions"], dtype=np.float32)
     if actions.ndim != 2:
         raise ValueError(f"Model actions must have shape [T,D], got {actions.shape}")
 
     # One model call corresponds to one memory slot/action chunk. The outer
     # RMBench loop supplies the representative observation for the next slot.
+    record_execution = result["record_execution"]
+    if record_execution:
+        start_step = TASK_ENV.take_action_cnt
     for action_idx, action in enumerate(actions):
         TASK_ENV.take_action(action, action_type="qpos")
         if TASK_ENV.eval_success:
@@ -91,6 +97,12 @@ def eval(TASK_ENV, model, observation):
         # policy memory must still advance once per configured action chunk.
         if action_idx + 1 < len(actions):
             TASK_ENV.get_obs()
+    if record_execution:
+        executed_steps = int(TASK_ENV.take_action_cnt - start_step)
+        if hasattr(model, "call"):
+            model.call(func_name="record_executed_actions", obs=executed_steps)
+        else:
+            model.record_executed_actions(executed_steps)
 
 
 def reset_model(model):

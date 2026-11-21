@@ -142,11 +142,30 @@ class BaseWorkspace:
         self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
 
         if "ema_model_state_dict" in ckpt:
-            self.ema_model.load_state_dict(ckpt["ema_model_state_dict"], strict=False)
+            ema_state = ckpt["ema_model_state_dict"]
+            if any(key.startswith("averaged_model.") for key in ema_state):
+                self.ema_model.load_state_dict(ema_state, strict=False)
+            else:
+                # save_ckpt stores averaged_model.state_dict(), not the wrapper.
+                self.ema_model.averaged_model.load_state_dict(ema_state, strict=False)
         else:
             self.ema_model.averaged_model.load_state_dict(
                 ckpt["model_state_dict"], strict=False
             )
+
+        ema_step = ckpt.get("ema_optimization_step")
+        if ema_step is None:
+            ema_step = ckpt.get("ema_model_state_dict", {}).get("optimization_step")
+        if ema_step is None:
+            # Legacy workspaces did not save the EMA counter. Adam's largest
+            # per-parameter step tracks optimizer updates for these runs.
+            steps = [
+                int(state["step"])
+                for state in ckpt.get("optimizer_state_dict", {}).get("state", {}).values()
+                if "step" in state
+            ]
+            ema_step = max(steps, default=0)
+        self.ema_model.optimization_step.fill_(int(ema_step))
 
         if "optimizer_state_dict" in ckpt:
             optimizer_state_dict = ckpt["optimizer_state_dict"]

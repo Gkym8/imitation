@@ -1,9 +1,11 @@
 import click
 import dill
 import hydra
+import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from robot_utils.torch_utils import torch_load
+from imitation_learning.utils.config_utils import remove_keys_from_config
 from imitation_learning.workspaces.base_workspace import BaseWorkspace
 
 
@@ -25,7 +27,8 @@ def main(
     record_history_attention: bool,
     train_batch_size: int | None,
 ):
-    ckpt = torch_load(ckpt_path, pickle_module=dill)
+    mp.set_start_method("spawn", force=True)
+    ckpt = torch_load(ckpt_path, map_location="cpu", pickle_module=dill)
 
     config_str: str = ckpt["cfg_str_unresolved"]
     config = OmegaConf.create(config_str)
@@ -49,6 +52,7 @@ def main(
         print(f"Per-process training batch size: {train_batch_size}")
 
     config["workspace"]["cfg_str_unresolved"] = config_str
+    config = remove_keys_from_config(config)
     workspace: BaseWorkspace = hydra.utils.instantiate(config["workspace"])
     workspace.resume_training(ckpt)
 

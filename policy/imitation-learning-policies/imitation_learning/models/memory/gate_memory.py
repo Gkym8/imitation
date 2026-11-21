@@ -132,20 +132,25 @@ class GateMemoryBank:
 
     def reproject(self, projector: Callable[..., torch.Tensor]):
         """Rebuild historical latents using the current chunk's parameters."""
-        if self.slots and all(slot.raw_features is not None for slot in self.slots):
-            raw_features = torch.stack([slot.raw_features for slot in self.slots])
-            if any(slot.raw_state is not None for slot in self.slots):
-                if not all(slot.raw_state is not None for slot in self.slots):
-                    raise ValueError("state-conditioned history is missing an image's own state")
-                raw_state = {
-                    name: torch.stack([slot.raw_state[name] for slot in self.slots])
-                    for name in self.slots[0].raw_state
-                }
-                projected = projector(raw_features, raw_state)
-            else:
-                projected = projector(raw_features)
-            for slot, latent in zip(self.slots, projected):
-                slot.latent = latent
+        if all(slot.raw_features is not None for slot in self.slots):
+            self._reproject_slots(self.slots, projector)
+
+    def _reproject_slots(self, slots: list[MemorySlot], projector: Callable[..., torch.Tensor]):
+        if not slots:
+            return
+        raw_features = torch.stack([slot.raw_features for slot in slots])
+        if any(slot.raw_state is not None for slot in slots):
+            if not all(slot.raw_state is not None for slot in slots):
+                raise ValueError("state-conditioned history is missing an image's own state")
+            raw_state = {
+                name: torch.stack([slot.raw_state[name] for slot in slots])
+                for name in slots[0].raw_state
+            }
+            projected = projector(raw_features, raw_state)
+        else:
+            projected = projector(raw_features)
+        for slot, latent in zip(slots, projected):
+            slot.latent = latent
 
 
 def gate_selectivity_penalty(

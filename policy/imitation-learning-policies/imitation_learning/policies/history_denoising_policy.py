@@ -38,8 +38,20 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         memory_gate: MemoryGate | None = None,
         max_training_traj_num: int = -1,
         future_prediction_mode: str | None = None,
+        memory_bank_type: str = "gate",
+        memoact_short_term_capacity: int = 6,
+        memoact_long_term_capacity: int = 8,
         **kwargs,
     ):
+        if memory_bank_type not in {"gate", "fusion", "memoact"}:
+            raise ValueError("memory_bank_type must be 'gate', 'fusion' or 'memoact'")
+        self.memory_bank_type = memory_bank_type
+        if memory_bank_type != "gate" and (
+            skip_memory or future_feature_predictor is not None
+            or future_img_feature_encoder is not None or memory_gate is not None
+        ):
+            raise ValueError(f"{memory_bank_type} requires visual memory without future prediction or memory gates")
+
         # Checkpoints without a mode retain their explicit legacy pooling and
         # target-encoder settings. New configs select both with one switch.
         if future_prediction_mode is not None:
@@ -106,7 +118,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             future_prediction_context_pooling
         )
         self.use_cached_image_features = bool(use_cached_image_features)
-        if future_img_feature_encoder is None:
+        if future_img_feature_encoder is None and self.memory_bank_type == "gate":
             # Keep legacy checkpoints unchanged: the fallback is the already
             # registered history encoder, not a second nn.Module alias with a
             # duplicate state-dict prefix.
@@ -202,6 +214,13 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         self.skip_memory = skip_memory
         if skip_memory:
             self.enable_skip_memory()
+        elif self.memory_bank_type != "gate":
+            if (
+                self.denoising_network.memory_retriever.slot_gate is not None
+                or self.denoising_network.shadow_horizon
+                or self.denoising_network.skip_history_attn
+            ):
+                raise ValueError(f"{memory_bank_type} requires ungated history attention without Shadow memory")
         elif self.denoising_network.memory_retriever.slot_gate is None:
             raise ValueError("Gate memory requires use_conditioned_slot_gate=True")
         if max_training_traj_num > 0:
@@ -214,8 +233,24 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         self.keep_recent_memory = eviction.get("keep_recent", 2)
         # Missing in old checkpoints: preserve their original Gate-only eviction.
         self.eviction_redundancy_alpha = eviction.get("redundancy_alpha", 0.0)
+        if self.memory_bank_type == "memoact":
+            from baseline.MemoAct.memory_bank import MemoActCompressor
+
+            network = self.denoising_network
+            self.memoact_short_term_capacity = memoact_short_term_capacity
+            self.memoact_long_term_capacity = memoact_long_term_capacity
+            token_num = (
+                network.global_cond_token_num
+                if network.compact_multiview_slot or network.state_conditioned_history_slot
+                else network.history_img_features_token_num
+            )
+            self.memoact_compressor = MemoActCompressor(
+                token_num, network.hidden_dim, network.head_num,
+            )
         if not skip_memory:
-            self._new_memory_bank()  # Validate capacity and protection together.
+            bank = self._new_memory_bank()  # Validate capacity and protection together.
+            if self.memory_bank_type == "memoact" and bank.capacity != self.denoising_network.max_history_len:
+                raise ValueError("MemoAct history length must equal the combined bank capacity")
         if not 0 <= gate_selectivity_min_std <= 0.5:
             raise ValueError("gate_selectivity_min_std must be in [0, 0.5]")
         self.gate_selectivity_min_std = float(gate_selectivity_min_std)
@@ -678,6 +713,17 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
 
 
     def _new_memory_bank(self) -> GateMemoryBank:
+        if self.memory_bank_type == "fusion":
+            from baseline.Fusion.memory_bank import FusionMemoryBank
+
+            return FusionMemoryBank(self.denoising_network.max_history_len)
+        if self.memory_bank_type == "memoact":
+            from baseline.MemoAct.memory_bank import MemoActMemoryBank
+
+            return MemoActMemoryBank(
+                self.memoact_short_term_capacity, self.memoact_long_term_capacity,
+                self.memoact_compressor,
+            )
         return RedundancyGateMemoryBank(
             self.denoising_network.max_history_len,
             keep_first=self.keep_first_memory,
@@ -693,6 +739,8 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         capacity = network.max_history_storage_len
         rows, masks, active_masks, shadow_masks, shadow_steps = [], [], [], [], []
         for bank in banks:
+            if self.memory_bank_type == "memoact":
+                bank.prepare_read()
             padding = capacity - len(bank)
             empty = reference.new_zeros((padding, *reference.shape[1:]))
             retained = (
@@ -701,6 +749,8 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             )
             rows.append(torch.cat([empty, retained], dim=0))
             masks.append(torch.arange(capacity, device=reference.device) >= padding)
+            if self.memory_bank_type != "gate":
+                continue
             active = torch.tensor(
                 [False] * padding + [slot.state == "active" for slot in bank.slots],
                 device=reference.device, dtype=torch.bool,
@@ -720,12 +770,13 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             shadow_steps.append(torch.tensor(steps, device=reference.device, dtype=torch.long))
         history = torch.stack(rows)
         positioned = network.add_history_key_encoding(history, network.history_time_embedding)
-        result = {
-            "history_mask": torch.stack(masks),
-            "history_active_mask": torch.stack(active_masks),
-            "history_shadow_mask": torch.stack(shadow_masks),
-            "history_shadow_steps": torch.stack(shadow_steps),
-        }
+        result = {"history_mask": torch.stack(masks)}
+        if self.memory_bank_type == "gate":
+            result.update(
+                history_active_mask=torch.stack(active_masks),
+                history_shadow_mask=torch.stack(shadow_masks),
+                history_shadow_steps=torch.stack(shadow_steps),
+            )
         if network.memory_retrieval_mode == "perception_patches":
             result["history_latents"] = history
             result["history_key_latents"] = positioned
@@ -739,7 +790,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             for name in ("history_cross_attention_frame_logits", "history_cross_attention_slot_weights"):
                 if name not in entries:
                     entries.append(name)
-        if training:
+        if training and self.memory_bank_type == "gate":
             entries.append("slot_gate_training_log_gates")
         return {name: [] for name in entries}
 
@@ -772,7 +823,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         ]
 
     def predict_single_traj(self, normalized_batch: batch_type) -> batch_type:
-        """Read, decide, evict by the same read's gates, then write the new slot."""
+        """Read the historical bank, predict an action, then write the new slot."""
         if "action" in normalized_batch:
             raise ValueError("Exclude action supervision during online inference")
         self.shared_model_manager.clear_cache()
@@ -799,27 +850,31 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         decision_memory = network.retrieve_decision_memory(
             retrieval_inputs, record_data_dict=records or None,
         )
-        gate_scores = self._current_gate_scores(banks)
+        uses_gate = self.memory_bank_type == "gate"
+        gate_scores = self._current_gate_scores(banks) if uses_gate else [None] * len(banks)
         gates = network.memory_retriever.latest_slot_gates
         effective_gates = network.memory_retriever.latest_effective_slot_gates
         self.latest_online_memory_query_dict = {}
         for i, (episode, bank) in enumerate(zip(episode_ids, banks)):
-            values = gates[i, gates.shape[1] - len(bank):].float().cpu().tolist()
-            self.latest_online_memory_query_dict[episode] = {
-                "query_frame_index": self.next_frame_index_dict.get(episode, 0),
-                "query_anchor_index": bank.next_anchor_index,
-                "active_slot_count": bank.active_count,
-                "shadow_slot_count": bank.shadow_count,
-                "slot_ids": tuple(slot.slot_id for slot in bank.slots),
-                "slot_frame_indices": tuple(slot.frame_index for slot in bank.slots),
-                "slot_states": tuple(slot.state for slot in bank.slots),
-                "slot_expire_at": tuple(slot.expire_at for slot in bank.slots),
-                "slot_gates": tuple(tuple(heads) for heads in values),
-                "slot_effective_gates": tuple(
-                    tuple(heads) for heads in effective_gates[i, gates.shape[1] - len(bank):].float().cpu().tolist()
-                ),
-                "gate_scores": tuple(sum(heads) / len(heads) for heads in values),
-            }
+            if uses_gate:
+                values = gates[i, gates.shape[1] - len(bank):].float().cpu().tolist()
+                self.latest_online_memory_query_dict[episode] = {
+                    "query_frame_index": self.next_frame_index_dict.get(episode, 0),
+                    "query_anchor_index": bank.next_anchor_index,
+                    "active_slot_count": bank.active_count,
+                    "shadow_slot_count": bank.shadow_count,
+                    "slot_ids": tuple(slot.slot_id for slot in bank.slots),
+                    "slot_frame_indices": tuple(slot.frame_index for slot in bank.slots),
+                    "slot_states": tuple(slot.state for slot in bank.slots),
+                    "slot_expire_at": tuple(slot.expire_at for slot in bank.slots),
+                    "slot_gates": tuple(tuple(heads) for heads in values),
+                    "slot_effective_gates": tuple(
+                        tuple(heads) for heads in effective_gates[i, gates.shape[1] - len(bank):].float().cpu().tolist()
+                    ),
+                    "gate_scores": tuple(sum(heads) / len(heads) for heads in values),
+                    "slot_one_minus_redundancy": (None,) * len(bank),
+                    "slot_eviction_scores": (None,) * len(bank),
+                }
             if records:
                 self.recorded_data_dicts.setdefault(episode, []).append({
                     key: torch.stack(values, dim=1)[i:i + 1].detach().clone()
@@ -852,11 +907,33 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                     None if network.image_merge_requires_state or network.compact_multiview_slot
                     or network.state_conditioned_history_slot else raw_features[i].detach()
                 ),
+                record_eviction_scores=uses_gate,
             )
+            if not uses_gate:
+                self.next_frame_index_dict[episode] = frame + self.execution_chunk_length
+                continue
+            # append scores the history read above, before demotion/expiry/write.
+            # Preserve that alignment even when a slot becomes Shadow now.
+            snapshot = self.latest_online_memory_query_dict[episode]
+            active_positions = [
+                position for position, state in enumerate(snapshot["slot_states"])
+                if state == "active"
+            ]
+            terms = bank.latest_eviction_score_terms
+            if terms is None or any(len(term) != len(active_positions) for term in terms):
+                raise RuntimeError("Eviction score recording is not aligned with Active history")
+            novelty, combined = torch.stack(terms).float().cpu().tolist()
+            novelty_by_slot = [None] * len(snapshot["slot_ids"])
+            combined_by_slot = [None] * len(snapshot["slot_ids"])
+            for position, novelty_score, combined_score in zip(active_positions, novelty, combined):
+                novelty_by_slot[position] = novelty_score
+                combined_by_slot[position] = combined_score
+            snapshot["slot_one_minus_redundancy"] = tuple(novelty_by_slot)
+            snapshot["slot_eviction_scores"] = tuple(combined_by_slot)
             self.next_frame_index_dict[episode] = frame + self.execution_chunk_length
         return self.action_decoder(data_dict["noisy_action"])
 
-    def _build_gate_training_memories(
+    def _build_training_memories(
         self, projected, raw_features, valid_mask, frame_indices, supervised, banks, raw_state=None,
     ):
         network = self.denoising_network
@@ -865,6 +942,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         offsets = torch.arange(batch_size, device=all_latents.device) * input_length
         memories, penalties, eligible_rows = [], [], []
         records = self._retrieval_records(training=True)
+        uses_gate = self.memory_bank_type == "gate"
         current_keys = ("global_cond", "global_cond_mask", "local_cond", "local_cond_mask", "memory_gate_val")
         can_reproject = not (network.compact_multiview_slot or network.state_conditioned_history_slot)
         if can_reproject:
@@ -882,14 +960,17 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             inputs.update(self._pack_history(banks, all_latents[:, anchor]))
             memory = network.retrieve_decision_memory(inputs, record_data_dict=records)
             memories.append(memory)
-            log_gates = records["slot_gate_training_log_gates"].pop()
-            penalty, eligible = gate_selectivity_penalty(
-                log_gates, inputs["history_active_mask"],
-                network.max_history_len, self.gate_selectivity_min_std,
-            )
-            penalties.append(penalty)
-            eligible_rows.append(eligible & valid_mask[:, anchor])
-            scores = self._current_gate_scores(banks)
+            if uses_gate:
+                log_gates = records["slot_gate_training_log_gates"].pop()
+                penalty, eligible = gate_selectivity_penalty(
+                    log_gates, inputs["history_active_mask"],
+                    network.max_history_len, self.gate_selectivity_min_std,
+                )
+                penalties.append(penalty)
+                eligible_rows.append(eligible & valid_mask[:, anchor])
+                scores = self._current_gate_scores(banks)
+            else:
+                scores = [None] * len(banks)
             for i, bank in enumerate(banks):
                 if bool(valid_mask[i, anchor]):
                     bank.append(
@@ -900,13 +981,14 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
                             if raw_state is not None and can_reproject else None
                         ),
                     )
-        records.pop("slot_gate_training_log_gates")
         memories = torch.stack(memories, dim=1)
-        penalties = torch.stack(penalties, dim=1)
-        eligible = torch.stack(eligible_rows, dim=1)
-        # An unfilled bank contributes zero. Averaging over valid anchors keeps
-        # the regularizer invariant to the trainer's chunk boundaries.
-        gate_loss = (penalties * eligible).sum() / valid_mask[:, :supervised].sum().clamp_min(1)
+        gate_loss = None
+        if uses_gate:
+            records.pop("slot_gate_training_log_gates")
+            penalties = torch.stack(penalties, dim=1)
+            eligible = torch.stack(eligible_rows, dim=1)
+            # Averaging over valid anchors keeps the regularizer invariant to chunk boundaries.
+            gate_loss = (penalties * eligible).sum() / valid_mask[:, :supervised].sum().clamp_min(1)
         if "decision_memory" in records:
             records["decision_memory"] = [
                 einops.rearrange(memories.detach(), "b t n d -> (b t) n d")
@@ -965,7 +1047,7 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
             raw_state = {name: batch[name] for name in self.local_cond_encoder.data_entry_names}
             if "local_cond_mask" in data_dict:
                 raw_state["_image_state_mask"] = data_dict["local_cond_mask"]
-        decision_memory, gate_loss = self._build_gate_training_memories(
+        decision_memory, gate_loss = self._build_training_memories(
             projected, data_dict["history_img_features"], valid,
             frames[:, :, 0], supervised, banks, raw_state=raw_state,
         )
@@ -985,8 +1067,13 @@ class HistoryDenoisingPolicy(BaseDenoisingPolicy):
         ).flatten(start_dim=2).mean(dim=-1)
         loss = {
             "action": (action_error * anchor_valid).sum() / anchor_valid.sum().clamp_min(1),
-            "gate_selectivity": gate_loss,
         }
+        if self.memory_bank_type == "memoact" and torch.is_grad_enabled():
+            # DDP must see compressor parameters on ranks whose chunks have no new summary.
+            params = [param.flatten()[0] for param in self.memoact_compressor.parameters()]
+            loss["action"] = loss["action"] + torch.stack(params).sum() * 0.0
+        if gate_loss is not None:
+            loss["gate_selectivity"] = gate_loss
         if self.future_feature_predictor is not None:
             actions = None
             if self.future_feature_predictor.use_action_condition:

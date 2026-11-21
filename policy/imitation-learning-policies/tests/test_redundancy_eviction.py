@@ -116,7 +116,10 @@ class RedundancyEvictionTest(unittest.TestCase):
         old = GateMemoryBank(5, keep_recent=2, shadow_horizon=3)
         new = RedundancyGateMemoryBank(5, keep_recent=2, shadow_horizon=3, redundancy_alpha=0.)
         generator = torch.Generator().manual_seed(4)
-        with patch(f"{MODULE}.token_mean_cosine", side_effect=AssertionError("disabled")):
+        with (
+            patch(f"{MODULE}.token_mean_cosine", side_effect=AssertionError("redundancy disabled")),
+            patch.object(new, "_active_pairs", side_effect=AssertionError("redundancy disabled")),
+        ):
             for i in range(30):
                 gates = torch.rand(len(old), generator=generator)
                 latent = torch.randn(2, 3, generator=generator)
@@ -151,6 +154,48 @@ class RedundancyEvictionTest(unittest.TestCase):
         for alpha in (-.1, True, float("nan"), float("inf"), "0.1"):
             with self.subTest(alpha=alpha), self.assertRaisesRegex(ValueError, "redundancy_alpha"):
                 RedundancyGateMemoryBank(5, redundancy_alpha=alpha)
+
+    def test_recording_reuses_eviction_calculation_and_keeps_pre_append_alignment(self):
+        bank = RedundancyGateMemoryBank(5, keep_recent=1, shadow_horizon=3, redundancy_alpha=1.)
+        self.fill(bank, self.features())
+        gates = torch.tensor([1., .55, .5, .4, 1.], requires_grad=True)
+        with patch(f"{MODULE}.token_mean_cosine", wraps=token_mean_cosine) as cosine:
+            demoted = bank.append(torch.ones(2, 2), 50, gates, record_eviction_scores=True)
+            self.assertEqual(cosine.call_count, 1)
+            self.assertEqual(cosine.call_args.args[0].shape[0], 4)
+        novelty, combined = bank.latest_eviction_score_terms
+        torch.testing.assert_close(novelty, 1 - torch.tensor([.55, .75, .275, .5, .4]))
+        torch.testing.assert_close(combined, gates.detach() + novelty)
+        self.assertEqual(demoted, 1)
+        self.assertEqual(len(novelty), 5)  # Incoming slot 5 is not in this read.
+        self.assertEqual(bank.slots[1].state, "shadow")
+        self.assertFalse(novelty.requires_grad)
+        self.assertFalse(combined.requires_grad)
+
+    def test_recording_does_not_change_lifecycle_for_zero_or_positive_alpha(self):
+        for alpha in (0., .7):
+            with self.subTest(alpha=alpha):
+                plain = RedundancyGateMemoryBank(5, shadow_horizon=3, redundancy_alpha=alpha)
+                recorded = RedundancyGateMemoryBank(5, shadow_horizon=3, redundancy_alpha=alpha)
+                rng = torch.Generator().manual_seed(72)
+                for i in range(20):
+                    states = [slot.state for slot in plain.slots]
+                    gates = torch.rand(len(plain), generator=rng)
+                    latent = torch.randn(3, 4, generator=rng)
+                    expected = plain.append(latent, i * 10, gates)
+                    actual = recorded.append(latent, i * 10, gates, record_eviction_scores=True)
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(
+                        [(s.slot_id, s.state, s.expire_at) for s in plain.slots],
+                        [(s.slot_id, s.state, s.expire_at) for s in recorded.slots],
+                    )
+                    novelty, combined = recorded.latest_eviction_score_terms
+                    self.assertEqual(len(novelty), states.count("active"))
+                    self.assertTrue(torch.isfinite(novelty).all())
+                    torch.testing.assert_close(
+                        combined, gates[[j for j, state in enumerate(states) if state == "active"]]
+                        + alpha * novelty,
+                    )
 
 
 class RedundancyPolicyTest(unittest.TestCase):
@@ -208,6 +253,18 @@ class RedundancyPolicyTest(unittest.TestCase):
                         "agent_pos": batch["agent_pos"][:, anchor],
                         "episode_idx": torch.tensor([0]),
                     })
+                snapshot = policy.latest_online_memory_query_dict[0]
+                novelty = snapshot["slot_one_minus_redundancy"]
+                combined = snapshot["slot_eviction_scores"]
+                self.assertEqual(len(novelty), len(snapshot["slot_ids"]))
+                for j, state in enumerate(snapshot["slot_states"]):
+                    if state == "shadow":
+                        self.assertIsNone(novelty[j])
+                        self.assertIsNone(combined[j])
+                    else:
+                        self.assertAlmostEqual(
+                            combined[j], snapshot["gate_scores"][j] + .7 * novelty[j], places=6,
+                        )
         self.assertEqual(traces, training_traces)
         self.assertTrue(any(state == "shadow" for _, state, _ in traces[-1]))
         policy.reset()

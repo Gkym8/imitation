@@ -28,6 +28,13 @@ class RMBenchSlotGateRecordingTest(unittest.TestCase):
         snapshot.setdefault("slot_effective_gates", snapshot["slot_gates"])
         snapshot.setdefault("active_slot_count", snapshot["slot_states"].count("active"))
         snapshot.setdefault("shadow_slot_count", snapshot["slot_states"].count("shadow"))
+        snapshot.setdefault("slot_one_minus_redundancy", tuple(
+            0.75 if state == "active" else None for state in snapshot["slot_states"]
+        ))
+        snapshot.setdefault("slot_eviction_scores", tuple(
+            sum(heads) / len(heads) + 0.4 * 0.75 if state == "active" else None
+            for state, heads in zip(snapshot["slot_states"], snapshot["slot_gates"])
+        ))
         adapter = RMBenchMemoryPolicy.__new__(RMBenchMemoryPolicy)
         adapter.slot_gate_record_path = record_path
         adapter._gate_head_num = 2
@@ -68,6 +75,7 @@ class RMBenchSlotGateRecordingTest(unittest.TestCase):
             self.assertEqual(list(rows[0]), [
                 "episode_index", "query_anchor_index", "slot_id", "slot_state",
                 "gate_mean", "gate_head_0", "gate_head_1", "attention_mean",
+                "one_minus_redundancy", "eviction_score",
             ])
             self.assertEqual(rows[0]["query_anchor_index"], "3")
             self.assertEqual(rows[0]["slot_id"], "0")
@@ -76,9 +84,12 @@ class RMBenchSlotGateRecordingTest(unittest.TestCase):
             self.assertEqual(rows[0]["gate_head_1"], "0.6")
             self.assertEqual(rows[0]["slot_state"], "active")
             self.assertEqual(rows[0]["attention_mean"], "0.375")
+            self.assertEqual(rows[0]["one_minus_redundancy"], "0.75")
+            self.assertEqual(rows[0]["eviction_score"], "0.7")
             self.assertEqual(rows[1]["slot_id"], "2")
             self.assertEqual(rows[1]["gate_mean"], "0.2")
             self.assertEqual(rows[1]["attention_mean"], "0.625")
+            self.assertEqual(rows[1]["eviction_score"], "0.5")
 
             adapter.policy.reset = Mock()
             adapter.observation_history = {}
@@ -135,6 +146,8 @@ class RMBenchSlotGateRecordingTest(unittest.TestCase):
             self.assertEqual(rows[1]["gate_head_0"], "0.1")
             self.assertEqual(rows[1]["gate_head_1"], "0.3")
             self.assertEqual(rows[1]["attention_mean"], "0.625")
+            self.assertEqual(rows[1]["one_minus_redundancy"], "")
+            self.assertEqual(rows[1]["eviction_score"], "")
 
 
 if __name__ == "__main__":
