@@ -9,7 +9,7 @@ from imitation_learning.models.common.state_query_merger import StateQueryPatchM
 from imitation_learning.models.common.pos_embeddings import get_nd_sincos_pos_embed_from_grid
 from imitation_learning.models.common.spatial_merge import spatial_merge_shape
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
-import test_future_prediction_mode as fixture
+import policy_fixture as fixture
 
 
 class RectangularMergeGeometryTest(unittest.TestCase):
@@ -70,17 +70,17 @@ class RectangularMergeGeometryTest(unittest.TestCase):
 class RectangularMergePolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        fixture.FuturePredictionModeTest.setUpClass()
+        fixture.PolicyFixture.setUpClass()
 
     def setUp(self):
-        self.helper = fixture.FuturePredictionModeTest()
+        self.helper = fixture.PolicyFixture()
 
     def tearDown(self):
         gc.collect()
         SharedModelManager.reset()
 
-    def config(self, merging='learned', shape=(4, 8), cached=True, mode='pooled', views=1):
-        cfg = self.helper.make_config(mode, cached, merge_size=list(shape))
+    def config(self, merging='learned', shape=(4, 8), cached=True, views=1):
+        cfg = self.helper.make_config(cached, merge_size=list(shape))
         cfg.visual_encoder.state_query_merge = merging == 'learned'
         cfg.workspace.train_dataset.image_keys = ['head_camera', 'left_camera', 'right_camera'][:views]
         # Rectangular pooling consumes full patch caches for every view.
@@ -96,8 +96,8 @@ class RectangularMergePolicyTest(unittest.TestCase):
             batch[camera + suffix] = batch['head_camera' + suffix].clone() + 0.1
         return batch
 
-    def check_policy_case(self, merging, shape, cached, mode, views):
-        cfg = self.config(merging, shape, cached, mode, views)
+    def check_policy_case(self, merging, shape, cached, views):
+        cfg = self.config(merging, shape, cached, views)
         policy = self.helper.instantiate_policy(cfg)
         network = policy.denoising_network
         batch = self.batch(cfg)
@@ -110,20 +110,8 @@ class RectangularMergePolicyTest(unittest.TestCase):
         )).to(network.global_cond_pos_embedding).reshape_as(network.global_cond_pos_embedding)
         torch.testing.assert_close(network.global_cond_pos_embedding, expected_positions, rtol=0, atol=0)
         self.assertEqual(policy.global_cond_encoder.token_num, (8 if merging == 'mean' else 256) * views)
-        self.assertEqual(policy.future_img_feature_encoder.token_num, (8 if mode == 'tokens' else 1) * views)
-        if mode == 'tokens':
-            _, targets = policy._encode_input_multi_traj(batch)
-            raw = batch['head_camera_feature'][..., 1:, :] if cached else None
-            if raw is not None:
-                grid = raw.reshape(1, 3, 1, 16, 16, 8)
-                height, width = shape
-                expected = torch.stack([
-                    grid[..., r:r + height, c:c + width, :].mean(dim=(-3, -2))
-                    for r in range(0, 16, height) for c in range(0, 16, width)
-                ], dim=-2).squeeze(2)
-                torch.testing.assert_close(targets['future_features'][:, :-1, :8], expected[:, 1:])
         losses = policy.compute_loss(batch)
-        total = losses['action'] + 0.05 * losses['future_prediction']
+        total = losses['action']
         self.assertTrue(torch.isfinite(total))
         total.backward()
         self.assertTrue(all(torch.isfinite(p.grad).all() for p in policy.parameters() if p.grad is not None))
@@ -141,14 +129,14 @@ class RectangularMergePolicyTest(unittest.TestCase):
             self.assertEqual(output['action'].shape, (1, 16, 14))
         self.assertTrue(all(slot.latent.shape == (8 * views, 32) for slot in policy.online_memory_banks[0].slots))
 
-    def test_all_merging_modes_cached_online_targets_orientations_and_views(self):
+    def test_all_merging_modes_cached_online_orientations_and_views(self):
         cases = (
-            ('mean', (4, 8), True, 'tokens', 1),
-            ('mean', (8, 4), False, 'pooled', 3),
-            ('learned', (4, 8), True, 'tokens', 3),
-            ('learned', (8, 4), False, 'pooled', 1),
-            ('learned', (4, 8), True, 'pooled', 3),
-            ('learned', (8, 4), False, 'tokens', 1),
+            ('mean', (4, 8), True, 1),
+            ('mean', (8, 4), False, 3),
+            ('learned', (4, 8), True, 3),
+            ('learned', (8, 4), False, 1),
+            ('learned', (4, 8), True, 3),
+            ('learned', (8, 4), False, 1),
         )
         for case in cases:
             with self.subTest(case=case):
@@ -169,7 +157,6 @@ class RectangularMergePolicyTest(unittest.TestCase):
                 ], dim=1)
                 torch.testing.assert_close(merged, expected, rtol=0, atol=0)
                 self.assertEqual(encoder.token_num, 8)
-                self.assertEqual(policy.future_img_feature_encoder.token_num, 1)
                 del policy
 
     def test_streaming_and_online_rectangular_history_and_shadows_agree(self):
@@ -188,7 +175,7 @@ class RectangularMergePolicyTest(unittest.TestCase):
             chunk = {name: value[:, start:start + 5] for name, value in batch.items()}
             chunk.update(_streaming_supervised_length=4, _streaming_reset=start == 0, _streaming_final=False)
             losses = policy.compute_loss(chunk)
-            (losses['action'] + 0.05 * losses['future_prediction']).backward()
+            (losses['action']).backward()
             for slot in policy._streaming_training_state[0].slots:
                 self.assertEqual(slot.latent.shape, (24, 32))
                 self.assertEqual(slot.raw_features.shape, (3 * (256 if merging == 'learned' else 8), 8))
@@ -210,7 +197,7 @@ class RectangularMergePolicyTest(unittest.TestCase):
                 self.check_roundtrip_case(merging)
 
     def check_roundtrip_case(self, merging):
-        cfg = self.config(merging, mode='tokens')
+        cfg = self.config(merging)
         cfg.run_name = 'rectangular-config-roundtrip'
         cfg.project_name = cfg.logger_project_name = 'rmbench'
         cfg.train_server_name = 'localhost'

@@ -10,7 +10,7 @@ import torch
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
 from imitation_learning.models.memory.gate_memory import GateMemoryBank, gate_selectivity_penalty
 import test_conditioned_slot_gate as gate_fixture
-import test_future_prediction_mode as future_fixture
+import policy_fixture as future_fixture
 
 
 class ShadowMemoryBankTest(unittest.TestCase):
@@ -176,17 +176,17 @@ class ShadowMemoryRetrievalTest(unittest.TestCase):
 class ShadowMemoryPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        future_fixture.FuturePredictionModeTest.setUpClass()
+        future_fixture.PolicyFixture.setUpClass()
 
     def setUp(self):
-        self.fixture = future_fixture.FuturePredictionModeTest()
+        self.fixture = future_fixture.PolicyFixture()
 
     def tearDown(self):
         gc.collect()
         SharedModelManager.reset()
 
-    def make_config(self, mode="tokens", cached=True):
-        cfg = self.fixture.make_config(mode, cached)
+    def make_config(self, cached=True):
+        cfg = self.fixture.make_config(cached)
         network = cfg.workspace.model.denoising_network_partial
         network.max_history_len = 4
         network.shadow_horizon = 3
@@ -201,100 +201,96 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
     def snapshot(self, bank):
         return tuple((slot.slot_id, slot.state, slot.expire_at, slot.frame_index) for slot in bank.slots)
 
-    def test_training_chunks_and_online_share_lifecycle_in_both_feature_modes(self):
-        for mode in ("pooled", "tokens"):
-            with self.subTest(mode=mode):
-                cfg = self.make_config(mode)
-                cfg.workspace.model.denoising_network_partial.shadow_horizon = 4
-                cfg.workspace.model.denoising_network_partial.shadow_gate_scale = 0.5
-                policy = self.fixture.instantiate_policy(cfg).eval()
-                batch = self.fixture.make_batch(anchors=13)
-                reads, shadow_step_reads = [], []
-                pack_history = policy._pack_history
+    def test_training_chunks_and_online_share_lifecycle(self):
+        cfg = self.make_config()
+        cfg.workspace.model.denoising_network_partial.shadow_horizon = 4
+        cfg.workspace.model.denoising_network_partial.shadow_gate_scale = 0.5
+        policy = self.fixture.instantiate_policy(cfg).eval()
+        batch = self.fixture.make_batch(anchors=13)
+        reads, shadow_step_reads = [], []
+        pack_history = policy._pack_history
 
-                def capture_history(banks, reference):
-                    reads.append(tuple(self.snapshot(bank) for bank in banks))
-                    packed = pack_history(banks, reference)
-                    shadow_step_reads.append(packed["history_shadow_steps"].tolist())
-                    return packed
+        def capture_history(banks, reference):
+            reads.append(tuple(self.snapshot(bank) for bank in banks))
+            packed = pack_history(banks, reference)
+            shadow_step_reads.append(packed["history_shadow_steps"].tolist())
+            return packed
 
-                with patch.object(policy, "_pack_history", side_effect=capture_history):
-                    full_loss = policy.compute_loss(self.chunk(batch, 0, 12, True, False))["gate_selectivity"].detach()
-                full_reads = list(reads)
-                full_shadow_step_reads = list(shadow_step_reads)
-                reads.clear()
-                shadow_step_reads.clear()
-                full_bank = self.snapshot(policy._streaming_training_state[0])
-                chunk_losses = []
-                with patch.object(policy, "_pack_history", side_effect=capture_history):
-                    for start in range(0, 12, 3):
-                        chunk_losses.append(policy.compute_loss(
-                            self.chunk(batch, start, 3, start == 0, start == 9),
-                        )["gate_selectivity"].detach())
-                self.assertEqual(reads, full_reads)
-                self.assertEqual(shadow_step_reads, full_shadow_step_reads)
-                self.assertEqual(len(reads), 12)
-                # Each read sees only preceding valid anchors, even at a
-                # chunk boundary; lookahead/current slots are never inserted early.
-                first_shadow_read = {}
-                for anchor, (snapshot,) in enumerate(reads):
-                    ids = [row[0] for row in snapshot]
-                    self.assertTrue(all(slot_id < anchor for slot_id in ids))
-                    if anchor:
-                        self.assertIn(anchor - 1, ids)
-                    retained_steps = shadow_step_reads[anchor][0][-len(snapshot):] if snapshot else []
-                    for (slot_id, state, _, _), step in zip(snapshot, retained_steps):
-                        if state == "shadow":
-                            first_shadow_read.setdefault(slot_id, anchor)
-                            self.assertEqual(step, anchor - first_shadow_read[slot_id] + 1)
-                            self.assertLessEqual(step, 4)
-                        else:
-                            self.assertEqual(step, 0)
-                reads.clear()
-                shadow_step_reads.clear()
-                self.assertIsNone(policy._streaming_training_state)
-                self.assertEqual(policy.latest_training_slot_ids[0], tuple(row[0] for row in full_bank))
-                self.assertEqual(policy.latest_training_slot_states[0], tuple(row[1] for row in full_bank))
-                torch.testing.assert_close(full_loss, torch.stack(chunk_losses).mean())
-                calls = []
-                handle = policy.denoising_network.memory_retriever.slot_gate.register_forward_hook(
-                    lambda module, args, output: calls.append(output.detach()),
-                )
-                with patch.object(policy.future_feature_predictor, "forward", side_effect=AssertionError("inference predictor")), \
-                     patch.object(policy.future_img_feature_encoder, "forward", side_effect=AssertionError("inference target encoder")), \
-                     patch.object(policy, "_pack_history", side_effect=capture_history):
-                    for anchor in range(12):
-                        with torch.inference_mode():
-                            output = policy.predict_action({
-                                "head_camera_feature": batch["head_camera_feature"][:, anchor],
-                                "agent_pos": batch["agent_pos"][:, anchor], "episode_idx": torch.tensor([0]),
-                            })
-                        self.assertTrue(torch.isfinite(output["action"]).all())
-                handle.remove()
-                self.assertEqual(reads, full_reads)
-                self.assertEqual(shadow_step_reads, full_shadow_step_reads)
-                bank = policy.online_memory_banks[0]
-                self.assertEqual(self.snapshot(bank), full_bank)
-                self.assertEqual(len(calls), 12)
-                self.assertEqual((bank.active_count, bank.shadow_count), (4, 4))
-                snapshot = policy.latest_online_memory_query_dict[0]
-                self.assertEqual(snapshot["active_slot_count"], 4)
-                self.assertEqual(snapshot["shadow_slot_count"], 4)
-                raw = torch.tensor(snapshot["slot_gates"])
-                effective = torch.tensor(snapshot["slot_effective_gates"])
-                shadow = torch.tensor([state == "shadow" for state in snapshot["slot_states"]])
-                steps = torch.tensor([
-                    snapshot["query_anchor_index"] - first_shadow_read[slot_id] + 1
-                    for slot_id, state in zip(snapshot["slot_ids"], snapshot["slot_states"])
-                    if state == "shadow"
-                ])
-                torch.testing.assert_close(effective[shadow], raw[shadow] * (0.5**steps[:, None]))
-                torch.testing.assert_close(effective[~shadow], raw[~shadow])
-                self.assertTrue(any(expiry == snapshot["query_anchor_index"] for expiry in snapshot["slot_expire_at"]))
-                policy.reset()
-                self.assertEqual(policy.online_memory_banks, {})
-                self.assertIsNone(policy.denoising_network.memory_retriever.latest_effective_slot_gates)
-                del capture_history, pack_history, policy
+        with patch.object(policy, "_pack_history", side_effect=capture_history):
+            full_loss = policy.compute_loss(self.chunk(batch, 0, 12, True, False))["gate_selectivity"].detach()
+        full_reads = list(reads)
+        full_shadow_step_reads = list(shadow_step_reads)
+        reads.clear()
+        shadow_step_reads.clear()
+        full_bank = self.snapshot(policy._streaming_training_state[0])
+        chunk_losses = []
+        with patch.object(policy, "_pack_history", side_effect=capture_history):
+            for start in range(0, 12, 3):
+                chunk_losses.append(policy.compute_loss(
+                    self.chunk(batch, start, 3, start == 0, start == 9),
+                )["gate_selectivity"].detach())
+        self.assertEqual(reads, full_reads)
+        self.assertEqual(shadow_step_reads, full_shadow_step_reads)
+        self.assertEqual(len(reads), 12)
+        # Each read sees only preceding valid anchors, even at a
+        # chunk boundary; lookahead/current slots are never inserted early.
+        first_shadow_read = {}
+        for anchor, (snapshot,) in enumerate(reads):
+            ids = [row[0] for row in snapshot]
+            self.assertTrue(all(slot_id < anchor for slot_id in ids))
+            if anchor:
+                self.assertIn(anchor - 1, ids)
+            retained_steps = shadow_step_reads[anchor][0][-len(snapshot):] if snapshot else []
+            for (slot_id, state, _, _), step in zip(snapshot, retained_steps):
+                if state == "shadow":
+                    first_shadow_read.setdefault(slot_id, anchor)
+                    self.assertEqual(step, anchor - first_shadow_read[slot_id] + 1)
+                    self.assertLessEqual(step, 4)
+                else:
+                    self.assertEqual(step, 0)
+        reads.clear()
+        shadow_step_reads.clear()
+        self.assertIsNone(policy._streaming_training_state)
+        self.assertEqual(policy.latest_training_slot_ids[0], tuple(row[0] for row in full_bank))
+        self.assertEqual(policy.latest_training_slot_states[0], tuple(row[1] for row in full_bank))
+        torch.testing.assert_close(full_loss, torch.stack(chunk_losses).mean())
+        calls = []
+        handle = policy.denoising_network.memory_retriever.slot_gate.register_forward_hook(
+            lambda module, args, output: calls.append(output.detach()),
+        )
+        with patch.object(policy, "_pack_history", side_effect=capture_history):
+            for anchor in range(12):
+                with torch.inference_mode():
+                    output = policy.predict_action({
+                        "head_camera_feature": batch["head_camera_feature"][:, anchor],
+                        "agent_pos": batch["agent_pos"][:, anchor], "episode_idx": torch.tensor([0]),
+                    })
+                self.assertTrue(torch.isfinite(output["action"]).all())
+        handle.remove()
+        self.assertEqual(reads, full_reads)
+        self.assertEqual(shadow_step_reads, full_shadow_step_reads)
+        bank = policy.online_memory_banks[0]
+        self.assertEqual(self.snapshot(bank), full_bank)
+        self.assertEqual(len(calls), 12)
+        self.assertEqual((bank.active_count, bank.shadow_count), (4, 4))
+        snapshot = policy.latest_online_memory_query_dict[0]
+        self.assertEqual(snapshot["active_slot_count"], 4)
+        self.assertEqual(snapshot["shadow_slot_count"], 4)
+        raw = torch.tensor(snapshot["slot_gates"])
+        effective = torch.tensor(snapshot["slot_effective_gates"])
+        shadow = torch.tensor([state == "shadow" for state in snapshot["slot_states"]])
+        steps = torch.tensor([
+            snapshot["query_anchor_index"] - first_shadow_read[slot_id] + 1
+            for slot_id, state in zip(snapshot["slot_ids"], snapshot["slot_states"])
+            if state == "shadow"
+        ])
+        torch.testing.assert_close(effective[shadow], raw[shadow] * (0.5**steps[:, None]))
+        torch.testing.assert_close(effective[~shadow], raw[~shadow])
+        self.assertTrue(any(expiry == snapshot["query_anchor_index"] for expiry in snapshot["slot_expire_at"]))
+        policy.reset()
+        self.assertEqual(policy.online_memory_banks, {})
+        self.assertIsNone(policy.denoising_network.memory_retriever.latest_effective_slot_gates)
+        del capture_history, pack_history, policy
 
     def test_regularizer_uses_only_active_raw_gates(self):
         policy = self.fixture.instantiate_policy(self.make_config())
@@ -318,7 +314,7 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
         self.assertTrue(any(int(mask.sum()) == 4 and mask.shape[1] == 7 for _, mask, _, _ in captured))
         torch.testing.assert_close(loss.detach(), torch.tensor(expected / 10))
 
-    def test_shadow_future_gradients_survive_chunk_and_optimizer_boundaries(self):
+    def test_shadow_action_gradients_survive_chunk_and_optimizer_boundaries(self):
         cfg = self.make_config()
         cfg.workspace.model.denoising_network_partial.max_history_len = 2
         cfg.workspace.model.memory_eviction.keep_recent = 0
@@ -341,12 +337,12 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
             losses = policy.compute_loss(self.chunk(batch, start, 3, start == 0, start == 6))
             selected = [(raw, mask) for raw, mask in zip(raw_outputs, shadow_masks) if mask.any()]
             if selected:
-                gradients = torch.autograd.grad(losses["future_prediction"], [raw for raw, _ in selected], retain_graph=True)
+                gradients = torch.autograd.grad(losses["action"], [raw for raw, _ in selected], retain_graph=True)
                 for gradient, (_, mask) in zip(gradients, selected):
                     self.assertTrue(torch.isfinite(gradient).all())
                     self.assertGreater(float(gradient[mask].abs().sum()), 0)
                     saw_shadow_gradient = True
-            total = losses["action"] + 0.05 * losses["future_prediction"] + 0.01 * losses["gate_selectivity"]
+            total = losses["action"] + 0.01 * losses["gate_selectivity"]
             total.backward()
             self.assertGreater(sum(float(p.grad.abs().sum()) for p in retriever.slot_gate.parameters()), 0)
             optimizer.step()
@@ -404,16 +400,14 @@ class ShadowMemoryPolicyTest(unittest.TestCase):
         self.assertEqual([policy.online_memory_banks[episode].next_anchor_index for episode in (4, 9)], [18, 8])
 
     def test_raw_image_training_uses_shadow_in_both_feature_modes(self):
-        for mode in ("pooled", "tokens"):
-            with self.subTest(mode=mode):
-                policy = self.fixture.instantiate_policy(self.make_config(mode, cached=False))
-                losses = policy.compute_loss(self.fixture.make_batch(cached=False, anchors=7))
-                total = losses["action"] + 0.05 * losses["future_prediction"] + 0.01 * losses["gate_selectivity"]
-                self.assertTrue(torch.isfinite(total))
-                total.backward()
-                self.assertIn("shadow", policy.latest_training_slot_states[0])
-                self.assertTrue(all(torch.isfinite(p.grad).all() for p in policy.denoising_network.memory_retriever.slot_gate.parameters()))
-                del policy
+        policy = self.fixture.instantiate_policy(self.make_config(cached=False))
+        losses = policy.compute_loss(self.fixture.make_batch(cached=False, anchors=7))
+        total = losses["action"] + 0.01 * losses["gate_selectivity"]
+        self.assertTrue(torch.isfinite(total))
+        total.backward()
+        self.assertIn("shadow", policy.latest_training_slot_states[0])
+        self.assertTrue(all(torch.isfinite(p.grad).all() for p in policy.denoising_network.memory_retriever.slot_gate.parameters()))
+        del policy
 
     def test_projection_accepts_physical_capacity_and_rejects_overflow(self):
         policy = self.fixture.instantiate_policy(self.make_config())

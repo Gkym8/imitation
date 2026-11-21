@@ -145,7 +145,6 @@ workspace:
         self.assertEqual(restored.workspace.model.denoising_network_partial.spatial_merge_size, [8, 4])
         self.assertEqual(restored.workspace.model.global_cond_encoder.image_encoder_partial.spatial_merge_size,
                          1 if restored.visual_encoder.state_query_merge else [8, 4])
-        self.assertEqual(restored.workspace.model.future_img_feature_encoder.image_encoder_partial.spatial_merge_size, [8, 4])
 
     def test_training_entry_point_saves_and_passes_merged_config(self):
         self.task('workspace:\n  trainer:\n    num_epochs: 401\n')

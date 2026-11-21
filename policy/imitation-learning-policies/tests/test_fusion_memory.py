@@ -9,13 +9,13 @@ from baseline.Fusion.config import configure_fusion
 from baseline.Fusion.memory_bank import FusionMemoryBank
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
 from imitation_learning.utils.config_utils import compose_training_config
-import test_future_prediction_mode as fixture
+import policy_fixture as fixture
 
 
 class FusionMemoryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        fixture.FuturePredictionModeTest.setUpClass()
+        fixture.PolicyFixture.setUpClass()
 
     def tearDown(self):
         SharedModelManager.reset()
@@ -57,11 +57,9 @@ class FusionMemoryTest(unittest.TestCase):
         self.assertFalse(model.action_history)
         self.assertFalse(model.denoising_network_partial.use_conditioned_slot_gate)
         self.assertEqual(model.denoising_network_partial.shadow_horizon, 0)
-        self.assertIsNone(model.future_feature_predictor)
-        self.assertIsNone(model.future_img_feature_encoder)
 
     def test_streaming_and_online_read_fusion_with_relative_positions(self):
-        helper = fixture.FuturePredictionModeTest()
+        helper = fixture.PolicyFixture()
         cfg = helper.make_config(merge_size=[4, 8])
         cfg.visual_encoder.state_query_merge = True
         cfg.workspace.model.memory_bank_type = "fusion"
@@ -71,8 +69,6 @@ class FusionMemoryTest(unittest.TestCase):
         policy = helper.instantiate_policy(cfg)
         batch = helper.make_batch(anchors=10)
         network = policy.denoising_network
-        self.assertIsNone(policy.future_img_feature_encoder)
-        self.assertIsNone(policy.future_feature_predictor)
         self.assertIsNone(network.memory_retriever.slot_gate)
         self.assertFalse(policy.action_history)
         self.assertFalse(any("future_" in key or "slot_gate" in key for key in policy.state_dict()))

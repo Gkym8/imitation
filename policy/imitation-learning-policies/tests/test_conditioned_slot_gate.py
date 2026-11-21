@@ -12,7 +12,7 @@ from imitation_learning.models.denoising_networks.memory_transformer import (
 )
 from imitation_learning.models.denoising_networks.modules import HistoryCrossAttention
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
-import test_future_prediction_mode as future_fixture
+import policy_fixture as future_fixture
 
 
 def make_retriever():
@@ -264,10 +264,10 @@ class ConditionedRetrieverTest(unittest.TestCase):
 class ConditionedSlotGatePolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        future_fixture.FuturePredictionModeTest.setUpClass()
+        future_fixture.PolicyFixture.setUpClass()
 
     def setUp(self):
-        self.fixture = future_fixture.FuturePredictionModeTest()
+        self.fixture = future_fixture.PolicyFixture()
 
     def tearDown(self):
         gc.collect()
@@ -276,7 +276,7 @@ class ConditionedSlotGatePolicyTest(unittest.TestCase):
     def test_streaming_projection_omits_unused_sliding_windows(self):
         for cached in (True, False):
             with self.subTest(cached=cached):
-                policy = self.fixture.instantiate_policy(self.fixture.make_config("tokens", cached))
+                policy = self.fixture.instantiate_policy(self.fixture.make_config(cached))
                 try:
                     batch = self.fixture.make_batch(cached)
                     data, _ = policy._encode_input_multi_traj(batch)
@@ -314,36 +314,34 @@ class ConditionedSlotGatePolicyTest(unittest.TestCase):
                 finally:
                     del policy
 
-    def test_action_and_future_losses_each_train_both_gates_in_both_feature_modes(self):
-        for mode in ("pooled", "tokens"):
-            for cached in (True, False):
-                with self.subTest(mode=mode, cached=cached):
-                    cfg = self.fixture.make_config(mode, cached)
-                    self.assertEqual(cfg.workspace.model.gate_selectivity_min_std, 0.1)
-                    policy = self.fixture.instantiate_policy(cfg)
-                    retriever = policy.denoising_network.memory_retriever
-                    gate = retriever.slot_gate
-                    self.assertIsNotNone(gate)
-                    fusion = retriever.perception_gate
-                    # The network-wide Xavier initialization must not overwrite
-                    # the original small fusion initialization (g starts near .5).
-                    self.assertLess(float(fusion.proj.weight.std()), 0.003)
-                    batch = self.fixture.make_batch(cached)
-                    losses = policy.compute_loss(batch)
-                    parameters = tuple(gate.parameters())
-                    for name in ("action", "future_prediction"):
-                        for module in (gate, fusion):
-                            gradients = torch.autograd.grad(
-                                losses[name], tuple(module.parameters()), retain_graph=True,
-                            )
-                            self.assertTrue(all(torch.isfinite(gradient).all() for gradient in gradients))
-                            self.assertGreater(sum(float(gradient.abs().sum()) for gradient in gradients), 0)
-                    (losses["action"] + 0.05 * losses["future_prediction"]).backward()
-                    self.assertGreater(sum(float(p.grad.abs().sum()) for p in parameters), 0)
-                    del policy
+    def test_action_loss_trains_both_gates(self):
+        for cached in (True, False):
+            with self.subTest(cached=cached):
+                cfg = self.fixture.make_config(cached)
+                self.assertEqual(cfg.workspace.model.gate_selectivity_min_std, 0.1)
+                policy = self.fixture.instantiate_policy(cfg)
+                retriever = policy.denoising_network.memory_retriever
+                gate = retriever.slot_gate
+                self.assertIsNotNone(gate)
+                fusion = retriever.perception_gate
+                # The network-wide Xavier initialization must not overwrite
+                # the original small fusion initialization (g starts near .5).
+                self.assertLess(float(fusion.proj.weight.std()), 0.003)
+                batch = self.fixture.make_batch(cached)
+                losses = policy.compute_loss(batch)
+                parameters = tuple(gate.parameters())
+                for module in (gate, fusion):
+                    gradients = torch.autograd.grad(
+                        losses["action"], tuple(module.parameters()), retain_graph=True,
+                    )
+                    self.assertTrue(all(torch.isfinite(gradient).all() for gradient in gradients))
+                    self.assertGreater(sum(float(gradient.abs().sum()) for gradient in gradients), 0)
+                (losses["action"]).backward()
+                self.assertGreater(sum(float(p.grad.abs().sum()) for p in parameters), 0)
+                del policy
 
     def test_gate_trains_across_chunk_and_optimizer_boundaries(self):
-        policy = self.fixture.instantiate_policy(self.fixture.make_config("tokens"))
+        policy = self.fixture.instantiate_policy(self.fixture.make_config())
         optimizer = torch.optim.SGD(policy.parameters(), lr=0.001)
         batch = self.fixture.make_batch(anchors=7)
         for start in (0, 3):
@@ -353,7 +351,7 @@ class ConditionedSlotGatePolicyTest(unittest.TestCase):
             chunk["_streaming_final"] = start == 3
             optimizer.zero_grad(set_to_none=True)
             losses = policy.compute_loss(chunk)
-            total = losses["action"] + 0.05 * losses["future_prediction"]
+            total = losses["action"]
             self.assertTrue(torch.isfinite(total))
             total.backward()
             gate = policy.denoising_network.memory_retriever.slot_gate
@@ -362,7 +360,7 @@ class ConditionedSlotGatePolicyTest(unittest.TestCase):
         self.assertIsNone(policy._streaming_training_state)
 
     def test_online_gate_is_reused_across_diffusion_steps(self):
-        cfg = self.fixture.make_config("tokens")
+        cfg = self.fixture.make_config()
         cfg.workspace.model.noise_scheduler.inference_step_num = 4
         policy = self.fixture.instantiate_policy(cfg).eval()
         gate = policy.denoising_network.memory_retriever.slot_gate

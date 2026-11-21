@@ -8,7 +8,7 @@ import torch
 
 from imitation_learning.models.common.state_query_merger import StateQueryPatchMerger
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
-import test_future_prediction_mode as fixture
+import policy_fixture as fixture
 
 
 class StateQueryMergerTest(unittest.TestCase):
@@ -100,17 +100,17 @@ class StateQueryMergerTest(unittest.TestCase):
 class StateQueryMergePolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        fixture.FuturePredictionModeTest.setUpClass()
+        fixture.PolicyFixture.setUpClass()
 
     def setUp(self):
-        self.helper = fixture.FuturePredictionModeTest()
+        self.helper = fixture.PolicyFixture()
 
     def tearDown(self):
         gc.collect()
         SharedModelManager.reset()
 
-    def config(self, mode='pooled', cached=True, views=1, size=4):
-        cfg = self.helper.make_config(mode, cached, merge_size=size)
+    def config(self, cached=True, views=1, size=4):
+        cfg = self.helper.make_config(cached, merge_size=size)
         cfg.visual_encoder.state_query_merge = True
         cfg.workspace.train_dataset.image_keys = ['head_camera', 'left_camera', 'right_camera'][:views]
         cfg.workspace.model.denoising_network_partial.state_as_dit_token = True
@@ -124,11 +124,10 @@ class StateQueryMergePolicyTest(unittest.TestCase):
             batch[name + suffix] = batch['head_camera' + suffix].clone() + 0.1
         return batch
 
-    def test_cached_online_multiview_and_future_modes_train_and_infer(self):
-        for cached, mode, views, size in ((True, 'pooled', 1, 4), (False, 'pooled', 1, 8),
-                                          (True, 'tokens', 1, 4), (True, 'pooled', 3, 8)):
-            with self.subTest(cached=cached, mode=mode, views=views, size=size):
-                cfg = self.config(mode, cached, views, size)
+    def test_cached_online_multiview_train_and_infer(self):
+        for cached, views, size in ((True, 1, 4), (False, 1, 8), (True, 3, 8)):
+            with self.subTest(cached=cached, views=views, size=size):
+                cfg = self.config(cached, views, size)
                 policy = self.helper.instantiate_policy(cfg)
                 network = policy.denoising_network
                 count = views * (16 // size)**2
@@ -136,14 +135,11 @@ class StateQueryMergePolicyTest(unittest.TestCase):
                 self.assertEqual(policy.global_cond_encoder.token_num, 256 * views)
                 self.assertEqual(network.global_cond_token_num, count)
                 self.assertEqual(network.history_img_features_token_num, count)
-                self.assertEqual(policy.future_img_feature_encoder.token_num, views if mode == 'pooled' else count)
                 self.assertEqual(cfg.workspace.train_dataset.cached_image_feature_kind, 'patches')
                 self.assertIsNone(network.history_img_features_projector)
                 batch = self.batch(cfg)
-                _, targets = policy._encode_input_multi_traj(batch)
-                expected_targets = targets['future_features'].detach().clone()
                 losses = policy.compute_loss(batch)
-                total = losses['action'] + 0.05 * losses['future_prediction']
+                total = losses['action']
                 total.backward()
                 merger = network.global_cond_projector
                 self.assertGreater(float(merger.query_tokens.grad.abs().sum()), 0)
@@ -151,10 +147,6 @@ class StateQueryMergePolicyTest(unittest.TestCase):
                 self.assertTrue(all(torch.isfinite(p.grad).all() for p in policy.parameters() if p.grad is not None))
                 for backbone in policy.shared_model_manager.vit_models.values():
                     self.assertTrue(all(p.grad is None for p in backbone.parameters()))
-                with torch.no_grad():
-                    merger.query_tokens.add_(0.1)
-                _, new_targets = policy._encode_input_multi_traj(batch)
-                torch.testing.assert_close(new_targets['future_features'], expected_targets, rtol=0, atol=0)
                 policy.eval()
                 policy.reset()
                 seen_images, dit_images, retrieval_queries = [], [], []
@@ -167,13 +159,12 @@ class StateQueryMergePolicyTest(unittest.TestCase):
                         lambda module, args, kwargs: retrieval_queries.append((len(seen_images) - 1, kwargs['query'].clone())), with_kwargs=True),
                 ]
                 suffix = '_feature' if cached else ''
-                with patch.object(policy.future_feature_predictor, 'forward', side_effect=AssertionError('online future predictor')):
-                    for anchor in range(2):
-                        obs = {name + suffix: batch[name + suffix][:, anchor] for name in cfg.workspace.train_dataset.image_keys}
-                        obs.update(agent_pos=batch['agent_pos'][:, anchor], episode_idx=torch.tensor([0]))
-                        with torch.inference_mode():
-                            output = policy.predict_action(obs)
-                        self.assertEqual(output['action'].shape, (1, 16, 14))
+                for anchor in range(2):
+                    obs = {name + suffix: batch[name + suffix][:, anchor] for name in cfg.workspace.train_dataset.image_keys}
+                    obs.update(agent_pos=batch['agent_pos'][:, anchor], episode_idx=torch.tensor([0]))
+                    with torch.inference_mode():
+                        output = policy.predict_action(obs)
+                    self.assertEqual(output['action'].shape, (1, 16, 14))
                 for handle in handles:
                     handle.remove()
                 self.assertEqual(len(seen_images), 2)
@@ -191,7 +182,8 @@ class StateQueryMergePolicyTest(unittest.TestCase):
         batch = self.batch(self.config(cached=False, size=8))
         images = {'head_camera': batch['head_camera']}
         raw = policy.global_cond_encoder(images)
-        cls = policy.future_img_feature_encoder(images)
+        # The patch-only consumers ignore the cached CLS slot.
+        cls = torch.zeros_like(raw[..., :1, :])
         cache = torch.cat([cls, raw], dim=-2).unsqueeze(-3)
         cached = policy.global_cond_encoder({'head_camera_feature': cache})
         torch.testing.assert_close(raw, cached, rtol=0, atol=0)
@@ -215,7 +207,7 @@ class StateQueryMergePolicyTest(unittest.TestCase):
             chunk = {key: value[:, start:start + 5] for key, value in batch.items()}
             chunk.update(_streaming_supervised_length=4, _streaming_reset=start == 0, _streaming_final=False)
             losses = policy.compute_loss(chunk)
-            (losses['action'] + 0.05 * losses['future_prediction']).backward()
+            (losses['action']).backward()
             bank = policy._streaming_training_state[0]
             for slot in bank.slots:
                 torch.testing.assert_close(slot.raw_state['agent_pos'], batch['agent_pos'][0, slot.frame_index // 10], rtol=0, atol=0)
@@ -253,7 +245,7 @@ class StateQueryMergePolicyTest(unittest.TestCase):
             chunk = {key: value[:, start:start + 5] for key, value in batch.items()}
             chunk.update(_streaming_supervised_length=4, _streaming_reset=start == 0, _streaming_final=False)
             losses = policy.compute_loss(chunk)
-            (losses['action'] + 0.05 * losses['future_prediction'] + 0.01 * losses['gate_selectivity']).backward()
+            (losses['action'] + 0.01 * losses['gate_selectivity']).backward()
             policy.zero_grad(set_to_none=True)
         bank = policy._streaming_training_state[0]
         expected = [(s.slot_id, s.state, s.expire_at) for s in bank.slots]
@@ -294,19 +286,18 @@ class StateQueryMergePolicyTest(unittest.TestCase):
         # exercise that complete startup path, not only model instantiation.
         for cached in (False, True):
             for mlp, state_query in ((False, False), (False, True)):
-                for mode in ('pooled', 'tokens'):
-                    with self.subTest(cached=cached, mlp=mlp, state_query=state_query, mode=mode):
-                        cfg = self.helper.make_config(mode=mode, cached=cached, merge_size=8)
-                        cfg.visual_encoder.state_query_merge = state_query
-                        cfg.run_name = 'workspace-config-roundtrip'
-                        cfg.project_name = cfg.logger_project_name = 'rmbench'
-                        cfg.train_server_name = 'localhost'
-                        cfg.workspace.cfg_str_unresolved = OmegaConf.to_yaml(cfg, resolve=False)
-                        OmegaConf.resolve(cfg)
-                        expected_size = 1 if mlp or state_query else 8
-                        self.assertEqual(cfg.workspace.model.global_cond_encoder.image_encoder_partial.spatial_merge_size, expected_size)
-                        self.assertEqual(cfg.workspace.model.history_img_feature_encoder.image_encoder_partial.spatial_merge_size, expected_size)
-                        self.assertEqual(cfg.workspace.train_dataset.cached_image_feature_kind, 'patches' if mlp or state_query else 'auto')
+                with self.subTest(cached=cached, mlp=mlp, state_query=state_query):
+                    cfg = self.helper.make_config(cached=cached, merge_size=8)
+                    cfg.visual_encoder.state_query_merge = state_query
+                    cfg.run_name = 'workspace-config-roundtrip'
+                    cfg.project_name = cfg.logger_project_name = 'rmbench'
+                    cfg.train_server_name = 'localhost'
+                    cfg.workspace.cfg_str_unresolved = OmegaConf.to_yaml(cfg, resolve=False)
+                    OmegaConf.resolve(cfg)
+                    expected_size = 1 if mlp or state_query else 8
+                    self.assertEqual(cfg.workspace.model.global_cond_encoder.image_encoder_partial.spatial_merge_size, expected_size)
+                    self.assertEqual(cfg.workspace.model.history_img_feature_encoder.image_encoder_partial.spatial_merge_size, expected_size)
+                    self.assertEqual(cfg.workspace.train_dataset.cached_image_feature_kind, 'patches' if mlp or state_query else 'auto')
 
     def test_rejects_non_boolean_configuration(self):
         for value in (0, 1, 8, 'true'):

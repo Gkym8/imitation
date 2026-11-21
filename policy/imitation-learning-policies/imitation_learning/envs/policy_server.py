@@ -23,7 +23,10 @@ from robot_utils.torch_utils import torch_load, torch_save
 from robot_utils.logging_utils import echo_exception
 from robot_utils.pose_utils import convert_10d_to_batch, convert_batch_to_10d
 from hydra.core.global_hydra import GlobalHydra
-from imitation_learning.utils.config_utils import remove_keys_from_config
+from imitation_learning.utils.config_utils import (
+    remove_keys_from_config,
+    remove_legacy_future_prediction_config,
+)
 
 class PolicyServer:
     def __init__(
@@ -114,6 +117,7 @@ class PolicyServer:
         self.ckpt_path = ckpt_info_dict["ckpt_path"]
 
         self.policy_cfg = cast(DictConfig, OmegaConf.create(ckpt["cfg_str_unresolved"]))
+        remove_legacy_future_prediction_config(self.policy_cfg)
 
 
         ## HACK: Update configs for compatibility

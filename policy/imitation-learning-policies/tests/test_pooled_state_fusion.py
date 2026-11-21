@@ -5,13 +5,13 @@ import torch
 
 from imitation_learning.models.common.image_state_fusion import ImageStateFusion
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
-import test_future_prediction_mode as fixture
+import policy_fixture as fixture
 
 
 class PooledStateFusionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        fixture.FuturePredictionModeTest.setUpClass()
+        fixture.PolicyFixture.setUpClass()
 
     def tearDown(self):
         gc.collect()
@@ -42,7 +42,7 @@ class PooledStateFusionTest(unittest.TestCase):
         self.assertEqual(float(states.grad[~mask].abs().sum()), 0)
 
     def test_pooling_fuses_current_and_historical_own_states_before_retrieval(self):
-        helper = fixture.FuturePredictionModeTest()
+        helper = fixture.PolicyFixture()
         cfg = helper.make_config(merge_size=[8, 4])
         cfg.workspace.model.denoising_network_partial.state_as_dit_token = True
         policy = helper.instantiate_policy(cfg)
@@ -72,7 +72,7 @@ class PooledStateFusionTest(unittest.TestCase):
         self.assertEqual(net.blocks[0].input_token_num, 18)
 
     def test_streaming_pooling_saves_own_states_and_reencodes_after_updates(self):
-        helper = fixture.FuturePredictionModeTest()
+        helper = fixture.PolicyFixture()
         cfg = helper.make_config(merge_size=[8, 4])
         netcfg = cfg.workspace.model.denoising_network_partial
         netcfg.max_history_len, netcfg.shadow_horizon = 3, 2
@@ -83,7 +83,7 @@ class PooledStateFusionTest(unittest.TestCase):
             chunk = {name: value[:, start:start+5] for name, value in batch.items()}
             chunk.update(_streaming_supervised_length=4, _streaming_reset=start == 0, _streaming_final=False)
             losses = policy.compute_loss(chunk)
-            (losses['action'] + 0.05 * losses['future_prediction']).backward()
+            (losses['action']).backward()
             bank = policy._streaming_training_state[0]
             self.assertTrue(any(slot.state == 'shadow' for slot in bank.slots))
             for slot in bank.slots:

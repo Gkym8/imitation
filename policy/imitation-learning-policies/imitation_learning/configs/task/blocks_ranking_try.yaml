@@ -14,7 +14,6 @@ workspace:
   trainer:
     num_epochs: 301
     checkpoint_every: 50
-    future_prediction_loss_weight: 0.05
     streaming_chunk_length: 8
 
 visual_encoder:

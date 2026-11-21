@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from omegaconf import open_dict
 
-import test_future_prediction_mode as fixture
+import policy_fixture as fixture
 from deploy_policy import eval as deploy_eval
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
 from imitation_learning.utils.config_utils import compose_hydra_config
@@ -17,13 +17,13 @@ from imitation_learning.utils.config_utils import compose_hydra_config
 class ActionHistoryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        fixture.FuturePredictionModeTest.setUpClass()
+        fixture.PolicyFixture.setUpClass()
 
     def tearDown(self):
         SharedModelManager.reset()
 
     def make(self, enabled):
-        helper = fixture.FuturePredictionModeTest()
+        helper = fixture.PolicyFixture()
         cfg = helper.make_config(merge_size=[8, 4])
         cfg.visual_encoder.state_query_merge = True
         cfg.workspace.model.denoising_network_partial.shadow_horizon = 2
@@ -70,7 +70,7 @@ class ActionHistoryTest(unittest.TestCase):
                 chunk.update(_streaming_supervised_length=length, _streaming_reset=start == 0,
                              _streaming_final=final)
                 loss = policy.compute_streaming_loss(chunk)
-                (loss["action"] + 0.05 * loss["future_prediction"]).backward()
+                (loss["action"]).backward()
                 self.assertTrue(torch.isfinite(loss["action"]))
                 if not final:
                     self.assertFalse(policy._training_action_history[0].requires_grad)
@@ -125,7 +125,7 @@ class ActionHistoryTest(unittest.TestCase):
         self.assertEqual(policy.online_memory_banks, {})
 
     def test_missing_actions_and_disabled_checkpoint(self):
-        helper = fixture.FuturePredictionModeTest()
+        helper = fixture.PolicyFixture()
         cfg = helper.make_config(merge_size=[8, 4])
         original_cfg = deepcopy(cfg)
         original_cfg.workspace.model._target_ = (

@@ -11,7 +11,7 @@ from imitation_learning.models.memory.gate_memory import (
 )
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
 from imitation_learning.trainers.policy_trainer import PolicyTrainer
-import test_future_prediction_mode as future_fixture
+import policy_fixture as future_fixture
 
 
 class GateMemoryBankTest(unittest.TestCase):
@@ -164,10 +164,10 @@ class GateSelectivityTest(unittest.TestCase):
 class GateMemoryPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        future_fixture.FuturePredictionModeTest.setUpClass()
+        future_fixture.PolicyFixture.setUpClass()
 
     def setUp(self):
-        self.fixture = future_fixture.FuturePredictionModeTest()
+        self.fixture = future_fixture.PolicyFixture()
 
     def tearDown(self):
         gc.collect()
@@ -183,7 +183,7 @@ class GateMemoryPolicyTest(unittest.TestCase):
         return chunk
 
     def test_training_and_online_keep_identical_slots_through_evictions(self):
-        cfg = self.fixture.make_config("tokens")
+        cfg = self.fixture.make_config()
         cfg.workspace.model.denoising_network_partial.max_history_len = 4
         cfg.workspace.model.memory_eviction.keep_recent = 2
         policy = self.fixture.instantiate_policy(cfg).eval()
@@ -245,25 +245,23 @@ class GateMemoryPolicyTest(unittest.TestCase):
         losses = policy.compute_loss(batch)
         self.assertEqual(policy.latest_training_slot_ids, ((0,),))
         self.assertEqual(float(losses["gate_selectivity"]), 0)
-        total = losses["action"] + losses["future_prediction"] + losses["gate_selectivity"]
+        total = losses["action"] + losses["gate_selectivity"]
         total.backward()
         for parameter in policy.denoising_network.memory_retriever.slot_gate.parameters():
             self.assertIsNotNone(parameter.grad)
             self.assertTrue(torch.isfinite(parameter.grad).all())
 
-    def test_online_never_calls_future_prediction_or_target_encoder(self):
+    def test_online_actions_and_reset(self):
         policy = self.fixture.instantiate_policy(self.fixture.make_config()).eval()
         batch = self.fixture.make_batch(anchors=5)
-        with patch.object(policy.future_feature_predictor, "forward", side_effect=AssertionError("future prediction during inference")), \
-             patch.object(policy.future_img_feature_encoder, "forward", side_effect=AssertionError("future encoder during inference")):
-            for anchor in range(5):
-                with torch.inference_mode():
-                    output = policy.predict_action({
-                        "head_camera_feature": batch["head_camera_feature"][:, anchor],
-                        "agent_pos": batch["agent_pos"][:, anchor],
-                        "episode_idx": torch.tensor([0]),
-                    })
-                self.assertTrue(torch.isfinite(output["action"]).all())
+        for anchor in range(5):
+            with torch.inference_mode():
+                output = policy.predict_action({
+                    "head_camera_feature": batch["head_camera_feature"][:, anchor],
+                    "agent_pos": batch["agent_pos"][:, anchor],
+                    "episode_idx": torch.tensor([0]),
+                })
+            self.assertTrue(torch.isfinite(output["action"]).all())
         policy.reset()
         self.assertEqual(policy.online_memory_banks, {})
 
@@ -272,17 +270,15 @@ class GateTrainerLossTest(unittest.TestCase):
     def test_weighted_gate_loss_is_logged_and_does_not_mutate_action_loss(self):
         values = {
             "action": torch.tensor(1.0, requires_grad=True),
-            "future_prediction": torch.tensor(2.0, requires_grad=True),
             "gate_selectivity": torch.tensor(3.0, requires_grad=True),
         }
         trainer = PolicyTrainer.__new__(PolicyTrainer)
         trainer.model = lambda batch: values
-        trainer.future_prediction_loss_weight = 0.05
         trainer.gate_selectivity_loss_weight = 0.01
         trainer.critical_action_loss_weights = [0.0]
         trainer.epoch = 0
         loss, logs = trainer.compute_loss({})
-        torch.testing.assert_close(loss, torch.tensor(1.13))
+        torch.testing.assert_close(loss, torch.tensor(1.03))
         self.assertEqual(float(values["action"]), 1)
         self.assertEqual(logs["train/gate_selectivity_loss"], 3)
         loss.backward()

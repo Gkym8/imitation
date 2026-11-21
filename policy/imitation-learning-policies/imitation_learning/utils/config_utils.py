@@ -1,7 +1,23 @@
 import hydra
 from hydra.errors import MissingConfigException
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from typing import cast
+
+
+def remove_legacy_future_prediction_config(cfg: DictConfig) -> None:
+    model = OmegaConf.select(cfg, "workspace.model")
+    trainer = OmegaConf.select(cfg, "workspace.trainer")
+    if isinstance(model, DictConfig):
+        with open_dict(model):
+            for key in (
+                "future_feature_predictor", "future_img_feature_encoder",
+                "future_prediction_mode", "future_prediction_context_pooling",
+            ):
+                if key in model:
+                    del model[key]
+    if isinstance(trainer, DictConfig) and "future_prediction_loss_weight" in trainer:
+        with open_dict(trainer):
+            del trainer["future_prediction_loss_weight"]
 
 
 def remove_keys_from_config(cfg: DictConfig):
@@ -9,6 +25,7 @@ def remove_keys_from_config(cfg: DictConfig):
     Will read _keys_to_remove_ cfg and remove the keys from the config
     This function should be called right before instantiating the config
     """
+    remove_legacy_future_prediction_config(cfg)
     if "_keys_to_remove_" not in cfg:
         return cfg
     keys_to_remove = cfg["_keys_to_remove_"]

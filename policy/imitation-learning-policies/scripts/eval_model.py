@@ -6,6 +6,7 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from robot_utils.torch_utils import torch_load
+from imitation_learning.utils.config_utils import remove_legacy_future_prediction_config
 from imitation_learning.workspaces.base_workspace import BaseWorkspace
 
 def eval_model(
@@ -21,6 +22,7 @@ def eval_model(
 
     config_str: str = ckpt["cfg_str_unresolved"]
     config = OmegaConf.create(config_str)
+    remove_legacy_future_prediction_config(config)
     OmegaConf.set_struct(config, True) # Will set the config to strict mode
     assert type(config) == DictConfig
 

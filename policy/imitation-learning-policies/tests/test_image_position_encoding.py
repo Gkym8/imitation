@@ -7,7 +7,7 @@ from omegaconf import open_dict
 from imitation_learning.models.common.pos_embeddings import get_nd_sincos_pos_embed_from_grid
 from imitation_learning.models.denoising_networks.conditional_transformer import ConditionalTransformer
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
-import test_future_prediction_mode as fixture
+import policy_fixture as fixture
 
 
 class ImagePositionEncodingTest(unittest.TestCase):
@@ -73,14 +73,14 @@ class ImagePositionEncodingTest(unittest.TestCase):
 class ImagePositionPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        fixture.FuturePredictionModeTest.setUpClass()
+        fixture.PolicyFixture.setUpClass()
 
     def tearDown(self):
         gc.collect()
         SharedModelManager.reset()
 
     def test_pooling_and_query_use_actual_grid_with_cached_and_online_features(self):
-        helper = fixture.FuturePredictionModeTest()
+        helper = fixture.PolicyFixture()
         for learned, cached, merge, views in (
             (False, True, [8, 4], 1), (True, True, [8, 4], 1),
             (False, False, [4, 8], 2), (True, False, [4, 8], 2),
@@ -109,7 +109,7 @@ class ImagePositionPolicyTest(unittest.TestCase):
                 del policy
 
     def test_legacy_pooling_config_uses_encoder_geometry(self):
-        helper = fixture.FuturePredictionModeTest()
+        helper = fixture.PolicyFixture()
         cfg = helper.make_config(merge_size=[8, 4])
         # Older checkpoints had no merger geometry in the network config.
         with open_dict(cfg.workspace.model.denoising_network_partial):

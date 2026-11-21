@@ -10,7 +10,7 @@ from imitation_learning.models.memory.redundancy_eviction import (
     RedundancyGateMemoryBank,
     token_mean_cosine,
 )
-import test_future_prediction_mode as future_fixture
+import policy_fixture as future_fixture
 
 
 MODULE = "imitation_learning.models.memory.redundancy_eviction"
@@ -201,10 +201,10 @@ class RedundancyEvictionTest(unittest.TestCase):
 class RedundancyPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        future_fixture.FuturePredictionModeTest.setUpClass()
+        future_fixture.PolicyFixture.setUpClass()
 
     def setUp(self):
-        self.fixture = future_fixture.FuturePredictionModeTest()
+        self.fixture = future_fixture.PolicyFixture()
 
     def tearDown(self):
         gc.collect()
@@ -225,7 +225,7 @@ class RedundancyPolicyTest(unittest.TestCase):
         legacy.load_state_dict(state, strict=True)
 
     def test_training_and_online_choose_identical_active_and_shadow_slots(self):
-        cfg = self.fixture.make_config("tokens")
+        cfg = self.fixture.make_config()
         cfg.workspace.model.denoising_network_partial.max_history_len = 5
         cfg.workspace.model.denoising_network_partial.shadow_horizon = 3
         cfg.workspace.model.memory_eviction.keep_recent = 2

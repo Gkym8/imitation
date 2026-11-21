@@ -10,6 +10,7 @@ from imitation_learning.datasets.base_dataset import BaseDataset
 from imitation_learning.datasets.multi_task_dataset import MultiTaskDataset
 from imitation_learning.models.ema_model import EMAModel
 from imitation_learning.trainers.base_trainer import BaseTrainer
+from imitation_learning.utils.legacy_future_prediction import remove_future_prediction_optimizer_state
 
 
 class BaseWorkspace:
@@ -168,7 +169,9 @@ class BaseWorkspace:
         self.ema_model.optimization_step.fill_(int(ema_step))
 
         if "optimizer_state_dict" in ckpt:
-            optimizer_state_dict = ckpt["optimizer_state_dict"]
+            optimizer_state_dict = remove_future_prediction_optimizer_state(
+                ckpt["optimizer_state_dict"], ckpt["model_state_dict"], self.model, self.trainer,
+            )
         else:
             optimizer_state_dict = None
             print("No optimizer state dict found in ckpt")

@@ -28,7 +28,6 @@ class PolicyTrainer(BaseTrainer):
         rollout_every: int,
         rollout_env: BaseEnv | None,
         critical_action_loss_weights: list[float],
-        future_prediction_loss_weight: float = 1.0,
         gate_selectivity_loss_weight: float = 0.01,
         streaming_chunk_length: int = 4,
         streaming_chunk_accumulate: int = 1,
@@ -44,9 +43,6 @@ class PolicyTrainer(BaseTrainer):
         if not isinstance(rollout_env, BaseEnv):
             rollout_env = None
         self.rollout_env: BaseEnv | None = rollout_env
-        if future_prediction_loss_weight < 0:
-            raise ValueError("future_prediction_loss_weight must be non-negative")
-        self.future_prediction_loss_weight = future_prediction_loss_weight
         if not np.isfinite(gate_selectivity_loss_weight) or gate_selectivity_loss_weight < 0:
             raise ValueError("gate_selectivity_loss_weight must be finite and non-negative")
         self.gate_selectivity_loss_weight = float(gate_selectivity_loss_weight)
@@ -405,13 +401,10 @@ class PolicyTrainer(BaseTrainer):
         loss_dict = self.model(batch)
         loss = loss_dict["action"]
         logs = {"train/action_loss": float(loss.detach().cpu())}
-        for name, weight in (
-            ("future_prediction", self.future_prediction_loss_weight),
-            ("gate_selectivity", self.gate_selectivity_loss_weight),
-        ):
-            if name in loss_dict:
-                loss = loss + weight * loss_dict[name]
-                logs[f"train/{name}_loss"] = float(loss_dict[name].detach().cpu())
+        if "gate_selectivity" in loss_dict:
+            gate_loss = loss_dict["gate_selectivity"]
+            loss = loss + self.gate_selectivity_loss_weight * gate_loss
+            logs["train/gate_selectivity_loss"] = float(gate_loss.detach().cpu())
         if "critical_action" in loss_dict:
             index = min(self.epoch, len(self.critical_action_loss_weights) - 1)
             loss = loss + self.critical_action_loss_weights[index] * loss_dict["critical_action"]
@@ -514,15 +507,10 @@ class PolicyTrainer(BaseTrainer):
                 for chunk_idx, (start, end, chunk_valid_num) in enumerate(
                     chunk_group
                 ):
-                    # The final encoded anchor is a target-only look-ahead
-                    # whenever it exists. It is re-encoded as the first
-                    # supervised anchor of the following chunk, while the bank
-                    # itself persists across calls.
-                    input_stop = min(end + 1, sequence_length)
                     chunk = self._slice_streaming_batch(
                         batch,
                         start,
-                        input_stop,
+                        end,
                         batch_size,
                         sequence_length,
                     )

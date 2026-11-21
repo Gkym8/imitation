@@ -9,7 +9,7 @@ from baseline.MemoAct.config import configure_memoact
 from baseline.MemoAct.memory_bank import MemoActMemoryBank
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
 from imitation_learning.utils.config_utils import compose_training_config
-import test_future_prediction_mode as fixture
+import policy_fixture as fixture
 
 
 class MeanCompressor:
@@ -22,7 +22,7 @@ class MeanCompressor:
 class MemoActMemoryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        fixture.FuturePredictionModeTest.setUpClass()
+        fixture.PolicyFixture.setUpClass()
 
     def tearDown(self):
         SharedModelManager.reset()
@@ -60,14 +60,12 @@ class MemoActMemoryTest(unittest.TestCase):
         self.assertEqual(model.denoising_network_partial.max_history_len, 14)
         self.assertEqual(model.execution_chunk_length, 10)
         self.assertIsNone(model.memory_eviction)
-        self.assertIsNone(model.future_feature_predictor)
-        self.assertIsNone(model.future_img_feature_encoder)
         self.assertFalse(model.action_history)
         self.assertFalse(model.denoising_network_partial.use_conditioned_slot_gate)
         self.assertEqual(model.denoising_network_partial.shadow_horizon, 0)
 
     def test_shared_reader_and_gradients_across_streaming_boundary(self):
-        helper = fixture.FuturePredictionModeTest()
+        helper = fixture.PolicyFixture()
         cfg = helper.make_config(merge_size=[4, 8])
         cfg.visual_encoder.state_query_merge = True
         cfg.workspace.model.memory_bank_type = "memoact"

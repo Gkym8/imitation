@@ -5,7 +5,9 @@ import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from robot_utils.torch_utils import torch_load
-from imitation_learning.utils.config_utils import remove_keys_from_config
+from imitation_learning.utils.config_utils import (
+    remove_keys_from_config, remove_legacy_future_prediction_config,
+)
 from imitation_learning.workspaces.base_workspace import BaseWorkspace
 
 
@@ -32,6 +34,8 @@ def main(
 
     config_str: str = ckpt["cfg_str_unresolved"]
     config = OmegaConf.create(config_str)
+    remove_legacy_future_prediction_config(config)
+    config_str = OmegaConf.to_yaml(config, resolve=False)
     OmegaConf.set_struct(config, True)
     assert type(config) == DictConfig
     # Update some configs here

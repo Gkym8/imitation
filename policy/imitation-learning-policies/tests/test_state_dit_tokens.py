@@ -8,23 +8,23 @@ import torch
 from imitation_learning.models.denoising_networks.memory_transformer import ObservationDrivenMemoryRetriever
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
 from imitation_learning.models.common.slot_gate import ObservationConditionedSlotGate
-import test_future_prediction_mode as fixture
+import policy_fixture as fixture
 
 
 class StateDiTTokensTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        fixture.FuturePredictionModeTest.setUpClass()
+        fixture.PolicyFixture.setUpClass()
 
     def setUp(self):
-        self.helper = fixture.FuturePredictionModeTest()
+        self.helper = fixture.PolicyFixture()
 
     def tearDown(self):
         gc.collect()
         SharedModelManager.reset()
 
-    def config(self, mode='pooled', merge=False):
-        cfg = self.helper.make_config(mode, cached=True, merge_size=8)
+    def config(self, merge=False):
+        cfg = self.helper.make_config(cached=True, merge_size=8)
         cfg.visual_encoder.state_query_merge = merge
         network = cfg.workspace.model.denoising_network_partial
         network.state_as_dit_token = True
@@ -123,42 +123,37 @@ class StateDiTTokensTest(unittest.TestCase):
             gate(history, images, state_tokens=states.detach(), state_mask=torch.ones(2, 3))
 
     def test_chunked_training_and_online_share_new_route_and_shadow_clock(self):
-        for mode in ('pooled', 'tokens'):
-            for merge in (False, True):
-                with self.subTest(mode=mode, merge=merge):
-                    policy = self.helper.instantiate_policy(self.config(mode, merge))
-                    batch = self.helper.make_batch(anchors=13)
-                    batch['agent_pos'].requires_grad_()
-                    for start in (0, 4, 8):
-                        chunk = {name:value[:, start:start + 5] for name,value in batch.items()}
-                        chunk.update(_streaming_supervised_length=4, _streaming_reset=start == 0, _streaming_final=False)
-                        losses = policy.compute_loss(chunk)
-                        action_gradient = torch.autograd.grad(losses['action'], batch['agent_pos'], retain_graph=True)[0]
-                        self.assertGreater(float(action_gradient.abs().sum()), 0)
-                        future_gradient = torch.autograd.grad(losses['future_prediction'], batch['agent_pos'], retain_graph=True, allow_unused=True)[0]
-                        self.assertIsNotNone(future_gradient)
-                        self.assertGreater(float(future_gradient.abs().sum()), 0)
-                        total = losses['action'] + 0.05 * losses['future_prediction'] + 0.01 * losses['gate_selectivity']
-                        total.backward()
-                        self.assertGreater(float(policy.denoising_network.local_cond_projector.model[0].weight.grad.abs().sum()), 0)
-                        self.assertTrue(all(torch.isfinite(p.grad).all() for p in policy.parameters() if p.grad is not None))
-                        policy.zero_grad(set_to_none=True)
-                    def snapshot(bank):
-                        return [(s.slot_id, s.state, s.expire_at) for s in bank.slots]
-                    expected = snapshot(policy._streaming_training_state[0])
-                    policy.eval()
-                    with patch.object(policy.future_feature_predictor, 'forward', side_effect=AssertionError('online future predictor')):
-                        for anchor in range(12):
-                            with torch.inference_mode():
-                                result = policy.predict_action({
-                                    'head_camera_feature':batch['head_camera_feature'][:, anchor],
-                                    'agent_pos':batch['agent_pos'][:, anchor], 'episode_idx':torch.tensor([0]),
-                                })
-                            self.assertEqual(tuple(result['action'].shape), (1, 16, 14))
-                            self.assertTrue(torch.isfinite(result['action']).all())
-                    self.assertEqual(snapshot(policy.online_memory_banks[0]), expected)
-                    self.assertEqual(policy.denoising_network.blocks[0].input_token_num, 18)
-                    del policy
+        for merge in (False, True):
+            with self.subTest(merge=merge):
+                policy = self.helper.instantiate_policy(self.config(merge))
+                batch = self.helper.make_batch(anchors=13)
+                batch['agent_pos'].requires_grad_()
+                for start in (0, 4, 8):
+                    chunk = {name:value[:, start:start + 5] for name,value in batch.items()}
+                    chunk.update(_streaming_supervised_length=4, _streaming_reset=start == 0, _streaming_final=False)
+                    losses = policy.compute_loss(chunk)
+                    action_gradient = torch.autograd.grad(losses['action'], batch['agent_pos'], retain_graph=True)[0]
+                    self.assertGreater(float(action_gradient.abs().sum()), 0)
+                    total = losses['action'] + 0.01 * losses['gate_selectivity']
+                    total.backward()
+                    self.assertGreater(float(policy.denoising_network.local_cond_projector.model[0].weight.grad.abs().sum()), 0)
+                    self.assertTrue(all(torch.isfinite(p.grad).all() for p in policy.parameters() if p.grad is not None))
+                    policy.zero_grad(set_to_none=True)
+                def snapshot(bank):
+                    return [(s.slot_id, s.state, s.expire_at) for s in bank.slots]
+                expected = snapshot(policy._streaming_training_state[0])
+                policy.eval()
+                for anchor in range(12):
+                    with torch.inference_mode():
+                        result = policy.predict_action({
+                            'head_camera_feature':batch['head_camera_feature'][:, anchor],
+                            'agent_pos':batch['agent_pos'][:, anchor], 'episode_idx':torch.tensor([0]),
+                        })
+                    self.assertEqual(tuple(result['action'].shape), (1, 16, 14))
+                    self.assertTrue(torch.isfinite(result['action']).all())
+                self.assertEqual(snapshot(policy.online_memory_banks[0]), expected)
+                self.assertEqual(policy.denoising_network.blocks[0].input_token_num, 18)
+                del policy
 
     def test_new_architecture_roundtrip_loads_strictly(self):
         cfg = self.config()

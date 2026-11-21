@@ -6,7 +6,7 @@ from torch import nn
 
 from imitation_learning.models.encoders.image_encoders import SharedModelManager
 from imitation_learning.models.ema_model import EMAModel
-import test_future_prediction_mode as fixture
+import policy_fixture as fixture
 
 
 MODEL_NAME = 'facebook/dinov2-with-registers-base-test'
@@ -109,21 +109,21 @@ class FrozenDinoPrecisionTest(unittest.TestCase):
 class SharedFrozenDinoPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        fixture.FuturePredictionModeTest.setUpClass()
+        fixture.PolicyFixture.setUpClass()
 
     def tearDown(self):
         SharedModelManager.reset()
 
-    def test_current_history_and_future_share_one_forward_for_both_mergers(self):
-        helper = fixture.FuturePredictionModeTest()
+    def test_current_and_history_share_one_forward_for_both_mergers(self):
+        helper = fixture.PolicyFixture()
         for state_query_merge in (False, True):
             with self.subTest(state_query_merge=state_query_merge):
-                cfg = helper.make_config('pooled', cached=False, merge_size=8)
+                cfg = helper.make_config(cached=False, merge_size=8)
                 cfg.visual_encoder.state_query_merge = state_query_merge
                 policy = helper.instantiate_policy(cfg)
                 manager = policy.shared_model_manager
                 self.assertEqual(list(manager.vit_models), [fixture.MODEL_NAME])
-                for encoder in (policy.global_cond_encoder, policy.history_img_feature_encoder, policy.future_img_feature_encoder):
+                for encoder in (policy.global_cond_encoder, policy.history_img_feature_encoder):
                     self.assertEqual(encoder.encoder_dict['head_camera'].shared_model_key, fixture.MODEL_NAME)
                 calls = []
                 handle = manager.vit_models[fixture.MODEL_NAME].register_forward_hook(lambda *args: calls.append(1))
@@ -132,17 +132,15 @@ class SharedFrozenDinoPolicyTest(unittest.TestCase):
                 losses = policy.compute_loss(helper.make_batch(cached=False, anchors=3))
                 handle.remove()
                 self.assertEqual(len(calls), 1)
-                (losses['action'] + 0.05 * losses['future_prediction']).backward()
+                (losses['action']).backward()
                 if state_query_merge:
                     self.assertGreater(float(policy.denoising_network.global_cond_projector.state_modulation[-1].weight.grad.abs().sum()), 0)
                 self.assertTrue(all(p.grad is None for p in manager.vit_models[fixture.MODEL_NAME].parameters()))
                 del policy
 
     def test_nested_legacy_ema_checkpoint_loads_without_duplicate_backbone(self):
-        helper = fixture.FuturePredictionModeTest()
-        cfg = helper.make_config('pooled', cached=False)
-        # Exercise the saved registry key from pre-sharing online checkpoints.
-        cfg.workspace.model.future_img_feature_encoder.image_encoder_partial.shared_model_key = 'future_target_dinov2'
+        helper = fixture.PolicyFixture()
+        cfg = helper.make_config(cached=False)
         policy = helper.instantiate_policy(cfg)
         ema = EMAModel(policy, inv_gamma=1.0, power=0.67, min_value=0.0, max_value=0.9999)
         self.assertEqual(len(ema.averaged_model.shared_model_manager.vit_models), 1)

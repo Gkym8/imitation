@@ -42,9 +42,6 @@ workspace:
     action_length: 16
     action_indices: ${range:0,${workspace.model.action_length}}
     execution_chunk_length: 10
-    # pooled: mean(h) -> future CLS; tokens: h -> future patch tokens.
-    # Patch targets use visual_encoder.spatial_merge_size, like memory slots.
-    future_prediction_mode: pooled
     denoising_network_partial:
       use_conditioned_slot_gate: true
       state_as_dit_token: true  # DiT: diffusion timestep + robot state + 16 actions
