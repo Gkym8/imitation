@@ -12,7 +12,6 @@ workspace:
     denoising_network_partial:
       max_history_len: 8
       shadow_horizon: 3
-    action_history: false
     memory_bank_type: gate
 
   trainer:

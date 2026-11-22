@@ -22,7 +22,16 @@ class ActionHistoryTest(unittest.TestCase):
     def tearDown(self):
         SharedModelManager.reset()
 
-    def make(self, enabled):
+    @staticmethod
+    def configure_legacy_policy(cfg, enabled):
+        with open_dict(cfg.workspace.model):
+            cfg.workspace.model._target_ = (
+                "imitation_learning.policies.action_history_policy.ActionHistoryPolicy"
+            )
+            cfg.workspace.model.action_history = enabled
+            cfg.workspace.model.action_history_num_layers = 3
+
+    def make(self):
         helper = fixture.PolicyFixture()
         cfg = helper.make_config(merge_size=[8, 4])
         cfg.visual_encoder.state_query_merge = True
@@ -31,20 +40,20 @@ class ActionHistoryTest(unittest.TestCase):
         cfg.workspace.model.denoising_network_partial.record_data_entries = [
             "history_cross_attention_slot_weights", "history_cross_attention_frame_logits",
         ]
-        cfg.workspace.model.action_history = enabled
+        self.configure_legacy_policy(cfg, enabled=True)
         cfg.workspace.model.memory_eviction.redundancy_alpha = 0.4
         cfg.workspace.model.noise_scheduler.inference_step_num = 2
         return helper.instantiate_policy(cfg), helper.make_batch(anchors=6)
 
-    def test_config_is_opt_in(self):
+    def test_training_config_uses_visual_history_policy(self):
         with hydra.initialize_config_dir(config_dir=str(fixture.CONFIG_DIR), version_base=None):
             cfg = compose_hydra_config("rmbench", "diffusion_memory_transformer")
-        self.assertFalse(cfg.workspace.model.action_history)
-        self.assertEqual(cfg.workspace.model.action_history_num_layers, 3)
-        self.assertTrue(cfg.workspace.model._target_.endswith(".ActionHistoryPolicy"))
+        self.assertNotIn("action_history", cfg.workspace.model)
+        self.assertNotIn("action_history_num_layers", cfg.workspace.model)
+        self.assertTrue(cfg.workspace.model._target_.endswith(".HistoryDenoisingPolicy"))
 
     def test_streaming_causality_and_gradients(self):
-        policy, batch = self.make(True)
+        policy, batch = self.make()
         encoder = policy.action_history_encoder
         self.assertEqual(len(encoder.sequence_layers), 2)
         network = policy.denoising_network
@@ -84,7 +93,7 @@ class ActionHistoryTest(unittest.TestCase):
         self.assertIsNone(policy._streaming_training_state)
 
     def test_online_confirmed_prefix_and_fixed_denoising_context(self):
-        policy, batch = self.make(True)
+        policy, batch = self.make()
         policy.eval()
         encoder = policy.action_history_encoder
         network = policy.denoising_network
@@ -124,32 +133,27 @@ class ActionHistoryTest(unittest.TestCase):
         self.assertEqual(policy._online_action_history, {})
         self.assertEqual(policy.online_memory_banks, {})
 
-    def test_missing_actions_and_disabled_checkpoint(self):
+    def test_visual_history_policy_matches_disabled_legacy_checkpoint(self):
         helper = fixture.PolicyFixture()
         cfg = helper.make_config(merge_size=[8, 4])
-        original_cfg = deepcopy(cfg)
-        original_cfg.workspace.model._target_ = (
-            "imitation_learning.policies.history_denoising_policy.HistoryDenoisingPolicy"
-        )
-        with open_dict(original_cfg.workspace.model):
-            original_cfg.workspace.model.pop("action_history")
-            original_cfg.workspace.model.pop("action_history_num_layers")
-        original = helper.instantiate_policy(original_cfg)
-        old = {key: value.clone() for key, value in original.state_dict().items()}
+        legacy_cfg = deepcopy(cfg)
+        self.configure_legacy_policy(legacy_cfg, enabled=False)
+        legacy = helper.instantiate_policy(legacy_cfg)
+        old = {key: value.clone() for key, value in legacy.state_dict().items()}
         batch = helper.make_batch()
         torch.manual_seed(5)
-        expected = original.compute_loss(batch)
-        del original
-        disabled = helper.instantiate_policy(cfg)
-        disabled.load_state_dict(old, strict=True)
-        self.assertEqual(set(old), set(disabled.state_dict()))
+        expected = legacy.compute_loss(batch)
+        del legacy
+        policy = helper.instantiate_policy(cfg)
+        policy.load_state_dict(old, strict=True)
+        self.assertEqual(set(old), set(policy.state_dict()))
         torch.manual_seed(5)
-        observed = disabled.compute_loss(batch)
+        observed = policy.compute_loss(batch)
         for key in expected:
             self.assertTrue(torch.equal(expected[key], observed[key]), key)
 
     def test_gaps_and_temporal_order(self):
-        policy, batch = self.make(True)
+        policy, batch = self.make()
         encoder = policy.action_history_encoder
         initial = encoder.initial_state(1)
         chunk = batch["action"][:, 0, :10]

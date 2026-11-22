@@ -4,7 +4,7 @@ defaults:
   - override denoising_network@denoising_network_partial: memory_transformer
   - _self_
 
-_target_: imitation_learning.policies.action_history_policy.ActionHistoryPolicy
+_target_: imitation_learning.policies.history_denoising_policy.HistoryDenoisingPolicy
 
 use_cached_image_features: ${workspace.train_dataset.use_cached_image_features}
 
@@ -12,8 +12,6 @@ skip_memory: false
 memory_bank_type: gate  # Baselines: fusion or memoact.
 memoact_short_term_capacity: 6
 memoact_long_term_capacity: 8
-action_history: false  # Recurrently encode executed action chunks into one DiT input token.
-action_history_num_layers: 3
 global_cond_encoder:
   image_encoder_partial:
     spatial_merge_size: ${cond:${oc.select:visual_encoder.state_query_merge,false},1,${visual_encoder.spatial_merge_size}}

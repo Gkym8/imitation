@@ -11,7 +11,7 @@ workspace:
     denoising_network_partial:
       max_history_len: 8
       shadow_horizon: 3
-    memory_bank_type: gate
+    memory_bank_type: fusion
     
   trainer:
     num_epochs: 301

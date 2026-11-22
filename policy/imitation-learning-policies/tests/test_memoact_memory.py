@@ -60,7 +60,7 @@ class MemoActMemoryTest(unittest.TestCase):
         self.assertEqual(model.denoising_network_partial.max_history_len, 14)
         self.assertEqual(model.execution_chunk_length, 10)
         self.assertIsNone(model.memory_eviction)
-        self.assertFalse(model.action_history)
+        self.assertNotIn("action_history", model)
         self.assertFalse(model.denoising_network_partial.use_conditioned_slot_gate)
         self.assertEqual(model.denoising_network_partial.shadow_horizon, 0)
 

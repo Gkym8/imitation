@@ -54,7 +54,7 @@ class FusionMemoryTest(unittest.TestCase):
         self.assertEqual(model.memory_bank_type, "fusion")
         self.assertEqual(model.execution_chunk_length, 10)
         self.assertEqual(model.denoising_network_partial.max_history_len, 8)
-        self.assertFalse(model.action_history)
+        self.assertNotIn("action_history", model)
         self.assertFalse(model.denoising_network_partial.use_conditioned_slot_gate)
         self.assertEqual(model.denoising_network_partial.shadow_horizon, 0)
 
@@ -70,7 +70,6 @@ class FusionMemoryTest(unittest.TestCase):
         batch = helper.make_batch(anchors=10)
         network = policy.denoising_network
         self.assertIsNone(network.memory_retriever.slot_gate)
-        self.assertFalse(policy.action_history)
         self.assertFalse(any("future_" in key or "slot_gate" in key for key in policy.state_dict()))
         observations = []
 
