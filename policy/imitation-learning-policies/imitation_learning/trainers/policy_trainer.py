@@ -507,10 +507,13 @@ class PolicyTrainer(BaseTrainer):
                 for chunk_idx, (start, end, chunk_valid_num) in enumerate(
                     chunk_group
                 ):
+                    # Match the original encoder and diffusion-noise input shape.
+                    # Supervision and memory writes still stop at end.
+                    input_stop = min(end + 1, sequence_length)
                     chunk = self._slice_streaming_batch(
                         batch,
                         start,
-                        end,
+                        input_stop,
                         batch_size,
                         sequence_length,
                     )
