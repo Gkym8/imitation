@@ -195,6 +195,8 @@ workspace:
 
     def test_non_rmbench_tasks_keep_original_config_selection(self):
         baseline = compose_hydra_config('mikasa_remember_color_3', POLICY)
+        from baseline.Fusion.config import configure_fusion
+        configure_fusion(baseline)
         cfg = compose_training_config(OmegaConf.create({
             'task_name': 'mikasa_remember_color_3', 'policy_name': POLICY,
         }))
@@ -203,7 +205,7 @@ workspace:
         self.assertEqual(OmegaConf.to_container(cfg.workspace, resolve=False),
                          OmegaConf.to_container(baseline.workspace, resolve=False))
         self.assertEqual(cfg.visual_encoder.model_name, baseline.visual_encoder.model_name)
-        self.assertNotIn('state_query_merge', cfg.visual_encoder)
+        self.assertEqual(cfg.visual_encoder.state_query_merge, baseline.visual_encoder.state_query_merge)
 
     def test_missing_file_without_fallback_keeps_original_error(self):
         with self.assertRaises(MissingConfigException):

@@ -1,4 +1,4 @@
-_target_: imitation_learning.datasets.mujoco_dataset.MujocoSingleTrajDataset
+_target_: imitation_learning.datasets.mikasa_dataset.MikasaSingleTrajDataset
 
 root_dir: ???
 name: ???
@@ -11,7 +11,7 @@ used_episode_ratio: 0.98 # How many episodes are used for training
 
 random_split_dataset: true # If false, will not use random split for the dataset
 history_padding_length: ${workspace.model.history_padding_length}
-future_padding_length: 16
+future_padding_length: ${eval:"${workspace.model.action_length}-1"}
 starting_percentile_max: 1.0
 starting_percentile_min: 0.0
 index_pool_size_per_episode: -1 # Use all indices
@@ -25,12 +25,20 @@ repeat_dataset_num: ??? # How many times to repeat the dataset. This will avoid 
 down_sample_steps: 1
 
 
-image_keys: ["third_person_camera", "robot0_wrist_camera"]
+image_keys: ["third_person_camera"]
 # proprio_keys: ["robot0_8d"] # Should be overridden if there are multiple proprio keys
 action_keys: ["action0_8d"] # Should be overridden if there are multiple action keys
 
-proprio_keys: []
+proprio_keys: ["robot0_8d"]
 # action_keys: ["robot0_8d"]
+
+use_cached_image_features: false
+cached_image_feature_kind: patches
+cached_image_feature_dim: 768
+cached_image_feature_patch_token_num: 256
+cached_image_feature_model_name: ${visual_encoder.model_name}
+cached_image_feature_input_size: ${visual_encoder.input_size}
+cached_image_feature_dtype: float32
 
 apply_image_augmentation_in_cpu: true
 source_data_meta:
@@ -56,66 +64,24 @@ output_data_meta:
   robot0_wrist_camera:
     data_type: image
     length: ${workspace.model.image_length}
-    normalizer: identity # Normalization should be done in the observation encoder according to the model
+    normalizer: identity
     augmentation:
-
-      # # FAIR_COMPARISON: To match the original training config
-      # - name: Resize 
-      #   size: [128, 128]
-      #   antialias: True
-      - name: RandomCrop
-        size: [112, 112]
-        p: 0.3
-
-      # # Best performance
-      # - name: RandomCrop
-      #   size: [224, 224]
-      #   p: 0.3
-        
       - name: Resize
-        size: [256, 256]
-        antialias: True
-      - name: ColorJitter
-        brightness: 0.3
-        contrast: 0.4
-        saturation: 0.5
-        hue: 0.08
-        p: 0.5
-
-    shape: [3, 256, 256] # For pytorch compatibility, move the color channel to the first dimension
+        size: ["${visual_encoder.input_size}", "${visual_encoder.input_size}"]
+        antialias: true
+    shape: [3, "${visual_encoder.input_size}", "${visual_encoder.input_size}"]
     source_entry_names:
       - robot0_wrist_camera
 
   third_person_camera:
-    name: third_person_camera
     data_type: image
     length: ${workspace.model.image_length}
     normalizer: identity
     augmentation:
-
-      # # FAIR_COMPARISON: To match the original training config
-      # - name: Resize 
-      #   size: [128, 128]
-      #   antialias: True
-      - name: RandomCrop
-        size: [112, 112]
-        p: 0.3
-
-      # # Best performance
-      # - name: RandomCrop
-      #   size: [224, 224]
-      #   p: 0.3
-
       - name: Resize
-        size: [256, 256]
-        antialias: True
-      - name: ColorJitter
-        brightness: 0.3
-        contrast: 0.4
-        saturation: 0.5
-        hue: 0.08
-        p: 0.3
-    shape: [3, 256, 256]
+        size: ["${visual_encoder.input_size}", "${visual_encoder.input_size}"]
+        antialias: true
+    shape: [3, "${visual_encoder.input_size}", "${visual_encoder.input_size}"]
     source_entry_names:
       - third_person_camera
 

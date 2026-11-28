@@ -13,4 +13,4 @@ workspace:
     denoising_network_partial:
       max_history_len: 45
     action_length: 4
-    history_action_num_per_chunk: 4
+    execution_chunk_length: 4
